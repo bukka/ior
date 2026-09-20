@@ -147,7 +147,9 @@ static void test_cancel_recv(void **state)
 	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
 }
 
-// Target and cancel in the same submit batch: the cancel still finds it.
+// Target and cancel in the same submit batch: the cancel still finds it,
+// either queued (0) or in its first non-blocking attempt (-EALREADY, but
+// the recv is then finished as cancelled instead of parked).
 static void test_cancel_same_batch(void **state)
 {
 	cancel_state *s = (cancel_state *) *state;
@@ -160,7 +162,7 @@ static void test_cancel_same_batch(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 
 	reap_tags(s->ctx, 2, res, seen);
-	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	assert_true(res[(uintptr_t) TAG_CANCEL] == 0 || res[(uintptr_t) TAG_CANCEL] == -EALREADY);
 	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
 }
 
@@ -632,13 +634,15 @@ static void test_cancel_stress(void **state)
 			assert_int_equal(got_recv[i], 1);
 			assert_int_equal(got_cancel[i], 1);
 			if (i % 2) {
-				// Never fed: must be cancelled.
-				assert_int_equal(cancel_res[i], 0);
+				// Never fed: must end cancelled. -EALREADY is the cancel
+				// catching the op mid-attempt (still finished as cancelled).
+				assert_true(cancel_res[i] == 0 || cancel_res[i] == -EALREADY);
 				assert_int_equal(recv_res[i], -ECANCELED);
 			} else {
-				// Fed: either outcome, but consistently paired.
+				// Fed: either outcome, but consistently paired: a cancel that
+				// reports 0 never sees data delivered.
 				if (recv_res[i] == -ECANCELED) {
-					assert_int_equal(cancel_res[i], 0);
+					assert_true(cancel_res[i] == 0 || cancel_res[i] == -EALREADY);
 					drained++;
 				} else {
 					assert_int_equal(recv_res[i], (int32_t) sizeof(msg));

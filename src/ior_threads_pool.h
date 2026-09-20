@@ -38,10 +38,12 @@ enum {
 	IOR_WORK_QUEUED, /* chain head in the worker pool FIFO, or just popped */
 	IOR_WORK_LINKED, /* chain member behind its head; not cancellable */
 	IOR_WORK_RUNNING, /* on a worker: syscall or callback in progress */
+	IOR_WORK_TRYING, /* on a worker: non-blocking attempt that may park on the poller */
 	IOR_WORK_DRAINING, /* on a worker: waiting for IO_DRAIN */
 	IOR_WORK_TIMER, /* armed on the timer thread */
 	IOR_WORK_POLLING, /* registered with the poller */
 	IOR_WORK_CANCELLED, /* claimed by a cancel; completes with -ECANCELED */
+	IOR_WORK_DONE, /* completion posted; item about to return to the free list */
 };
 
 /*
@@ -57,11 +59,16 @@ typedef struct ior_work {
 	uint64_t seq; // submission order, for IO_DRAIN
 	struct ior_work *next; // free-list link (scratch link while allocated)
 	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
+	/*
+	 * Fields a worker writes while it owns the op, kept together (and off the
+	 * neighbouring item's SQE) so the submitter's alloc and copy do not share
+	 * cache lines with them.
+	 */
 	_Atomic int state; // IOR_WORK_*
-	struct ior_work_token token; // IOR_OP_WORK only: cancellation handle
+	int ready; // rw op: the poller reported readiness, skip the probe
 	struct ior_work_token *cur_token; // token the running callback observes
 	uint64_t deadline_ns; // link-timeout deadline once computed (0 = none)
-	int ready; // rw op: the poller reported readiness, skip the probe
+	struct ior_work_token token; // IOR_OP_WORK only: cancellation handle
 } ior_work;
 
 /*
@@ -99,6 +106,14 @@ struct ior_threads_pool {
 	 */
 	pthread_mutex_t work_lock;
 	ior_work *work_items; // pool array [work_cap]
+
+	/*
+	 * Serializes arming a timer op (with the worker's post-arm cancel check)
+	 * against a cancel claiming it, so neither side can miss the other; kept
+	 * off work_lock, which every completion takes. Order: work_lock, then
+	 * arm_lock, then the worker pool's timer lock.
+	 */
+	pthread_mutex_t arm_lock;
 	ior_work *work_free; // free list
 	uint32_t work_cap;
 	uint64_t next_seq; // next submission sequence to assign

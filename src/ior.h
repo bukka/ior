@@ -539,9 +539,11 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
  *   - -ENOENT: no matching operation is in flight (it already completed, or
  *     was never submitted);
  *   - -EALREADY: the target was found but is executing and cannot be
- *     interrupted (a work callback, a syscall on a regular file); it completes
- *     on its own with its real result. A running work callback sees
- *     ior_work_cancelled() return non-zero so it can return early.
+ *     interrupted (a work callback, a syscall on a regular file, or a
+ *     socket op in its non-blocking attempt); it completes on its own,
+ *     with its real result or with -ECANCELED if it was about to wait for
+ *     readiness. A running work callback sees ior_work_cancelled() return
+ *     non-zero so it can return early.
  * If several in-flight operations share the user data, one of them is
  * cancelled per call.
  *

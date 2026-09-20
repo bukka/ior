@@ -120,23 +120,23 @@ static int ior_threads_pool_drain_wait(ior_threads_pool *pool, ior_work *w)
 }
 
 /*
- * Retire one operation: return its work item to the pool, post its completion,
- * record it for drain ordering, and drop the in-flight/outstanding counts so
- * get_sqe and worker provisioning see the freed capacity. The item is released
- * before the CQE is posted so that a cancel submitted by a consumer who has
- * seen the CQE finds nothing in flight (-ENOENT) rather than a stale state;
- * the CQ cannot overflow, since `outstanding` still holds the slot until last.
+ * Retire one operation: post its completion, record it for drain ordering,
+ * return its work item to the pool, and drop the in-flight/outstanding counts
+ * so get_sqe and worker provisioning see the freed capacity. The item is
+ * marked DONE before the CQE is posted so that a cancel submitted by a
+ * consumer who has seen the CQE finds nothing in flight (-ENOENT) rather
+ * than a stale state.
  */
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe)
 {
-	uint64_t seq = work->seq;
+	atomic_store_explicit(&work->state, IOR_WORK_DONE, memory_order_release);
+
+	ior_threads_pool_post_completion(pool, cqe);
+	ior_threads_pool_drain_complete(pool, work->seq);
 
 	pthread_mutex_lock(&pool->work_lock);
 	ior_threads_pool_work_release(pool, work);
 	pthread_mutex_unlock(&pool->work_lock);
-
-	ior_threads_pool_post_completion(pool, cqe);
-	ior_threads_pool_drain_complete(pool, seq);
 
 	atomic_fetch_sub(&pool->outstanding, 1);
 	atomic_fetch_sub(&pool->num_inflight, 1);
@@ -309,6 +309,11 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		free(pool);
 		return NULL;
 	}
+	if (pthread_mutex_init(&pool->arm_lock, NULL) != 0) {
+		pthread_mutex_destroy(&pool->work_lock);
+		free(pool);
+		return NULL;
+	}
 
 	pool->work_items = calloc(pool->work_cap, sizeof(*pool->work_items));
 	uint32_t drain_cap = ior_threads_pool_round_up_pow2(pool->work_cap * 2);
@@ -318,6 +323,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 			|| pthread_mutex_init(&pool->drain_lock, NULL) != 0) {
 		free(pool->drain_done);
 		free(pool->work_items);
+		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
@@ -326,6 +332,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
 		free(pool->work_items);
+		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
@@ -348,6 +355,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
 		free(pool->work_items);
+		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
@@ -474,6 +482,7 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	pthread_mutex_destroy(&pool->drain_lock);
 	free(pool->drain_done);
 	free(pool->work_items);
+	pthread_mutex_destroy(&pool->arm_lock);
 	pthread_mutex_destroy(&pool->work_lock);
 	free(pool);
 }
@@ -533,6 +542,25 @@ static int ior_threads_pool_rw_nowait(const ior_sqe *sqe)
 {
 	return (sqe->threads.opcode == IOR_OP_SEND || sqe->threads.opcode == IOR_OP_RECV)
 			&& (sqe->threads.rw_flags & MSG_DONTWAIT);
+}
+
+/*
+ * Does the op need a readiness probe before its syscall? Only a read or
+ * write at the current position: the descriptor may be a blocking socket or
+ * pipe and read(2) has no per-call non-blocking flag. send/recv are issued
+ * with MSG_DONTWAIT instead (one syscall when ready), and positioned I/O is
+ * regular-file semantics that runs to completion, as on io_uring's worker
+ * queue.
+ */
+static int ior_threads_pool_rw_probe(const ior_sqe *sqe)
+{
+	return (sqe->threads.opcode == IOR_OP_READ || sqe->threads.opcode == IOR_OP_WRITE)
+			&& sqe->threads.off == IOR_OFF_NONE;
+}
+
+static int ior_threads_pool_res_would_block(int32_t res)
+{
+	return res == -EAGAIN || res == -EWOULDBLOCK;
 }
 
 /*
@@ -791,13 +819,13 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		ior_work *after = lt ? lt->chain : next;
 
 		/*
-		 * Readiness gate: poll ops always wait on the poller; rw ops only when
-		 * the descriptor is not ready yet. On a regular file poll() reports
-		 * ready at once, so the op runs here uncancelled - matching io_uring.
+		 * Readiness gate: poll ops always wait on the poller; positionless
+		 * read/write only when the probe says the descriptor is not ready.
+		 * Other rw ops run at once and park below if they would block.
 		 */
 		short events = ior_threads_pool_rw_events(&w->sqe);
 		int gate = opcode == IOR_OP_POLL;
-		if (events && !w->ready && !ior_threads_pool_rw_nowait(&w->sqe)
+		if (events && !w->ready && ior_threads_pool_rw_probe(&w->sqe)
 				&& !ior_threads_pool_fd_ready(w->sqe.threads.fd, events)) {
 			gate = 1;
 		}
@@ -825,7 +853,9 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 			w = after;
 			continue;
 		}
-		w->ready = 0;
+		if (w->ready) {
+			w->ready = 0;
+		}
 
 		/*
 		 * A guarded work op cannot be poll-gated: the callback runs on this
@@ -863,11 +893,19 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 			continue;
 		}
 
-		// Run the op now. The token pointer is published before the state
-		// so a cancel that sees RUNNING can flag it.
+		/*
+		 * Run the op now. The token pointer is published before the state so
+		 * a cancel that sees RUNNING can flag it. An rw op that may still park
+		 * (send/recv, positionless read/write) runs as TRYING instead: a
+		 * cancel can claim that, and the claim is honoured below by finishing
+		 * the op instead of parking it.
+		 */
 		ior_cqe cqe;
 		w->cur_token = &w->token;
-		if (ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0) {
+		int may_park = events && !ior_threads_pool_rw_nowait(&w->sqe)
+				&& (opcode == IOR_OP_SEND || opcode == IOR_OP_RECV
+						|| ior_threads_pool_rw_probe(&w->sqe));
+		if (ior_threads_pool_enter(w, may_park ? IOR_WORK_TRYING : IOR_WORK_RUNNING) < 0) {
 			memset(&cqe, 0, sizeof(cqe));
 			cqe.threads.user_data = w->sqe.threads.user_data;
 			cqe.threads.res = -ECANCELED;
@@ -875,16 +913,23 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 			ior_threads_pool_process_single_sqe(pool, &w->sqe, &cqe, &w->token);
 
 			/*
-			 * Readiness raced another consumer of a non-blocking descriptor:
-			 * park on the poller and retry once it is ready again, unless the
-			 * caller asked for MSG_DONTWAIT semantics.
+			 * The op would block (send/recv are always issued with
+			 * MSG_DONTWAIT; a non-blocking descriptor says so itself): park
+			 * on the poller and retry once it is ready, unless the caller
+			 * asked for MSG_DONTWAIT semantics. A cancel that claimed the op
+			 * meanwhile makes hand_to_poller fail with -ECANCELED, which is
+			 * then the result; a syscall that did complete keeps its real
+			 * result.
 			 */
-			if (events && cqe.threads.res == -EAGAIN && !ior_threads_pool_rw_nowait(&w->sqe)) {
+			if (events && ior_threads_pool_res_would_block(cqe.threads.res)
+					&& !ior_threads_pool_rw_nowait(&w->sqe)) {
 				uint32_t mask = events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT;
-				if (ior_threads_pool_hand_to_poller(pool, w, lt, mask) == 0) {
+				int ret = ior_threads_pool_hand_to_poller(pool, w, lt, mask);
+				if (ret == 0) {
 					atomic_fetch_add(&pool->tasks_completed, count);
 					return;
 				}
+				cqe.threads.res = ret;
 			}
 		}
 		ior_threads_pool_finish_op(pool, w, &cqe);
@@ -1002,7 +1047,9 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len,
 					sqe->threads.rw_flags);
 			const void *buf = (const void *) (uintptr_t) sqe->threads.addr;
-			ssize_t ret = send(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
+			// Never block a worker: readiness is waited for on the poller.
+			ssize_t ret = send(sqe->threads.fd, buf, sqe->threads.len,
+					(int) sqe->threads.rw_flags | MSG_DONTWAIT);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("send end: res=%d", cqe->threads.res);
 			break;
@@ -1013,7 +1060,9 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len,
 					sqe->threads.rw_flags);
 			void *buf = (void *) (uintptr_t) sqe->threads.addr;
-			ssize_t ret = recv(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
+			// Never block a worker: readiness is waited for on the poller.
+			ssize_t ret = recv(sqe->threads.fd, buf, sqe->threads.len,
+					(int) sqe->threads.rw_flags | MSG_DONTWAIT);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("recv end: res=%d", cqe->threads.res);
 			break;
@@ -1086,7 +1135,7 @@ static void ior_threads_pool_timer_fired(void *owner, void *arg)
  * Arm a timeout. Validates the timespec and hands the work item to the shared
  * pool's timer thread, which finishes it on expiry. Invalid timespecs (and a
  * heap allocation failure) finish inline so the caller never has to
- * special-case them. Arming happens under work_lock so that a cancel racing
+ * special-case them. Arming happens under arm_lock so that a cancel racing
  * it either finds the armed timer or, having claimed the op first, is
  * honoured here.
  */
@@ -1107,7 +1156,7 @@ static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work)
 				? ts_ns
 				: ior_worker_pool_monotonic_ns() + ts_ns;
 
-		pthread_mutex_lock(&pool->work_lock);
+		pthread_mutex_lock(&pool->arm_lock);
 		int ret = ior_worker_pool_arm_timer(
 				pool->wp, deadline_ns, ior_threads_pool_timer_fired, NULL, work);
 		if (ret < 0) {
@@ -1117,7 +1166,7 @@ static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work)
 			// Claimed between enter and arm; the timer never fires.
 			err = ECANCELED;
 		}
-		pthread_mutex_unlock(&pool->work_lock);
+		pthread_mutex_unlock(&pool->arm_lock);
 	}
 
 	if (err) {
@@ -1190,19 +1239,37 @@ static int ior_threads_pool_cancel_one(ior_threads_pool *pool, ior_work *w, ior_
 				}
 				continue;
 
-			case IOR_WORK_TIMER:
+			case IOR_WORK_TRYING:
+				// A non-blocking attempt in progress: like io_uring's transient
+				// poll ownership, report it as running. The claim still keeps
+				// the worker from parking it: the attempt either completes
+				// with its real result or ends as -ECANCELED.
+				if (atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED)) {
+					return -EALREADY;
+				}
+				continue;
+
+			case IOR_WORK_TIMER: {
+				// Under arm_lock the worker is either before or after its
+				// arm-and-check, never in between (see arm_timer).
+				pthread_mutex_lock(&pool->arm_lock);
 				if (ior_worker_pool_cancel_timer(pool->wp, w) == 0) {
 					atomic_store_explicit(&w->state, IOR_WORK_CANCELLED, memory_order_release);
+					pthread_mutex_unlock(&pool->arm_lock);
 					w->chain = NULL; // a linked rest was already finished by the worker
 					w->next = *done;
 					*done = w;
 					return 0;
 				}
 				// Firing, or not armed yet: whoever finishes it sees the claim.
-				if (atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED)) {
+				int claimed
+						= atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED);
+				pthread_mutex_unlock(&pool->arm_lock);
+				if (claimed) {
 					return 0;
 				}
 				continue;
+			}
 
 			case IOR_WORK_POLLING: {
 				ior_threads_poller *poller
@@ -1258,7 +1325,7 @@ static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self)
 			continue;
 		}
 		int state = atomic_load_explicit(&w->state, memory_order_acquire);
-		if (state == IOR_WORK_FREE || state == IOR_WORK_LINKED) {
+		if (state == IOR_WORK_FREE || state == IOR_WORK_LINKED || state == IOR_WORK_DONE) {
 			continue;
 		}
 		if (!ior_threads_pool_cancel_match(w, c)) {
