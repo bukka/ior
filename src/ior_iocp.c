@@ -793,8 +793,17 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 }
 
 /*
- * Associate h with the port on first use. Also returns the handle's current
- * cancel generation in *gen, which the op about to be issued records.
+ * Associate h with the port before every issue. Also returns the handle's
+ * current cancel generation in *gen, which the op about to be issued records.
+ *
+ * The kernel is asked every time rather than once per handle value: ior does
+ * not see the caller close a handle, and the next socket or file the process
+ * opens routinely gets the same value back, so a "seen before" cache would
+ * skip the association for a brand-new object and its completions would never
+ * reach the port (a connect that never completes, a recv that never returns).
+ * CreateIoCompletionPort on a handle that is already associated fails with
+ * ERROR_INVALID_PARAMETER; the set of handles this context associated turns
+ * that into "still ours, fine" against "bound to some other port, refuse".
  */
 static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen)
 {
@@ -805,20 +814,20 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen)
 	EnterCriticalSection(&ctx->handles.lock);
 
 	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, h);
-	if (entry) {
-		*gen = entry->cancel_gen;
-		LeaveCriticalSection(&ctx->handles.lock);
-		return 0;
-	}
 
 	HANDLE result = CreateIoCompletionPort(h, ctx->iocp_handle, (ULONG_PTR) h, 0);
 	if (result == NULL) {
 		DWORD err = GetLastError();
-		LeaveCriticalSection(&ctx->handles.lock);
-		return win_error_to_errno(err);
+		if (!(err == ERROR_INVALID_PARAMETER && entry)) {
+			LeaveCriticalSection(&ctx->handles.lock);
+			return win_error_to_errno(err);
+		}
+		// Already associated, and by this context: the same object is still open.
 	}
 
-	entry = handle_set_insert_locked(&ctx->handles, h);
+	if (!entry) {
+		entry = handle_set_insert_locked(&ctx->handles, h);
+	}
 	*gen = entry ? entry->cancel_gen : 0;
 	LeaveCriticalSection(&ctx->handles.lock);
 
