@@ -5,6 +5,7 @@ set(BENCH_SOURCES
     ior_bench.c
     bench_metrics.c
     bench_trace.c
+    bench_wait.c
     scenario_socket.c
     scenario_file.c
     scenario_mixed.c

@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,19 @@ uint64_t bench_now_ns(void)
 int bench_fd_is_valid(ior_fd_t fd)
 {
 	return fd >= 0;
+}
+
+int bench_wait_readable(ior_fd_t fd, int timeout_ms)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	int ret;
+	do {
+		ret = poll(&pfd, 1, timeout_ms);
+	} while (ret < 0 && errno == EINTR);
+	if (ret < 0) {
+		return -errno;
+	}
+	return ret > 0 ? 1 : 0;
 }
 
 void bench_close_fd(ior_fd_t fd)

@@ -85,6 +85,13 @@ void bench_close_fd(ior_fd_t fd);
 /* True if fd is a valid descriptor (handles the HANDLE-vs-int difference). */
 int bench_fd_is_valid(ior_fd_t fd);
 
+/*
+ * Wait up to timeout_ms for a descriptor from ior_notify_fd() to become
+ * readable (poll() on POSIX, WSAPoll() on Windows). Returns 1 if readable, 0
+ * on timeout, negative errno on error.
+ */
+int bench_wait_readable(ior_fd_t fd, int timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

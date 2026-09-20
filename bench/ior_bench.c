@@ -52,7 +52,9 @@ static void usage(const char *prog)
 	printf("  --race-pct P       cancel: %% of rounds sending data in the cancel's batch (default "
 		   "50)\n");
 	printf("  --workspace DIR    directory for temp files (default platform tmp/ior)\n");
-	printf("  --sq-entries N     submission queue size hint\n\n");
+	printf("  --sq-entries N     submission queue size hint\n");
+	printf("  --notify           block on ior_notify_fd() readability instead of\n");
+	printf("                     ior_wait_cqe(), reaping with peeks (embedded-loop style)\n\n");
 	printf("Output:\n");
 	printf("  --csv              print machine-readable CSV instead of a table\n");
 	printf("  --help             show this help\n");
@@ -79,6 +81,7 @@ static void defaults(bench_options *o)
 	o->race_pct = 50;
 	o->workspace = NULL;
 	o->sq_entries = 0;
+	o->notify = 0;
 }
 
 /* Run one scenario, print results, and return the number of correctness errors
@@ -123,6 +126,11 @@ static int run_smoke(void)
 	/* socket, linked timeout guard */
 	o.timer_mode = BENCH_TIMER_LINKED;
 	errors += run_one(bench_run_socket, "socket", "timer=linked", &o, 0);
+
+	/* socket again, blocking on ior_notify_fd() the way an embedding loop does */
+	o.timer_mode = BENCH_TIMER_NONE;
+	o.notify = 1;
+	errors += run_one(bench_run_socket, "socket", "timer=none notify", &o, 0);
 
 	/* file */
 	defaults(&o);
@@ -191,6 +199,8 @@ int main(int argc, char **argv)
 			smoke = 1;
 		} else if (strcmp(a, "--csv") == 0) {
 			csv = 1;
+		} else if (strcmp(a, "--notify") == 0) {
+			o.notify = 1;
 		} else if (strcmp(a, "--duration") == 0) {
 			o.duration_s = strtod(NEXT(), NULL);
 			o.ops = 0;
@@ -258,6 +268,9 @@ int main(int argc, char **argv)
 
 	if (csv) {
 		bench_metrics_print_csv_header();
+	}
+	if (o.notify) {
+		fprintf(stderr, "blocking on ior_notify_fd() instead of ior_wait_cqe()\n");
 	}
 
 	uint64_t errors = 0;

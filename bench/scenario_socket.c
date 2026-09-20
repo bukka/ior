@@ -274,7 +274,7 @@ static int run_loop(sock_ctx *s)
 		/* Nothing harvested but work is outstanding: block for a completion. */
 		if (n == 0 && s->inflight > 0) {
 			ior_cqe *cqe = NULL;
-			int ret = BENCH_WAIT_CQE(s->ior, &cqe, s->completed_rt);
+			int ret = bench_wait_completion(s->ior, s->opts, &cqe, s->completed_rt);
 			if (ret < 0 && ret != -EAGAIN && ret != -EINTR && ret != -ETIME) {
 				return ret;
 			}

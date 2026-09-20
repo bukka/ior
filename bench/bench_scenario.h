@@ -11,6 +11,7 @@
 #define BENCH_SCENARIO_H
 
 #include <stdint.h>
+#include "../src/ior.h"
 #include "bench_metrics.h"
 
 #ifdef __cplusplus
@@ -44,7 +45,22 @@ typedef struct bench_options {
 	const char *workspace; /* directory for temp files */
 
 	uint32_t sq_entries; /* ior submission queue size */
+
+	/* Block on ior_notify_fd() readability instead of ior_wait_cqe(), the way
+	 * an embedding event loop would; completions are then reaped by peeks. */
+	int notify;
 } bench_options;
+
+/*
+ * Block until something may have completed, the way the run was configured:
+ * ior_wait_cqe() (with the stall watchdog under BENCH_TRACE), or with
+ * opts->notify a wait for ior_notify_fd() to become readable followed by
+ * ior_notify_clear(), leaving the reap to the scenario's next peek. Returns 0
+ * or -EAGAIN when the loop should peek again, -ETIME when the wait interval
+ * elapsed, another negative errno on failure.
+ */
+int bench_wait_completion(
+		ior_ctx *ctx, const bench_options *opts, ior_cqe **cqe, uint64_t progress);
 
 /*
  * Run a scenario. Each fills `m` (already init'd by the caller) and returns 0 on

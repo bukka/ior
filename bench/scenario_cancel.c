@@ -318,7 +318,7 @@ static int run_loop(cancel_ctx *s)
 
 		if (n == 0 && s->inflight > 0 && s->ready_count == 0) {
 			ior_cqe *cqe = NULL;
-			int ret = BENCH_WAIT_CQE(s->ior, &cqe, s->rounds);
+			int ret = bench_wait_completion(s->ior, s->opts, &cqe, s->rounds);
 			if (ret < 0 && ret != -EAGAIN && ret != -EINTR && ret != -ETIME) {
 				return ret;
 			}

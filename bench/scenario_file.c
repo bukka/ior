@@ -147,7 +147,7 @@ static int run_loop(file_ctx *f)
 		 * for the next completion instead of spinning. */
 		if (n == 0 && f->inflight > 0) {
 			ior_cqe *cqe = NULL;
-			int ret = BENCH_WAIT_CQE(f->ior, &cqe, f->completed);
+			int ret = bench_wait_completion(f->ior, f->opts, &cqe, f->completed);
 			if (ret < 0 && ret != -EAGAIN && ret != -EINTR && ret != -ETIME) {
 				return ret;
 			}
