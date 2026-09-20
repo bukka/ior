@@ -892,6 +892,14 @@ static ior_fd_t ior_uring_backend_notify_fd(void *backend_ctx)
 		return IOR_INVALID_FD;
 	}
 	ctx->notify_fd = efd;
+
+	// Completions posted before the registration are not announced by the
+	// kernel; signal once for them so the caller's first wait sees them,
+	// as it would on the other backends.
+	if (io_uring_cq_ready(&ctx->ring) > 0) {
+		uint64_t one = 1;
+		(void) !write(efd, &one, sizeof(one));
+	}
 	return efd;
 }
 

@@ -734,6 +734,10 @@ uint32_t ior_cqe_get_flags(ior_ctx *ctx, ior_cqe *cqe);
  * registered eventfd's own behaviour, whose counter tracks completions posted
  * rather than entries still in the queue.
  *
+ * Completions already pending when the descriptor is first requested are
+ * announced by that call, so a loop may create the descriptor after
+ * submitting.
+ *
  * On the io_uring backend this is an eventfd registered with the ring (created
  * on first call); on the threads backend the eventfd or pipe workers already
  * signal; on Windows the readable end of a loopback socket pair fed by a

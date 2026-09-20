@@ -83,7 +83,10 @@ static void test_notify_nop(void **state)
 }
 
 // A recv with nothing to read does not signal; the send that feeds it does,
-// and both completions are then visible to peeks.
+// and both completions are then visible to peeks. Cleared before reaping, as
+// the contract says: the two completions come from different threads, and a
+// signal for one already reaped may still land after a clear that follows the
+// reap (a harmless spurious wakeup, not something to assert against).
 static void test_notify_recv_late(void **state)
 {
 	notify_state *s = (notify_state *) *state;
@@ -102,9 +105,8 @@ static void test_notify_recv_late(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 
 	assert_int_equal(test_wait_readable(s->nfd, 2000), 1);
-	reap_peek(s, 2, (void *) 0x2);
 	assert_return_code(ior_notify_clear(s->ctx), 0);
-	assert_int_equal(test_wait_readable(s->nfd, 0), 0);
+	reap_peek(s, 2, (void *) 0x2);
 }
 
 static int32_t notify_work_fn(ior_work_token *token, void *arg)
@@ -174,6 +176,30 @@ static void test_notify_clear_then_more(void **state)
 	reap_peek(s, 1, (void *) 0x5);
 }
 
+// A completion posted before the first ior_notify_fd() call is announced
+// by that call (a fresh context that has not requested the descriptor yet).
+static void test_notify_late_request(void **state)
+{
+	(void) state;
+	ior_ctx *ctx;
+	assert_return_code(ior_queue_init(32, &ctx), 0);
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_nop(ctx, sqe);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x7);
+	assert_true(ior_submit(ctx) >= 0);
+
+	ior_fd_t nfd = ior_notify_fd(ctx);
+	assert_true(test_fd_is_valid(nfd));
+	assert_int_equal(test_wait_readable(nfd, 2000), 1);
+	assert_return_code(ior_notify_clear(ctx), 0);
+	ior_cqe *cqe = NULL;
+	assert_return_code(ior_peek_cqe(ctx, &cqe), 0);
+	assert_int_equal((uintptr_t) ior_cqe_get_data(ctx, cqe), 0x7);
+	ior_cqe_seen(ctx, cqe);
+	ior_queue_exit(ctx);
+}
+
 // ior_wait_cqe() still works alongside the exported descriptor.
 static void test_notify_mixed_wait(void **state)
 {
@@ -206,6 +232,7 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_notify_work, setup_notify, teardown_notify),
 		cmocka_unit_test_setup_teardown(test_notify_timer, setup_notify, teardown_notify),
 		cmocka_unit_test_setup_teardown(test_notify_clear_then_more, setup_notify, teardown_notify),
+		cmocka_unit_test(test_notify_late_request),
 		cmocka_unit_test_setup_teardown(test_notify_mixed_wait, setup_notify, teardown_notify),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
