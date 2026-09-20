@@ -200,7 +200,7 @@ static int run_loop(mix_ctx *x)
 		}
 		if (n == 0 && x->inflight > 0) {
 			ior_cqe *cqe = NULL;
-			int ret = BENCH_WAIT_CQE(x->ior, &cqe, x->completed);
+			int ret = bench_wait_completion(x->ior, x->opts, &cqe, x->completed);
 			if (ret < 0 && ret != -EAGAIN && ret != -EINTR && ret != -ETIME) {
 				return ret;
 			}

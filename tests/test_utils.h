@@ -80,6 +80,13 @@ int test_make_socketpair(ior_fd_t fds[2]);
 int test_set_nonblocking(ior_fd_t fd);
 
 /*
+ * Wait up to timeout_ms for a descriptor from ior_notify_fd() to become
+ * readable (poll() on POSIX, WSAPoll() on Windows). Returns 1 if readable,
+ * 0 on timeout, negative errno on error.
+ */
+int test_wait_readable(ior_fd_t fd, int timeout_ms);
+
+/*
  * Current value of the monotonic clock the backends use for absolute timeouts
  * (IOR_TIMEOUT_ABS), in nanoseconds: CLOCK_MONOTONIC on POSIX, QPC on Windows.
  * Used by tests to build an absolute deadline in the backend's own clock base.

@@ -175,7 +175,7 @@ static int run_loop(work_ctx *w)
 		}
 		if (n == 0 && w->inflight > 0) {
 			ior_cqe *cqe = NULL;
-			int ret = BENCH_WAIT_CQE(w->ior, &cqe, w->completed);
+			int ret = bench_wait_completion(w->ior, w->opts, &cqe, w->completed);
 			if (ret < 0 && ret != -EAGAIN && ret != -EINTR && ret != -ETIME) {
 				return ret;
 			}

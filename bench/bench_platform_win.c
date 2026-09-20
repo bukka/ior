@@ -50,6 +50,16 @@ int bench_fd_is_valid(ior_fd_t fd)
 	return fd != NULL && fd != INVALID_HANDLE_VALUE;
 }
 
+int bench_wait_readable(ior_fd_t fd, int timeout_ms)
+{
+	WSAPOLLFD pfd = { .fd = (SOCKET) fd, .events = POLLRDNORM };
+	int ret = WSAPoll(&pfd, 1, timeout_ms);
+	if (ret == SOCKET_ERROR) {
+		return -EIO;
+	}
+	return ret > 0 ? 1 : 0;
+}
+
 void bench_close_fd(ior_fd_t fd)
 {
 	if (!bench_fd_is_valid(fd)) {
