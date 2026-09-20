@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "config.h"
-#ifdef IOR_HAVE_SPLICE
+#if defined(IOR_HAVE_SPLICE) || defined(IOR_HAVE_ACCEPT4)
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <unistd.h>
@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <fcntl.h>
 #include <time.h>
 #include <poll.h>
 #include <limits.h>
@@ -27,7 +28,7 @@ typedef off_t loff_t;
 static void ior_threads_pool_run_job(void *owner, ior_worker_pool_job *job);
 static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *head);
 static void ior_threads_pool_process_single_sqe(
-		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, ior_work_token *token);
+		ior_threads_pool *pool, ior_work *w, ior_cqe *cqe, ior_work_token *token);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work);
 static int ior_threads_pool_timer_valid(const ior_work *work);
@@ -409,6 +410,7 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		w->cur_token = NULL;
 		w->deadline_ns = 0;
 		w->ready = 0;
+		w->connecting = 0;
 		if (w->sqe.threads.opcode == IOR_OP_WORK) {
 			atomic_init(&w->token.cancelled, 0);
 			w->token.shutdown = &pool->wp->shutdown;
@@ -537,9 +539,11 @@ static short ior_threads_pool_rw_events(const ior_sqe *sqe)
 	switch (sqe->threads.opcode) {
 		case IOR_OP_READ:
 		case IOR_OP_RECV:
+		case IOR_OP_ACCEPT:
 			return POLLIN;
 		case IOR_OP_WRITE:
 		case IOR_OP_SEND:
+		case IOR_OP_CONNECT:
 			return POLLOUT;
 		default:
 			return 0;
@@ -579,6 +583,10 @@ static int ior_threads_pool_rw_needs_nonblock(const ior_sqe *sqe)
 	if (!IOR_SEND_HONOURS_DONTWAIT && sqe->threads.opcode == IOR_OP_SEND) {
 		return 1;
 	}
+	// accept(2) and connect(2) have no per-call non-blocking flag either.
+	if (sqe->threads.opcode == IOR_OP_ACCEPT || sqe->threads.opcode == IOR_OP_CONNECT) {
+		return 1;
+	}
 	return (sqe->threads.opcode == IOR_OP_READ || sqe->threads.opcode == IOR_OP_WRITE)
 			&& sqe->threads.off == IOR_OFF_NONE;
 }
@@ -599,8 +607,12 @@ static int ior_threads_pool_set_nonblock(int fd)
 	return ioctl(fd, FIONBIO, &on) < 0 ? -1 : 0;
 }
 
-static int ior_threads_pool_res_would_block(int32_t res)
+static int ior_threads_pool_res_would_block(uint8_t opcode, int32_t res)
 {
+	if (opcode == IOR_OP_CONNECT) {
+		// The connection proceeds in the background: wait for writability.
+		return res == -EINPROGRESS || res == -EALREADY;
+	}
 	return res == -EAGAIN || res == -EWOULDBLOCK;
 }
 
@@ -757,7 +769,7 @@ static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *po
 static int ior_threads_pool_process_work_timed(ior_threads_pool *pool, ior_work *w, ior_work *lt,
 		ior_threads_pool_lt_arb *arb, ior_cqe *gcqe, ior_cqe *lcqe)
 {
-	ior_threads_pool_process_single_sqe(pool, &w->sqe, gcqe, w->cur_token);
+	ior_threads_pool_process_single_sqe(pool, w, gcqe, w->cur_token);
 
 	int fired = 0;
 	if (arb) {
@@ -985,7 +997,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 			cqe.threads.user_data = w->sqe.threads.user_data;
 			cqe.threads.res = -ECANCELED;
 		} else {
-			ior_threads_pool_process_single_sqe(pool, &w->sqe, &cqe, &w->token);
+			ior_threads_pool_process_single_sqe(pool, w, &cqe, &w->token);
 
 			/*
 			 * The op would block (send/recv are always issued with
@@ -996,7 +1008,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 			 * then the result; a syscall that did complete keeps its real
 			 * result.
 			 */
-			if (events && ior_threads_pool_res_would_block(cqe.threads.res)
+			if (events && ior_threads_pool_res_would_block(opcode, cqe.threads.res)
 					&& !ior_threads_pool_rw_nowait(&w->sqe)) {
 				uint32_t mask = events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT;
 				int ret = ior_threads_pool_hand_to_poller(pool, w, lt, mask);
@@ -1025,10 +1037,46 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 	atomic_fetch_add(&pool->tasks_completed, count);
 }
 
+/*
+ * Accept with accept4 semantics for the flags. Where accept4 is missing, or
+ * where the accepted socket inherits the listener's mode (BSD), set exactly
+ * the state the caller asked for: the listener is non-blocking because ior
+ * made it so, which must not leak into the accepted socket.
+ */
+static int ior_threads_pool_accept(
+		int fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags)
+{
+#ifdef IOR_HAVE_ACCEPT4
+	int nfd = accept4(fd, addr, addrlen, (int) flags);
+#else
+	int nfd = accept(fd, addr, addrlen);
+#endif
+	if (nfd < 0) {
+		return -errno;
+	}
+// accept4 is authoritative on Linux alone; elsewhere it may still hand back
+// the listener's mode, and without it the flags need applying by hand.
+#if !defined(IOR_HAVE_ACCEPT4) || !defined(__linux__)
+	int fl = fcntl(nfd, F_GETFL, 0);
+	if (fl >= 0) {
+		fl = (flags & IOR_ACCEPT_NONBLOCK) ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
+		(void) fcntl(nfd, F_SETFL, fl);
+	}
+	if (flags & IOR_ACCEPT_CLOEXEC) {
+		int fdfl = fcntl(nfd, F_GETFD, 0);
+		if (fdfl >= 0) {
+			(void) fcntl(nfd, F_SETFD, fdfl | FD_CLOEXEC);
+		}
+	}
+#endif
+	return nfd;
+}
+
 static void ior_threads_pool_process_single_sqe(
-		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, ior_work_token *token)
+		ior_threads_pool *pool, ior_work *w, ior_cqe *cqe, ior_work_token *token)
 {
 	(void) pool;
+	const ior_sqe *sqe = &w->sqe;
 
 	memset(cqe, 0, sizeof(*cqe));
 	cqe->threads.user_data = sqe->threads.user_data;
@@ -1152,8 +1200,41 @@ static void ior_threads_pool_process_single_sqe(
 			cqe->threads.res = -ECANCELED;
 			break;
 
-		case IOR_OP_ACCEPT:
-		case IOR_OP_CONNECT:
+		case IOR_OP_ACCEPT: {
+			IOR_LOG_TRACE("accept start: fd=%d", sqe->threads.fd);
+			cqe->threads.res = ior_threads_pool_accept(sqe->threads.fd,
+					(struct sockaddr *) (uintptr_t) sqe->threads.addr,
+					(socklen_t *) (uintptr_t) sqe->threads.off, sqe->threads.rw_flags);
+			IOR_LOG_TRACE("accept end: res=%d", cqe->threads.res);
+			break;
+		}
+
+		case IOR_OP_CONNECT: {
+			IOR_LOG_TRACE("connect start: fd=%d", sqe->threads.fd);
+			if (w->connecting) {
+				// Writable after -EINPROGRESS: the outcome is in SO_ERROR.
+				int err = 0;
+				socklen_t errlen = sizeof(err);
+				if (getsockopt(sqe->threads.fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0) {
+					err = errno;
+				}
+				cqe->threads.res = -err;
+			} else {
+				int ret = connect(sqe->threads.fd,
+						(const struct sockaddr *) (uintptr_t) sqe->threads.addr,
+						(socklen_t) sqe->threads.off);
+				if (ret < 0 && errno == EINTR) {
+					errno = EINPROGRESS; // the connection continues asynchronously
+				}
+				if (ret < 0 && errno == EINPROGRESS) {
+					w->connecting = 1;
+				}
+				cqe->threads.res = (ret < 0) ? -errno : 0;
+			}
+			IOR_LOG_TRACE("connect end: res=%d", cqe->threads.res);
+			break;
+		}
+
 		case IOR_OP_LISTEN:
 		case IOR_OP_BIND:
 			cqe->threads.res = -ENOSYS;
@@ -1261,6 +1342,8 @@ static int ior_threads_pool_op_has_fd(uint8_t opcode)
 		case IOR_OP_RECV:
 		case IOR_OP_POLL:
 		case IOR_OP_SPLICE:
+		case IOR_OP_ACCEPT:
+		case IOR_OP_CONNECT:
 			return 1;
 		default:
 			return 0;

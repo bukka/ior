@@ -152,6 +152,9 @@ typedef struct ior_backend_ops {
 	void (*prep_send)(ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags);
 	void (*prep_recv)(ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
 	void (*prep_poll_add)(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
+	void (*prep_accept)(
+			ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags);
+	void (*prep_connect)(ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen);
 	void (*prep_cancel)(ior_sqe *sqe, uint64_t user_data);
 	void (*prep_cancel_fd)(ior_sqe *sqe, ior_fd_t fd);
 	/* Optional (NULL = work ops unsupported). Takes backend_ctx because some

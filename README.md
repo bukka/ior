@@ -1,4 +1,4 @@
-# IOR - I/O Ring Library
+#IOR - I / O Ring Library
 
 A cross-platform library providing an io_uring-like API for asynchronous I/O operations.
 
@@ -16,6 +16,9 @@ The goal is to provide maximum performance on platforms with native async I/O su
 
 - Read and write operations
 - Socket send and receive operations
+- Socket accept and connect operations (`ior_prep_accept`,
+  `ior_prep_connect`), readiness-driven on the thread pool and through
+  AcceptEx/ConnectEx on Windows
 - Timer/timeout operations
 - Async cancellation of submitted operations (`ior_prep_cancel`,
   `ior_prep_cancel_fd`), with io_uring semantics on every backend
@@ -37,16 +40,16 @@ For detailed build instructions, options, and troubleshooting, see [BUILD.md](BU
 
 ### Quick Start
 ```bash
-# Clone and build
+#Clone and build
 git clone https://github.com/yourusername/ior.git
 cd ior
 cmake -B build
 cmake --build build
 
-# Run tests
+#Run tests
 ctest --test-dir build --output-on-failure
 
-# Install
+#Install
 sudo cmake --build build --target install
 ```
 
@@ -67,67 +70,67 @@ sudo cmake --build build --target install
 #include <fcntl.h>
 
 int main() {
-    // Initialize queue
-    ior_ctx *ctx;
-    if (ior_queue_init(32, &ctx) < 0) {
-        perror("ior_queue_init");
-        return 1;
-    }
-    
-    printf("Using backend: %s\n", ior_get_backend_name(ctx));
-    
-    // Open file
-    int fd = open("test.txt", O_RDONLY);
-    if (fd < 0) {
-        perror("open");
-        ior_queue_exit(ctx);
-        return 1;
-    }
-    
-    // Prepare read operation
-    char buffer[4096];
-    ior_sqe *sqe = ior_get_sqe(ctx);
-    if (!sqe) {
-        fprintf(stderr, "Failed to get SQE\n");
-        close(fd);
-        ior_queue_exit(ctx);
-        return 1;
-    }
-    
-    ior_prep_read(ctx, sqe, fd, buffer, sizeof(buffer), 0);
-    ior_sqe_set_data(ctx, sqe, NULL);
-    
-    // Submit and wait
-    if (ior_submit(ctx) < 0) {
-        perror("ior_submit");
-        close(fd);
-        ior_queue_exit(ctx);
-        return 1;
-    }
-    
-    // Wait for completion
-    ior_cqe *cqe;
-    if (ior_wait_cqe(ctx, &cqe) < 0) {
-        perror("ior_wait_cqe");
-        close(fd);
-        ior_queue_exit(ctx);
-        return 1;
-    }
-    
-    int32_t res = ior_cqe_get_res(ctx, cqe);
-    if (res < 0) {
-        fprintf(stderr, "Read error: %d\n", res);
-    } else {
-        printf("Read %d bytes\n", res);
-    }
-    
-    ior_cqe_seen(ctx, cqe);
-    
-    // Cleanup
-    close(fd);
-    ior_queue_exit(ctx);
-    
-    return 0;
+	// Initialize queue
+	ior_ctx *ctx;
+	if (ior_queue_init(32, &ctx) < 0) {
+		perror("ior_queue_init");
+		return 1;
+	}
+
+	printf("Using backend: %s\n", ior_get_backend_name(ctx));
+
+	// Open file
+	int fd = open("test.txt", O_RDONLY);
+	if (fd < 0) {
+		perror("open");
+		ior_queue_exit(ctx);
+		return 1;
+	}
+
+	// Prepare read operation
+	char buffer[4096];
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	if (!sqe) {
+		fprintf(stderr, "Failed to get SQE\n");
+		close(fd);
+		ior_queue_exit(ctx);
+		return 1;
+	}
+
+	ior_prep_read(ctx, sqe, fd, buffer, sizeof(buffer), 0);
+	ior_sqe_set_data(ctx, sqe, NULL);
+
+	// Submit and wait
+	if (ior_submit(ctx) < 0) {
+		perror("ior_submit");
+		close(fd);
+		ior_queue_exit(ctx);
+		return 1;
+	}
+
+	// Wait for completion
+	ior_cqe *cqe;
+	if (ior_wait_cqe(ctx, &cqe) < 0) {
+		perror("ior_wait_cqe");
+		close(fd);
+		ior_queue_exit(ctx);
+		return 1;
+	}
+
+	int32_t res = ior_cqe_get_res(ctx, cqe);
+	if (res < 0) {
+		fprintf(stderr, "Read error: %d\n", res);
+	} else {
+		printf("Read %d bytes\n", res);
+	}
+
+	ior_cqe_seen(ctx, cqe);
+
+	// Cleanup
+	close(fd);
+	ior_queue_exit(ctx);
+
+	return 0;
 }
 ```
 
@@ -156,19 +159,19 @@ ior_submit_and_wait(ctx, 2);
 
 // Process completions in order
 for (int i = 0; i < 2; i++) {
-    ior_cqe *cqe;
-    ior_wait_cqe(ctx, &cqe);
-    // ... process ...
-    ior_cqe_seen(ctx, cqe);
+	ior_cqe *cqe;
+	ior_wait_cqe(ctx, &cqe);
+	// ... process ...
+	ior_cqe_seen(ctx, cqe);
 }
 ```
 
 ### Compile and Link
 ```bash
-# Using pkg-config
+#Using pkg - config
 gcc example.c $(pkg-config --cflags --libs ior) -o example
 
-# Or manually
+#Or manually
 gcc example.c -I/usr/local/include -L/usr/local/lib -lior -lpthread -o example
 ```
 
@@ -240,6 +243,16 @@ void ior_prep_send(ior_ctx *ctx, ior_sqe *sqe, int sockfd, const void *buf,
 // Receive operation (socket)
 void ior_prep_recv(ior_ctx *ctx, ior_sqe *sqe, int sockfd, void *buf,
                    unsigned nbytes, int flags);
+
+// Accept a connection: completes with the new socket (a SOCKET cast to
+// int32 on Windows), filling addr/addrlen like accept(2); flags are
+// IOR_ACCEPT_NONBLOCK / IOR_ACCEPT_CLOEXEC for the accepted socket.
+void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, int fd, struct sockaddr *addr,
+                     socklen_t *addrlen, unsigned flags);
+
+// Connect a socket: completes with 0 or a negative errno.
+void ior_prep_connect(ior_ctx *ctx, ior_sqe *sqe, int fd,
+                      const struct sockaddr *addr, socklen_t addrlen);
 
 // Timeout operation
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,

@@ -212,6 +212,22 @@ if(IOR_PLATFORM_LINUX)
     endif()
 endif()
 
+# Check for accept4 (Linux, BSD); macOS emulates the flags
+set(IOR_HAVE_ACCEPT4 FALSE)
+if(NOT IOR_PLATFORM_WINDOWS)
+    check_c_source_compiles("
+        #define _GNU_SOURCE
+        #include <sys/socket.h>
+        int main(void) {
+            return accept4(0, (struct sockaddr *) 0, (socklen_t *) 0, SOCK_NONBLOCK | SOCK_CLOEXEC) < 0;
+        }
+    " HAVE_ACCEPT4)
+    if(HAVE_ACCEPT4)
+        set(IOR_HAVE_ACCEPT4 TRUE)
+        message(STATUS "accept4() available")
+    endif()
+endif()
+
 # Check for liburing on Linux
 set(IOR_HAVE_URING FALSE)
 set(IOR_URING_VERSION "unknown")

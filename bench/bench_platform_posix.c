@@ -59,6 +59,53 @@ void bench_close_fd(ior_fd_t fd)
 	}
 }
 
+void bench_close_fd_abort(ior_fd_t fd)
+{
+	if (bench_fd_is_valid(fd)) {
+		struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+		(void) setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+		close(fd);
+	}
+}
+
+ior_fd_t bench_fd_from_res(int32_t res)
+{
+	return res;
+}
+
+int bench_make_listener(ior_fd_t *fd, struct sockaddr_storage *addr, socklen_t *addrlen)
+{
+	int l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (l < 0) {
+		return -errno;
+	}
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	socklen_t alen = sizeof(a);
+	if (bind(l, (struct sockaddr *) &a, sizeof(a)) < 0 || listen(l, SOMAXCONN) < 0
+			|| getsockname(l, (struct sockaddr *) &a, &alen) < 0) {
+		int err = errno;
+		close(l);
+		return -err;
+	}
+	memcpy(addr, &a, sizeof(a));
+	*addrlen = sizeof(a);
+	*fd = l;
+	return 0;
+}
+
+int bench_make_tcp_socket(ior_fd_t *fd)
+{
+	int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s < 0) {
+		return -errno;
+	}
+	*fd = s;
+	return 0;
+}
+
 const char *bench_default_workspace(void)
 {
 	return "/tmp/ior";

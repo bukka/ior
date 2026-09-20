@@ -218,6 +218,22 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
 	}
 }
 
+void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr,
+		socklen_t *addrlen, unsigned flags)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_accept(sqe, fd, addr, addrlen, flags);
+	}
+}
+
+void ior_prep_connect(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_connect(sqe, fd, addr, addrlen);
+	}
+}
+
 void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data)
 {
 	if (ctx && sqe) {

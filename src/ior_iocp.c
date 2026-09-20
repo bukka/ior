@@ -14,6 +14,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>
 
 #include "ior_backend.h"
 #include <stdlib.h>
@@ -155,6 +157,16 @@ typedef struct ior_iocp_op {
 	// Overlapped I/O: the handle's cancel_gen when this request was issued.
 	uint32_t io_cancel_gen;
 
+	// IOR_OP_ACCEPT / IOR_OP_CONNECT. AcceptEx needs the accepted socket
+	// created up front and a buffer for both addresses; the user's address
+	// buffers are filled on completion. For connect, sa_len_val is addrlen.
+	SOCKET accept_sock;
+	struct sockaddr *sa;
+	socklen_t *sa_len;
+	socklen_t sa_len_val;
+	DWORD accept_recvd;
+	char accept_buf[2 * (sizeof(SOCKADDR_STORAGE) + 16)];
+
 	_Atomic int state; // IOCP_OP_*
 
 	// Free list linkage (preserved across prep_*)
@@ -287,6 +299,11 @@ typedef struct ior_ctx_iocp {
 	// ior_notify_fd() completion pump
 	iocp_pump pump;
 
+	// Winsock extension functions, fetched on first use (WSAIoctl).
+	LPFN_ACCEPTEX fn_acceptex;
+	LPFN_CONNECTEX fn_connectex;
+	LPFN_GETACCEPTEXSOCKADDRS fn_getacceptexsockaddrs;
+
 	// Handle association tracking
 	handle_set handles;
 
@@ -356,7 +373,24 @@ static int win_error_to_errno(DWORD err)
 		case WSAECONNRESET:
 			return -ECONNRESET;
 		case WSAECONNREFUSED:
+		case ERROR_CONNECTION_REFUSED:
 			return -ECONNREFUSED;
+		case WSAENETUNREACH:
+		case ERROR_NETWORK_UNREACHABLE:
+			return -ENETUNREACH;
+		case WSAEHOSTUNREACH:
+		case ERROR_HOST_UNREACHABLE:
+			return -EHOSTUNREACH;
+		case ERROR_SEM_TIMEOUT:
+			return -ETIMEDOUT;
+		case WSAEADDRINUSE:
+			return -EADDRINUSE;
+		case WSAEISCONN:
+			return -EISCONN;
+		case WSAEAFNOSUPPORT:
+			return -EAFNOSUPPORT;
+		case WSAEINVAL:
+			return -EINVAL;
 		case WSAECONNABORTED:
 			return -ECONNABORTED;
 		case WSAENOTCONN:
@@ -603,6 +637,11 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->cancel_key = 0;
 	op->cancel_flags = 0;
 	op->io_cancel_gen = 0;
+	op->accept_sock = INVALID_SOCKET;
+	op->sa = NULL;
+	op->sa_len = NULL;
+	op->sa_len_val = 0;
+	op->accept_recvd = 0;
 	atomic_store(&op->state, IOCP_OP_FREE);
 
 	return op;
@@ -612,6 +651,13 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	if (!op) {
 		return;
+	}
+
+	// An accept that never handed its socket over (failed, cancelled, or
+	// reclaimed at teardown) still owns it.
+	if (op->accept_sock != INVALID_SOCKET) {
+		closesocket(op->accept_sock);
+		op->accept_sock = INVALID_SOCKET;
 	}
 
 	atomic_store(&op->state, IOCP_OP_FREE);
@@ -747,8 +793,17 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 }
 
 /*
- * Associate h with the port on first use. Also returns the handle's current
- * cancel generation in *gen, which the op about to be issued records.
+ * Associate h with the port before every issue. Also returns the handle's
+ * current cancel generation in *gen, which the op about to be issued records.
+ *
+ * The kernel is asked every time rather than once per handle value: ior does
+ * not see the caller close a handle, and the next socket or file the process
+ * opens routinely gets the same value back, so a "seen before" cache would
+ * skip the association for a brand-new object and its completions would never
+ * reach the port (a connect that never completes, a recv that never returns).
+ * CreateIoCompletionPort on a handle that is already associated fails with
+ * ERROR_INVALID_PARAMETER; the set of handles this context associated turns
+ * that into "still ours, fine" against "bound to some other port, refuse".
  */
 static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen)
 {
@@ -759,20 +814,20 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen)
 	EnterCriticalSection(&ctx->handles.lock);
 
 	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, h);
-	if (entry) {
-		*gen = entry->cancel_gen;
-		LeaveCriticalSection(&ctx->handles.lock);
-		return 0;
-	}
 
 	HANDLE result = CreateIoCompletionPort(h, ctx->iocp_handle, (ULONG_PTR) h, 0);
 	if (result == NULL) {
 		DWORD err = GetLastError();
-		LeaveCriticalSection(&ctx->handles.lock);
-		return win_error_to_errno(err);
+		if (!(err == ERROR_INVALID_PARAMETER && entry)) {
+			LeaveCriticalSection(&ctx->handles.lock);
+			return win_error_to_errno(err);
+		}
+		// Already associated, and by this context: the same object is still open.
 	}
 
-	entry = handle_set_insert_locked(&ctx->handles, h);
+	if (!entry) {
+		entry = handle_set_insert_locked(&ctx->handles, h);
+	}
 	*gen = entry ? entry->cancel_gen : 0;
 	LeaveCriticalSection(&ctx->handles.lock);
 
@@ -946,6 +1001,184 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	}
 
 	return post_synthetic_completion(ctx, op, (DWORD) err, 0);
+}
+
+/* ================= Accept / connect (AcceptEx, ConnectEx) ================= */
+
+// Fetch a Winsock extension function pointer through a socket of its family.
+static int load_extension(SOCKET s, GUID guid, void **out)
+{
+	DWORD bytes = 0;
+	if (WSAIoctl(s, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), out, sizeof(*out),
+				&bytes, NULL, NULL)
+			!= 0) {
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * AcceptEx needs the accepted socket created up front, of the listener's
+ * family and protocol, overlapped so it can join the port later. The
+ * accepted socket is handed to the caller in res on success (see
+ * finish_socket_op) and closed on any failure.
+ */
+static int issue_accept(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	SOCKET ls = (SOCKET) op->fd;
+
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
+	if (ret < 0) {
+		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+	}
+
+	// A re-issue after a collateral abort starts over with a fresh socket.
+	if (op->accept_sock != INVALID_SOCKET) {
+		closesocket(op->accept_sock);
+		op->accept_sock = INVALID_SOCKET;
+	}
+
+	if (!ctx->fn_acceptex) {
+		GUID guid = WSAID_ACCEPTEX;
+		if (load_extension(ls, guid, (void **) &ctx->fn_acceptex) < 0) {
+			return post_synthetic_completion(ctx, op, (DWORD) WSAGetLastError(), 0);
+		}
+	}
+	if (!ctx->fn_getacceptexsockaddrs) {
+		GUID guid = WSAID_GETACCEPTEXSOCKADDRS;
+		if (load_extension(ls, guid, (void **) &ctx->fn_getacceptexsockaddrs) < 0) {
+			return post_synthetic_completion(ctx, op, (DWORD) WSAGetLastError(), 0);
+		}
+	}
+
+	WSAPROTOCOL_INFOW info;
+	int info_len = sizeof(info);
+	if (getsockopt(ls, SOL_SOCKET, SO_PROTOCOL_INFOW, (char *) &info, &info_len) != 0) {
+		return post_synthetic_completion(ctx, op, (DWORD) WSAGetLastError(), 0);
+	}
+	SOCKET as = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, &info, 0,
+			WSA_FLAG_OVERLAPPED);
+	if (as == INVALID_SOCKET) {
+		return post_synthetic_completion(ctx, op, (DWORD) WSAGetLastError(), 0);
+	}
+	op->accept_sock = as;
+	op->accept_recvd = 0;
+	atomic_store(&op->state, IOCP_OP_IO);
+
+	// No data is received with the accept (dwReceiveDataLength 0), so the
+	// completion arrives as soon as a connection is there.
+	DWORD addr_room = sizeof(SOCKADDR_STORAGE) + 16;
+	BOOL ok = ctx->fn_acceptex(
+			ls, as, op->accept_buf, 0, addr_room, addr_room, &op->accept_recvd, &op->overlapped);
+	if (ok) {
+		// Synchronous success: completion packet will still be posted to IOCP
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	int err = WSAGetLastError();
+	if (err == WSA_IO_PENDING) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	closesocket(as);
+	op->accept_sock = INVALID_SOCKET;
+	return post_synthetic_completion(ctx, op, (DWORD) err, 0);
+}
+
+/*
+ * ConnectEx needs a bound socket; an unbound one is bound to the wildcard
+ * address of the destination's family first, as connect(2) would do.
+ */
+static int issue_connect(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	SOCKET s = (SOCKET) op->fd;
+
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
+	if (ret < 0) {
+		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+	}
+	if (!op->sa) {
+		return post_synthetic_completion(ctx, op, ERROR_INVALID_PARAMETER, 0);
+	}
+
+	if (!ctx->fn_connectex) {
+		GUID guid = WSAID_CONNECTEX;
+		if (load_extension(s, guid, (void **) &ctx->fn_connectex) < 0) {
+			return post_synthetic_completion(ctx, op, (DWORD) WSAGetLastError(), 0);
+		}
+	}
+
+	SOCKADDR_STORAGE local;
+	int local_len = sizeof(local);
+	if (getsockname(s, (struct sockaddr *) &local, &local_len) != 0
+			&& WSAGetLastError() == WSAEINVAL) {
+		memset(&local, 0, sizeof(local));
+		local.ss_family = op->sa->sa_family;
+		int bind_len = op->sa->sa_family == AF_INET6 ? (int) sizeof(struct sockaddr_in6)
+													 : (int) sizeof(struct sockaddr_in);
+		if (bind(s, (struct sockaddr *) &local, bind_len) != 0) {
+			return post_synthetic_completion(ctx, op, (DWORD) WSAGetLastError(), 0);
+		}
+	}
+
+	atomic_store(&op->state, IOCP_OP_IO);
+	BOOL ok = ctx->fn_connectex(s, op->sa, (int) op->sa_len_val, NULL, 0, NULL, &op->overlapped);
+	if (ok) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	int err = WSAGetLastError();
+	if (err == WSA_IO_PENDING) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	return post_synthetic_completion(ctx, op, (DWORD) err, 0);
+}
+
+/*
+ * Completion side of accept and connect, run at dequeue before the CQE is
+ * built: an accepted socket must inherit the listener's context and the
+ * caller's address buffers are filled; a connected socket must have its
+ * context updated too. A failure closes the accepted socket.
+ */
+static void finish_socket_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	if (op->opcode == IOR_OP_ACCEPT) {
+		if (op->accept_sock == INVALID_SOCKET) {
+			return;
+		}
+		if (op->error_code == ERROR_SUCCESS) {
+			SOCKET ls = (SOCKET) op->fd;
+			if (setsockopt(op->accept_sock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+						(const char *) &ls, sizeof(ls))
+					!= 0) {
+				op->error_code = (DWORD) WSAGetLastError();
+			} else if (op->sa && op->sa_len) {
+				struct sockaddr *la = NULL, *ra = NULL;
+				int la_len = 0, ra_len = 0;
+				DWORD addr_room = sizeof(SOCKADDR_STORAGE) + 16;
+				ctx->fn_getacceptexsockaddrs(
+						op->accept_buf, 0, addr_room, addr_room, &la, &la_len, &ra, &ra_len);
+				int n = ra_len < (int) *op->sa_len ? ra_len : (int) *op->sa_len;
+				if (n > 0) {
+					memcpy(op->sa, ra, (size_t) n);
+				}
+				*op->sa_len = (socklen_t) ra_len;
+			}
+		}
+		if (op->error_code != ERROR_SUCCESS) {
+			closesocket(op->accept_sock);
+			op->accept_sock = INVALID_SOCKET;
+		}
+	} else if (op->opcode == IOR_OP_CONNECT && op->error_code == ERROR_SUCCESS) {
+		if (setsockopt((SOCKET) op->fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0) != 0) {
+			op->error_code = (DWORD) WSAGetLastError();
+		}
+	}
 }
 
 /*
@@ -1318,6 +1551,12 @@ static void op_to_cqe(ior_iocp_op *op)
 		// The callback's return value (ready poll mask, cancel result), not
 		// a byte count.
 		op->cqe.iocp.res = op->work_res;
+	} else if (op->opcode == IOR_OP_ACCEPT) {
+		// The accepted socket, now the caller's (handles fit in 32 bits).
+		op->cqe.iocp.res = (int32_t) (intptr_t) op->accept_sock;
+		op->accept_sock = INVALID_SOCKET;
+	} else if (op->opcode == IOR_OP_CONNECT) {
+		op->cqe.iocp.res = 0;
 	} else {
 		op->cqe.iocp.res = (int32_t) op->bytes_transferred;
 	}
@@ -1697,6 +1936,8 @@ static bool iocp_op_has_fd(uint8_t opcode)
 		case IOR_OP_SEND:
 		case IOR_OP_RECV:
 		case IOR_OP_POLL:
+		case IOR_OP_ACCEPT:
+		case IOR_OP_CONNECT:
 			return true;
 		default:
 			return false;
@@ -1900,6 +2141,11 @@ static bool reissue_collateral_abort(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD b
 		case IOR_OP_RECV:
 			issue = issue_recv;
 			break;
+		case IOR_OP_ACCEPT:
+			// Restarted with a fresh accepted socket; a ConnectEx cannot be
+			// replayed on the same socket and stays reported.
+			issue = issue_accept;
+			break;
 		default:
 			return false;
 	}
@@ -2027,6 +2273,14 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 		case IOR_OP_RECV:
 			ret = issue_recv(ctx, op);
+			break;
+
+		case IOR_OP_ACCEPT:
+			ret = issue_accept(ctx, op);
+			break;
+
+		case IOR_OP_CONNECT:
+			ret = issue_connect(ctx, op);
 			break;
 
 		case IOR_OP_WORK:
@@ -2298,6 +2552,23 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	}
 
 	/*
+	 * Abort overlapped I/O still in flight: a parked recv or accept never
+	 * completes on its own, and the drain below would wait for it forever.
+	 * Each op is cancelled by its own OVERLAPPED rather than by handle, so a
+	 * handle the caller closed long ago and the kernel has since reused for
+	 * something else cannot be hit (CancelIoEx on it just fails). Every
+	 * producer thread is stopped by now, so nothing is issued after this pass.
+	 */
+	for (uint32_t i = 0; i < ctx->pool_size; i++) {
+		ior_iocp_op *op = &ctx->op_pool[i];
+		int state = atomic_load(&op->state);
+		if (state == IOCP_OP_IO || state == IOCP_OP_IO_CANCEL) {
+			atomic_store(&op->state, IOCP_OP_IO_CANCEL);
+			CancelIoEx((HANDLE) op->fd, &op->overlapped);
+		}
+	}
+
+	/*
 	 * Drain all in-flight completions from the IOCP.
 	 *
 	 * active_count tracks ops that have been posted to the IOCP
@@ -2315,9 +2586,9 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		if (!ok && overlapped == NULL) {
 			DWORD gle = GetLastError();
 			if (gle == WAIT_TIMEOUT || gle == ERROR_TIMEOUT) {
-				// Timeout with nothing dequeued; keep trying briefly.
-				// Safety valve: if nothing arrives after several rounds,
-				// break to avoid hanging forever during teardown.
+				// Nothing dequeued this round. Every counted completion is on
+				// its way (the pass above cancelled what was parked), so keep
+				// waiting rather than free the pool under the kernel's writes.
 				continue;
 			}
 			if (gle == ERROR_ABANDONED_WAIT_0) {
@@ -2755,6 +3026,9 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	// Mark completion (for DRAIN barriers)
 	atomic_fetch_add(&ctx->completed_cnt, 1);
 
+	if (op->opcode == IOR_OP_ACCEPT || op->opcode == IOR_OP_CONNECT) {
+		finish_socket_op(ctx, op);
+	}
 	op_to_cqe(op);
 
 	int ret = ready_queue_push(&ctx->ready, op);
@@ -3179,6 +3453,29 @@ static void ior_iocp_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t p
 	op->poll_mask = poll_mask;
 }
 
+static void ior_iocp_backend_prep_accept(
+		ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_ACCEPT;
+	op->fd = fd;
+	op->sa = addr;
+	op->sa_len = addrlen;
+	(void) flags; // an accepted socket is overlapped like any other
+}
+
+static void ior_iocp_backend_prep_connect(
+		ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_CONNECT;
+	op->fd = fd;
+	op->sa = (struct sockaddr *) addr;
+	op->sa_len_val = addrlen;
+}
+
 static void ior_iocp_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
 {
 	ior_iocp_op *op = (ior_iocp_op *) sqe;
@@ -3312,6 +3609,8 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_send = ior_iocp_backend_prep_send,
 	.prep_recv = ior_iocp_backend_prep_recv,
 	.prep_poll_add = ior_iocp_backend_prep_poll_add,
+	.prep_accept = ior_iocp_backend_prep_accept,
+	.prep_connect = ior_iocp_backend_prep_connect,
 	.prep_cancel = ior_iocp_backend_prep_cancel,
 	.prep_cancel_fd = ior_iocp_backend_prep_cancel_fd,
 	.prep_work = ior_iocp_backend_prep_work,

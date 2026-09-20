@@ -84,6 +84,36 @@ static int32_t wait_res_find_tag(ior_ctx *ctx, void *tag)
 	return 0;
 }
 
+/*
+ * Reap the poll carrying poll_tag and the write carrying write_tag, in either
+ * order, and return the poll's res. The write must be reaped too: the poll
+ * may complete (from the poller thread) before the worker's write() has
+ * returned, and a teardown that closes the socket under an op still in flight
+ * is a use of a closed descriptor the backend cannot prevent.
+ */
+static int32_t wait_poll_and_write(ior_ctx *ctx, void *poll_tag, void *write_tag)
+{
+	int32_t poll_res = 0;
+	int got_poll = 0, got_write = 0;
+	while (!got_poll || !got_write) {
+		ior_cqe *cqe = NULL;
+		assert_return_code(ior_wait_cqe(ctx, &cqe), 0);
+		void *data = ior_cqe_get_data(ctx, cqe);
+		int32_t res = ior_cqe_get_res(ctx, cqe);
+		ior_cqe_seen(ctx, cqe);
+		if (data == poll_tag) {
+			poll_res = res;
+			got_poll = 1;
+		} else if (data == write_tag) {
+			assert_int_equal(res, 1);
+			got_write = 1;
+		} else {
+			fail_msg("unexpected completion tag %p", data);
+		}
+	}
+	return poll_res;
+}
+
 /* The backend must advertise poll support. */
 static void test_poll_feature_flag(void **state)
 {
@@ -131,7 +161,7 @@ static void test_poll_becomes_readable(void **state)
 	ior_sqe_set_data(s->ctx, w, WRITE_TAG(0));
 	assert_true(ior_submit(s->ctx) >= 0);
 
-	int32_t res = wait_res_find_tag(s->ctx, POLL_TAG(0));
+	int32_t res = wait_poll_and_write(s->ctx, POLL_TAG(0), WRITE_TAG(0));
 	assert_true(res > 0);
 	assert_true(res & IOR_POLL_IN);
 }
@@ -182,7 +212,7 @@ static void test_poll_multiplex(void **state)
 		ior_sqe_set_data(s->ctx, w, WRITE_TAG(i));
 		assert_true(ior_submit(s->ctx) >= 0);
 
-		int32_t res = wait_res_find_tag(s->ctx, POLL_TAG(i));
+		int32_t res = wait_poll_and_write(s->ctx, POLL_TAG(i), WRITE_TAG(i));
 		assert_true(res > 0);
 		assert_true(res & IOR_POLL_IN);
 	}
@@ -224,7 +254,7 @@ static void test_poll_same_fd(void **state)
 	ior_sqe_set_data(s->ctx, w, WRITE_TAG(0));
 	assert_true(ior_submit(s->ctx) >= 0);
 
-	res = wait_res_find_tag(s->ctx, POLL_TAG(1));
+	res = wait_poll_and_write(s->ctx, POLL_TAG(1), WRITE_TAG(0));
 	assert_true(res > 0);
 	assert_true(res & IOR_POLL_IN);
 }

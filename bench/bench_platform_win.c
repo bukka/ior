@@ -73,6 +73,53 @@ void bench_close_fd(ior_fd_t fd)
 	}
 }
 
+void bench_close_fd_abort(ior_fd_t fd)
+{
+	if (bench_fd_is_valid(fd)) {
+		struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+		(void) setsockopt((SOCKET) fd, SOL_SOCKET, SO_LINGER, (const char *) &lg, sizeof(lg));
+		closesocket((SOCKET) fd);
+	}
+}
+
+ior_fd_t bench_fd_from_res(int32_t res)
+{
+	return (ior_fd_t) (intptr_t) res;
+}
+
+int bench_make_listener(ior_fd_t *fd, struct sockaddr_storage *addr, socklen_t *addrlen)
+{
+	SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (l == INVALID_SOCKET) {
+		return -EIO;
+	}
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int alen = sizeof(a);
+	if (bind(l, (struct sockaddr *) &a, sizeof(a)) == SOCKET_ERROR
+			|| listen(l, SOMAXCONN) == SOCKET_ERROR
+			|| getsockname(l, (struct sockaddr *) &a, &alen) == SOCKET_ERROR) {
+		closesocket(l);
+		return -EIO;
+	}
+	memcpy(addr, &a, sizeof(a));
+	*addrlen = sizeof(a);
+	*fd = (ior_fd_t) l;
+	return 0;
+}
+
+int bench_make_tcp_socket(ior_fd_t *fd)
+{
+	SOCKET s = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+	if (s == INVALID_SOCKET) {
+		return -EIO;
+	}
+	*fd = (ior_fd_t) s;
+	return 0;
+}
+
 const char *bench_default_workspace(void)
 {
 	static char path[MAX_PATH];

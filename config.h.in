@@ -18,6 +18,7 @@
 #cmakedefine IOR_HAVE_EPOLL
 #cmakedefine IOR_HAVE_KQUEUE
 #cmakedefine IOR_HAVE_SPLICE
+#cmakedefine IOR_HAVE_ACCEPT4
 
 /* Build options */
 #cmakedefine IOR_FORCE_PIPE
