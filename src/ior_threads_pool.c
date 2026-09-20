@@ -30,6 +30,7 @@ static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, ior_work_token *token);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work);
+static int ior_threads_pool_timer_valid(const ior_work *work);
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
 static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res);
 static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self);
@@ -196,9 +197,10 @@ static void ior_threads_pool_poll_done(void *owner, void *req, int res)
 	uint64_t count = 1;
 
 	// Claim the op back from the poller. A cancel that raced the poller's
-	// dispatch has promised -ECANCELED; honour it whatever the poller saw.
+	// dispatch has promised -ECANCELED; honour it whatever the poller saw,
+	// deadline included (the link timeout is then cancelled too).
 	int prev = atomic_exchange(&w->state, IOR_WORK_RUNNING);
-	if (prev == IOR_WORK_CANCELLED && res != -ETIME) {
+	if (prev == IOR_WORK_CANCELLED) {
 		res = -ECANCELED;
 	}
 
@@ -398,6 +400,7 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 	ior_work *prev = NULL;
 	int prev_link = 0;
 	ior_work *cancels = NULL;
+	ior_work *cancels_tail = NULL;
 	for (uint32_t p = consumed; p != cached; p++) {
 		ior_work *w = ior_threads_pool_work_alloc(pool);
 		w->sqe = sqes[p & ctx->sq_ring.mask];
@@ -418,8 +421,13 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		} else if (w->sqe.threads.opcode == IOR_OP_ASYNC_CANCEL
 				&& !(flags & (IOR_SQE_IO_LINK | IOR_SQE_IO_DRAIN))) {
 			atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
-			w->next = cancels;
-			cancels = w;
+			w->next = NULL;
+			if (cancels_tail) {
+				cancels_tail->next = w;
+			} else {
+				cancels = w;
+			}
+			cancels_tail = w;
 		} else {
 			atomic_store_explicit(&w->state, IOR_WORK_QUEUED, memory_order_release);
 			w->job.next = NULL;
@@ -649,10 +657,9 @@ static int ior_threads_pool_hand_to_poller(
 	if (ret == 0) {
 		w->ready = 0;
 		ret = ior_threads_poller_add(poller, w->sqe.threads.fd, mask, w->deadline_ns, w);
-		if (ret == 0
-				&& atomic_load_explicit(&w->state, memory_order_acquire) == IOR_WORK_CANCELLED) {
-			// Claimed between enter and add: the poller drops it as cancelled.
-			(void) ior_threads_poller_cancel(poller, w);
+		if (ret < 0) {
+			// Still ours, and about to fail: not claimable any more.
+			atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
 		}
 	}
 	pthread_mutex_unlock(&pool->work_lock);
@@ -744,7 +751,8 @@ static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *po
  *   - callback finishes first: work res = callback's return, LT = -ECANCELED;
  *   - deadline fires while the callback runs: work res = callback's return
  *     (posted when it returns), LT = -ETIME.
- * Returns non-zero if the deadline fired; drops this worker's arb ref.
+ * Returns non-zero if the deadline fired. The worker's arb ref is not
+ * dropped here.
  */
 static int ior_threads_pool_process_work_timed(ior_threads_pool *pool, ior_work *w, ior_work *lt,
 		ior_threads_pool_lt_arb *arb, ior_cqe *gcqe, ior_cqe *lcqe)
@@ -757,7 +765,8 @@ static int ior_threads_pool_process_work_timed(ior_threads_pool *pool, ior_work 
 		if (!atomic_compare_exchange_strong(&arb->state, &expected, 1)) {
 			fired = 1; // timer thread claimed the deadline while the callback ran
 		}
-		ior_threads_pool_lt_arb_release(arb);
+		// The caller drops the worker's ref once w is retired: until then a
+		// cancel may still flag the token through w->cur_token.
 	}
 
 	memset(lcqe, 0, sizeof(*lcqe));
@@ -811,8 +820,13 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		// Timers run on the dedicated timer thread, which finishes the op on
 		// expiry. A timeout completes with -ETIME, breaking any following link.
 		if (opcode == IOR_OP_TIMER) {
-			if (ior_threads_pool_enter(w, IOR_WORK_TIMER) < 0) {
+			// An invalid timespec fails as a running op: a cancel then reports
+			// -EALREADY rather than claiming an op that completes -EINVAL.
+			int valid = ior_threads_pool_timer_valid(w);
+			if (ior_threads_pool_enter(w, valid ? IOR_WORK_TIMER : IOR_WORK_RUNNING) < 0) {
 				ior_threads_pool_finish_res(pool, w, -ECANCELED);
+			} else if (!valid) {
+				ior_threads_pool_finish_res(pool, w, -EINVAL);
 			} else {
 				ior_threads_pool_arm_timer(pool, w);
 			}
@@ -934,14 +948,16 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 				memset(&lcqe, 0, sizeof(lcqe));
 				lcqe.threads.user_data = lt->sqe.threads.user_data;
 				lcqe.threads.res = -ECANCELED;
-				if (arb) {
-					ior_threads_pool_lt_arb_release(arb); // the timer drops its own
-				}
 			} else {
 				ior_threads_pool_process_work_timed(pool, w, lt, arb, &gcqe, &lcqe);
 			}
 			int failed = gcqe.threads.res < 0;
 			ior_threads_pool_finish_op(pool, w, &gcqe);
+			if (arb) {
+				// Only now: a cancel dereferences w->cur_token under work_lock
+				// while w is RUNNING, and finish_op took that lock to retire w.
+				ior_threads_pool_lt_arb_release(arb);
+			}
 			ior_threads_pool_finish_op(pool, lt, &lcqe);
 			count += 2;
 
@@ -1192,43 +1208,42 @@ static void ior_threads_pool_timer_fired(void *owner, void *arg)
 	ior_threads_pool_finish_res(pool, work, prev == IOR_WORK_CANCELLED ? -ECANCELED : -ETIME);
 }
 
+static int ior_threads_pool_timer_valid(const ior_work *work)
+{
+	ior_timespec *ts = (ior_timespec *) (uintptr_t) work->sqe.threads.addr;
+	return ts && ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000L;
+}
+
 /*
- * Arm a timeout. Validates the timespec and hands the work item to the shared
- * pool's timer thread, which finishes it on expiry. Invalid timespecs (and a
- * heap allocation failure) finish inline so the caller never has to
- * special-case them. Arming happens under arm_lock so that a cancel racing
- * it either finds the armed timer or, having claimed the op first, is
- * honoured here.
+ * Arm a timeout (already validated) on the shared pool's timer thread, which
+ * finishes it on expiry. A heap allocation failure finishes inline so the
+ * caller never has to special-case it. Arming happens under arm_lock so that
+ * a cancel racing it either finds the armed timer or, having claimed the op
+ * first, is honoured here - including when arming failed.
  */
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work)
 {
 	ior_timespec *ts = (ior_timespec *) (uintptr_t) work->sqe.threads.addr;
 	int err = 0;
 
-	if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L) {
-		err = EINVAL;
-	}
+	// IOR_TIMEOUT_ABS: ts is an absolute CLOCK_MONOTONIC deadline; otherwise
+	// it is a relative duration from now.
+	uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	uint64_t deadline_ns = (work->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
+			? ts_ns
+			: ior_worker_pool_monotonic_ns() + ts_ns;
 
-	if (!err) {
-		// IOR_TIMEOUT_ABS: ts is an absolute CLOCK_MONOTONIC deadline; otherwise
-		// it is a relative duration from now.
-		uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-		uint64_t deadline_ns = (work->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
-				? ts_ns
-				: ior_worker_pool_monotonic_ns() + ts_ns;
-
-		pthread_mutex_lock(&pool->arm_lock);
-		int ret = ior_worker_pool_arm_timer(
-				pool->wp, deadline_ns, ior_threads_pool_timer_fired, NULL, work);
-		if (ret < 0) {
-			err = ENOMEM;
-		} else if (atomic_load_explicit(&work->state, memory_order_acquire) == IOR_WORK_CANCELLED
-				&& ior_worker_pool_cancel_timer(pool->wp, work) == 0) {
-			// Claimed between enter and arm; the timer never fires.
-			err = ECANCELED;
-		}
-		pthread_mutex_unlock(&pool->arm_lock);
+	pthread_mutex_lock(&pool->arm_lock);
+	int ret = ior_worker_pool_arm_timer(
+			pool->wp, deadline_ns, ior_threads_pool_timer_fired, NULL, work);
+	int claimed = atomic_load_explicit(&work->state, memory_order_acquire) == IOR_WORK_CANCELLED;
+	if (ret < 0) {
+		err = claimed ? ECANCELED : ENOMEM;
+	} else if (claimed && ior_worker_pool_cancel_timer(pool->wp, work) == 0) {
+		// Claimed between enter and arm; the timer never fires.
+		err = ECANCELED;
 	}
+	pthread_mutex_unlock(&pool->arm_lock);
 
 	if (err) {
 		ior_threads_pool_finish_res(pool, work, -err);

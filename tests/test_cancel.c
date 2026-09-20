@@ -454,6 +454,49 @@ static void test_cancel_work_running(void **state)
 }
 
 /*
+ * A running callback guarded by a link timeout: the cancel must reach the
+ * token the callback actually polls (the pair's arbitration token, not the
+ * op's own), so the callback can bail out, and the link timeout then resolves
+ * as "op finished first".
+ */
+static void test_cancel_work_guarded_running(void **state)
+{
+	cancel_state *s = (cancel_state *) *state;
+	int32_t res[MAX_TAG];
+	char seen[MAX_TAG];
+	work_gate gate;
+	atomic_init(&gate.started, 0);
+	atomic_init(&gate.release, 0);
+	atomic_init(&gate.done, 0);
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	assert_return_code(ior_prep_work(s->ctx, w, gated_work, &gate), 0);
+	ior_sqe_set_data(s->ctx, w, TAG_OP);
+	ior_sqe_set_flags(s->ctx, w, IOR_SQE_IO_LINK);
+	ior_sqe *t = ior_get_sqe(s->ctx);
+	assert_non_null(t);
+	ior_timespec ts = { .tv_sec = 5, .tv_nsec = 0 };
+	ior_prep_link_timeout(s->ctx, t, &ts, 0);
+	ior_sqe_set_data(s->ctx, t, TAG_TMO);
+	assert_true(ior_submit(s->ctx) >= 0);
+	while (!atomic_load(&gate.started)) {
+		cancel_msleep(1);
+	}
+
+	submit_cancel(s, TAG_OP);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	uint64_t start = test_monotonic_now_ns();
+	reap_tags(s->ctx, 3, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], -EALREADY);
+	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED); // the callback's choice
+	assert_int_equal(res[(uintptr_t) TAG_TMO], -ECANCELED); // callback finished first
+	assert_true(test_monotonic_now_ns() - start < 2000000000ULL);
+	gate_join(&gate);
+}
+
+/*
  * A callback that has not started never runs when cancelled. The pool is
  * saturated with gated callbacks (more than its 32 worker cap) so the last
  * submitted one is certainly still queued when the cancel arrives.
@@ -688,6 +731,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(
 				test_cancel_recv_data_intact, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_work_running, setup_cancel, teardown_cancel),
+		cmocka_unit_test_setup_teardown(
+				test_cancel_work_guarded_running, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_work_queued, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_stress, setup_stress, teardown_stress),
 	};
