@@ -423,6 +423,35 @@ static void test_socket_send_dontwait(void **state)
 }
 #endif
 
+/*
+ * A send larger than the socket buffer completes short rather than occupying
+ * its worker until the peer drains. Readiness alone cannot give this: poll()
+ * promises only SO_SNDLOWAT bytes of room, while a blocking send does not
+ * return until all of len is queued.
+ */
+static void test_socket_send_larger_than_buffer(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	int sndbuf = 8192;
+	(void) setsockopt(s->sock[0], SOL_SOCKET, SO_SNDBUF, (void *) &sndbuf, sizeof(sndbuf));
+	(void) setsockopt(s->sock[1], SOL_SOCKET, SO_RCVBUF, (void *) &sndbuf, sizeof(sndbuf));
+
+	/* Far more than the buffers can hold, and nobody reads sock[1]. */
+	size_t len = 4u * 1024 * 1024;
+	char *buf = calloc(1, len);
+	assert_non_null(buf);
+
+	ior_sqe *snd = ior_get_sqe(s->ctx);
+	assert_non_null(snd);
+	ior_prep_send(s->ctx, snd, s->sock[0], buf, (unsigned) len, 0);
+	int32_t res = submit_one_and_get_res(s->ctx, snd, (void *) 0x74);
+
+	assert_true(res > 0);
+	assert_true((size_t) res < len);
+	free(buf);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -450,6 +479,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(
 				test_socket_send_dontwait, setup_socketpair, teardown_socketpair),
 #endif
+		cmocka_unit_test_setup_teardown(
+				test_socket_send_larger_than_buffer, setup_socketpair, teardown_socketpair),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

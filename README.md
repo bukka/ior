@@ -312,15 +312,36 @@ IOR automatically selects the best available backend:
 The thread pool backend uses:
 - Lock-free ring buffers for submission and completion queues
 - Out-of-order completion support for maximum parallelism
-- A single readiness poller thread (epoll/kqueue/poll) that gates blocking
+- A single readiness poller thread (epoll/kqueue/poll) that parks
   read/write/send/recv on pollable descriptors, so workers never block on a
   socket, non-blocking descriptors never spin on `EAGAIN`, and pending
-  operations stay cancellable
+  operations stay cancellable. Descriptors it cannot ask for a non-blocking
+  attempt per call are put in non-blocking mode (see below)
 - Operation chaining with `IOR_SQE_IO_LINK` flag
 - Ordering guarantees with `IOR_SQE_IO_DRAIN` flag
 - eventfd (Linux/FreeBSD 13+) or pipe-based notification
 - Dynamic worker thread scaling
 - Efficient work distribution and completion posting
+
+#### Descriptor blocking mode
+
+The thread backend may set `O_NONBLOCK` on a pollable descriptor you submit,
+and leaves it set. Do not rely on the blocking mode of a descriptor handed to
+ior, and do not assume a synchronous `read()` or `send()` of your own on that
+descriptor still waits.
+
+This is what lets a worker run an op that has no per-call non-blocking flag
+(`read`/`write` at the current position, and `send` on macOS, whose `sosend()`
+ignores `MSG_DONTWAIT`) without occupying a worker thread until the peer
+catches up. Readiness alone cannot give that guarantee for writes: `poll()`
+promises only `SO_SNDLOWAT` bytes of room, while a blocking write does not
+return until all of `len` is queued, so a write larger than the free space
+would wait however ready the descriptor looked.
+
+As on io_uring, a send or write may therefore complete short; callers must
+handle a partial result and submit the remainder. io_uring issues socket ops
+non-blocking in the kernel and needs no descriptor change; IOCP uses
+overlapped I/O and needs none either.
 
 ### IOCP Backend Design
 
