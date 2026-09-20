@@ -447,6 +447,27 @@ static void ior_threads_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_
 	sqe->threads.poll_events = poll_mask;
 }
 
+static void ior_threads_backend_prep_accept(
+		ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_ACCEPT;
+	sqe->threads.fd = fd;
+	sqe->threads.addr = (uint64_t) (uintptr_t) addr;
+	sqe->threads.off = (uint64_t) (uintptr_t) addrlen;
+	sqe->threads.rw_flags = flags;
+}
+
+static void ior_threads_backend_prep_connect(
+		ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_CONNECT;
+	sqe->threads.fd = fd;
+	sqe->threads.addr = (uint64_t) (uintptr_t) addr;
+	sqe->threads.off = addrlen;
+}
+
 static void ior_threads_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
 {
 	memset(sqe, 0, sizeof(*sqe));
@@ -561,6 +582,8 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_send = ior_threads_backend_prep_send,
 	.prep_recv = ior_threads_backend_prep_recv,
 	.prep_poll_add = ior_threads_backend_prep_poll_add,
+	.prep_accept = ior_threads_backend_prep_accept,
+	.prep_connect = ior_threads_backend_prep_connect,
 	.prep_cancel = ior_threads_backend_prep_cancel,
 	.prep_cancel_fd = ior_threads_backend_prep_cancel_fd,
 	.prep_work = ior_threads_backend_prep_work,

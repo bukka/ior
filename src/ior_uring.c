@@ -762,6 +762,24 @@ static void ior_uring_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t 
 	io_uring_prep_poll_add(s, (int) fd, poll_mask);
 }
 
+/* IOR_ACCEPT_* equal SOCK_* on Linux, so the flags pass through. */
+_Static_assert(IOR_ACCEPT_NONBLOCK == SOCK_NONBLOCK, "IOR_ACCEPT_NONBLOCK must match");
+_Static_assert(IOR_ACCEPT_CLOEXEC == SOCK_CLOEXEC, "IOR_ACCEPT_CLOEXEC must match");
+
+static void ior_uring_backend_prep_accept(
+		ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_accept(s, (int) fd, addr, addrlen, (int) flags);
+}
+
+static void ior_uring_backend_prep_connect(
+		ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_connect(s, (int) fd, addr, addrlen);
+}
+
 static void ior_uring_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
 {
 	struct io_uring_sqe *s = &sqe->uring.sqe;
@@ -958,6 +976,8 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_send = ior_uring_backend_prep_send,
 	.prep_recv = ior_uring_backend_prep_recv,
 	.prep_poll_add = ior_uring_backend_prep_poll_add,
+	.prep_accept = ior_uring_backend_prep_accept,
+	.prep_connect = ior_uring_backend_prep_connect,
 	.prep_cancel = ior_uring_backend_prep_cancel,
 	.prep_cancel_fd = ior_uring_backend_prep_cancel_fd,
 	.prep_work = ior_uring_backend_prep_work,

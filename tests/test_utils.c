@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #endif
 
 uint64_t test_monotonic_now_ns(void)
@@ -293,6 +294,46 @@ int test_set_nonblocking(ior_fd_t fd)
 	return 0;
 }
 
+int test_make_listener(ior_fd_t *fd, struct sockaddr_storage *addr, socklen_t *addrlen)
+{
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+		return -EIO;
+	}
+	SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (l == INVALID_SOCKET) {
+		return -EIO;
+	}
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int alen = sizeof(a);
+	if (bind(l, (struct sockaddr *) &a, sizeof(a)) == SOCKET_ERROR || listen(l, 16) == SOCKET_ERROR
+			|| getsockname(l, (struct sockaddr *) &a, &alen) == SOCKET_ERROR) {
+		closesocket(l);
+		return -EIO;
+	}
+	memcpy(addr, &a, sizeof(a));
+	*addrlen = sizeof(a);
+	*fd = (ior_fd_t) l;
+	return 0;
+}
+
+int test_make_tcp_socket(ior_fd_t *fd)
+{
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+		return -EIO;
+	}
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == INVALID_SOCKET) {
+		return -EIO;
+	}
+	*fd = (ior_fd_t) s;
+	return 0;
+}
+
 int test_wait_readable(ior_fd_t fd, int timeout_ms)
 {
 	WSAPOLLFD pfd = { .fd = (SOCKET) fd, .events = POLLRDNORM };
@@ -367,6 +408,39 @@ int test_set_nonblocking(ior_fd_t fd)
 	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
 		return -errno;
 	}
+	return 0;
+}
+
+int test_make_listener(ior_fd_t *fd, struct sockaddr_storage *addr, socklen_t *addrlen)
+{
+	int l = socket(AF_INET, SOCK_STREAM, 0);
+	if (l < 0) {
+		return -errno;
+	}
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	socklen_t alen = sizeof(a);
+	if (bind(l, (struct sockaddr *) &a, sizeof(a)) < 0 || listen(l, 16) < 0
+			|| getsockname(l, (struct sockaddr *) &a, &alen) < 0) {
+		int err = errno;
+		close(l);
+		return -err;
+	}
+	memcpy(addr, &a, sizeof(a));
+	*addrlen = sizeof(a);
+	*fd = l;
+	return 0;
+}
+
+int test_make_tcp_socket(ior_fd_t *fd)
+{
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0) {
+		return -errno;
+	}
+	*fd = s;
 	return 0;
 }
 

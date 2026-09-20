@@ -87,6 +87,17 @@ int test_set_nonblocking(ior_fd_t fd);
 int test_wait_readable(ior_fd_t fd, int timeout_ms);
 
 /*
+ * Create a listening loopback TCP socket on an ephemeral port. Fills *addr
+ * and *addrlen with the address to connect to. Returns 0 or a negative errno;
+ * close the socket with test_close_fd().
+ */
+int test_make_listener(ior_fd_t *fd, struct sockaddr_storage *addr, socklen_t *addrlen);
+
+/* Create an unconnected loopback-capable TCP socket (blocking, overlapped
+ * on Windows). Returns 0 or a negative errno. */
+int test_make_tcp_socket(ior_fd_t *fd);
+
+/*
  * Current value of the monotonic clock the backends use for absolute timeouts
  * (IOR_TIMEOUT_ABS), in nanoseconds: CLOCK_MONOTONIC on POSIX, QPC on Windows.
  * Used by tests to build an absolute deadline in the backend's own clock base.

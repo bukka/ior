@@ -32,6 +32,7 @@ set(TESTS
     test_work
     test_cancel
     test_notify
+    test_accept_connect
 )
 
 # Add test for splice only on Linux with splice support

@@ -40,12 +40,17 @@ extern "C" {
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+/* winsock2.h (for struct sockaddr / socklen_t in the accept and connect
+ * helpers) must precede windows.h; it includes it in the right order. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 /** Platform descriptor type used by all operations (HANDLE on Windows). */
 typedef HANDLE ior_fd_t;
 /** Invalid-descriptor sentinel for ::ior_fd_t. */
 #define IOR_INVALID_FD INVALID_HANDLE_VALUE
 #else
+#include <sys/socket.h>
 /** Platform descriptor type used by all operations (int on POSIX). */
 typedef int ior_fd_t;
 /** Invalid-descriptor sentinel for ::ior_fd_t. */
@@ -68,9 +73,8 @@ typedef struct ior_timespec {
 /**
  * @name Operation codes
  * Identify the type of operation an SQE carries; set by the ior_prep_*()
- * helpers. NOP/READ/WRITE/TIMER/SPLICE/SEND/RECV/LINK_TIMEOUT/WORK/POLL/
- * ASYNC_CANCEL are implemented; the remaining socket opcodes are reserved and
- * not yet wired to prep helpers.
+ * helpers. LISTEN and BIND are reserved and not yet wired to prep helpers;
+ * everything else is implemented on every backend.
  * @{
  */
 /** No-op; completes immediately with result 0. */
@@ -83,10 +87,9 @@ typedef struct ior_timespec {
 #define IOR_OP_TIMER 3
 /** Move data between descriptors (ior_prep_splice). */
 #define IOR_OP_SPLICE 4
-// Stage 2:
-/** Reserved: accept a connection (not yet implemented). */
+/** Accept a connection (ior_prep_accept); completes with the new socket. */
 #define IOR_OP_ACCEPT 5
-/** Reserved: connect a socket (not yet implemented). */
+/** Connect a socket (ior_prep_connect). */
 #define IOR_OP_CONNECT 6
 /** Reserved: listen on a socket (not yet implemented). */
 #define IOR_OP_LISTEN 7
@@ -156,6 +159,28 @@ typedef struct ior_timespec {
 /** Interpret the timespec as an absolute deadline on the monotonic clock
  *  rather than a relative duration. */
 #define IOR_TIMEOUT_ABS (1U << 0)
+/** @} */
+
+/**
+ * @name Accept flags
+ * Bits for the flags argument of ior_prep_accept(), applied to the accepted
+ * socket. Equal to SOCK_NONBLOCK / SOCK_CLOEXEC where the platform defines
+ * them (accept4 semantics), emulated elsewhere; ignored on Windows, where an
+ * accepted socket is an overlapped socket like any other.
+ * @{
+ */
+#ifdef SOCK_NONBLOCK
+#define IOR_ACCEPT_NONBLOCK SOCK_NONBLOCK
+#else
+/** Put the accepted socket in non-blocking mode. */
+#define IOR_ACCEPT_NONBLOCK (1U << 0)
+#endif
+#ifdef SOCK_CLOEXEC
+#define IOR_ACCEPT_CLOEXEC SOCK_CLOEXEC
+#else
+/** Mark the accepted socket close-on-exec. */
+#define IOR_ACCEPT_CLOEXEC (1U << 1)
+#endif
 /** @} */
 
 /**
@@ -518,6 +543,52 @@ void ior_prep_send(
  */
 void ior_prep_recv(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
+
+/**
+ * Prepare an accept on a listening socket (like io_uring's ACCEPT).
+ *
+ * Completes with the accepted socket as res (>= 0), or a negative errno. On
+ * Windows res is the accepted SOCKET cast to int32 (handles fit); the socket
+ * is overlapped, associated with the context's port and ready for
+ * ior_prep_send()/ior_prep_recv(). @p addr and @p addrlen, if non-NULL, are
+ * filled with the peer address as accept(2) does; @p addrlen must be
+ * initialised to the buffer size and stays valid until completion.
+ *
+ * The thread backend puts the listening socket in non-blocking mode (see
+ * IOR_SETUP_FD_NONBLOCK) and waits for readiness on its poller, so the op is
+ * cancellable and never occupies a worker; the accepted socket gets exactly
+ * the state @p flags asks for, whatever the listener's mode.
+ *
+ * @param ctx      I/O context.
+ * @param sqe      Entry from ior_get_sqe().
+ * @param fd       Listening socket.
+ * @param addr     Buffer for the peer address, or NULL.
+ * @param addrlen  In/out size of @p addr, or NULL.
+ * @param flags    IOR_ACCEPT_NONBLOCK, IOR_ACCEPT_CLOEXEC, or 0.
+ */
+void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr,
+		socklen_t *addrlen, unsigned flags);
+
+/**
+ * Prepare a connect (like io_uring's CONNECT).
+ *
+ * Completes with 0 once the connection is established, or a negative errno
+ * (-ECONNREFUSED, -ETIMEDOUT, ...). @p addr must stay valid until completion.
+ *
+ * The thread backend puts the socket in non-blocking mode (see
+ * IOR_SETUP_FD_NONBLOCK), starts the connection and waits for writability on
+ * its poller, so the op is cancellable and never occupies a worker. On
+ * Windows an unbound socket is bound to the wildcard address first, as
+ * ConnectEx requires.
+ *
+ * @param ctx      I/O context.
+ * @param sqe      Entry from ior_get_sqe().
+ * @param fd       Socket to connect.
+ * @param addr     Address to connect to.
+ * @param addrlen  Size of @p addr.
+ */
+void ior_prep_connect(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen);
 
 /**
  * Prepare a one-shot wait for fd readiness (like io_uring's POLL_ADD).
