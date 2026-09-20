@@ -1054,7 +1054,9 @@ static int ior_threads_pool_accept(
 	if (nfd < 0) {
 		return -errno;
 	}
-#ifndef __linux__
+// accept4 is authoritative on Linux alone; elsewhere it may still hand back
+// the listener's mode, and without it the flags need applying by hand.
+#if !defined(IOR_HAVE_ACCEPT4) || !defined(__linux__)
 	int fl = fcntl(nfd, F_GETFL, 0);
 	if (fl >= 0) {
 		fl = (flags & IOR_ACCEPT_NONBLOCK) ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);

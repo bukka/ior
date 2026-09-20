@@ -559,6 +559,11 @@ void ior_prep_recv(
  * cancellable and never occupies a worker; the accepted socket gets exactly
  * the state @p flags asks for, whatever the listener's mode.
  *
+ * Under IOR_SETUP_FD_NONBLOCK, pass IOR_ACCEPT_NONBLOCK. That promise covers
+ * the accepted socket as soon as you submit an operation on it, and nothing
+ * else puts it in non-blocking mode: accepted without the flag, it is a
+ * blocking descriptor the backend will take at its word.
+ *
  * @param ctx      I/O context.
  * @param sqe      Entry from ior_get_sqe().
  * @param fd       Listening socket.
