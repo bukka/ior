@@ -42,6 +42,9 @@
 
 typedef struct handle_set_entry {
 	HANDLE handle;
+	// Bumped before every CancelIoEx() on the handle; see
+	// reissue_collateral_abort() for what it is compared against.
+	uint32_t cancel_gen;
 	struct handle_set_entry *next;
 } handle_set_entry;
 
@@ -62,8 +65,10 @@ enum {
 	IOCP_OP_DEFERRED, /* drain-deferred head in the pending list */
 	IOCP_OP_LINKED, /* behind a link (or a paired link timeout); not cancellable */
 	IOCP_OP_IO, /* overlapped I/O in flight */
+	IOCP_OP_IO_CANCEL, /* overlapped I/O in flight, CancelIoEx requested on it */
 	IOCP_OP_TIMER, /* armed on the timer thread */
-	IOCP_OP_WORK, /* callback submitted to the threadpool */
+	IOCP_OP_WORK, /* work object queued on the threadpool, callback not started */
+	IOCP_OP_WORK_RUNNING, /* callback executing */
 	IOCP_OP_POLL, /* registered with the poller */
 	IOCP_OP_DONE,
 };
@@ -139,9 +144,16 @@ typedef struct ior_iocp_op {
 	struct ior_ctx_iocp *work_owner;
 	struct ior_work_token token;
 
+	// IOR_OP_WORK: the threadpool work object, so a queued callback can be
+	// withdrawn by a cancel. Closed by the consumer once the op completes.
+	PTP_WORK tp_work;
+
 	// IOR_OP_ASYNC_CANCEL: what to match (user data, or fd with IOR_CANCEL_BY_FD).
 	uint64_t cancel_key;
 	uint32_t cancel_flags;
+
+	// Overlapped I/O: the handle's cancel_gen when this request was issued.
+	uint32_t io_cancel_gen;
 
 	_Atomic int state; // IOCP_OP_*
 
@@ -433,30 +445,41 @@ static uint32_t handle_hash(HANDLE h)
 	return (uint32_t) (val % HANDLE_SET_SIZE);
 }
 
-static bool handle_set_contains_locked(handle_set *set, HANDLE h)
+static handle_set_entry *handle_set_find_locked(handle_set *set, HANDLE h)
 {
 	uint32_t bucket = handle_hash(h);
 	handle_set_entry *entry = set->buckets[bucket];
 	while (entry) {
 		if (entry->handle == h) {
-			return true;
+			return entry;
 		}
 		entry = entry->next;
 	}
-	return false;
+	return NULL;
 }
 
-static bool handle_set_insert_locked(handle_set *set, HANDLE h)
+static handle_set_entry *handle_set_insert_locked(handle_set *set, HANDLE h)
 {
 	uint32_t bucket = handle_hash(h);
 	handle_set_entry *entry = malloc(sizeof(handle_set_entry));
 	if (!entry) {
-		return false;
+		return NULL;
 	}
 	entry->handle = h;
+	entry->cancel_gen = 0;
 	entry->next = set->buckets[bucket];
 	set->buckets[bucket] = entry;
-	return true;
+	return entry;
+}
+
+/* Current cancel generation of an associated handle (0 if never associated). */
+static uint32_t handle_cancel_gen(ior_ctx_iocp *ctx, HANDLE h)
+{
+	EnterCriticalSection(&ctx->handles.lock);
+	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, h);
+	uint32_t gen = entry ? entry->cancel_gen : 0;
+	LeaveCriticalSection(&ctx->handles.lock);
+	return gen;
 }
 
 /* ================= Op pool ================= */
@@ -537,8 +560,10 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	atomic_init(&op->token.cancelled, 0);
 	op->token.shutdown = NULL;
 
+	op->tp_work = NULL;
 	op->cancel_key = 0;
 	op->cancel_flags = 0;
+	op->io_cancel_gen = 0;
 	atomic_store(&op->state, IOCP_OP_FREE);
 
 	return op;
@@ -682,7 +707,11 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 	}
 }
 
-static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
+/*
+ * Associate h with the port on first use. Also returns the handle's current
+ * cancel generation in *gen, which the op about to be issued records.
+ */
+static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen)
 {
 	if (h == NULL || h == INVALID_HANDLE_VALUE) {
 		return -EBADF;
@@ -690,7 +719,9 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
 
 	EnterCriticalSection(&ctx->handles.lock);
 
-	if (handle_set_contains_locked(&ctx->handles, h)) {
+	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, h);
+	if (entry) {
+		*gen = entry->cancel_gen;
 		LeaveCriticalSection(&ctx->handles.lock);
 		return 0;
 	}
@@ -702,10 +733,31 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h)
 		return win_error_to_errno(err);
 	}
 
-	(void) handle_set_insert_locked(&ctx->handles, h);
+	entry = handle_set_insert_locked(&ctx->handles, h);
+	*gen = entry ? entry->cancel_gen : 0;
 	LeaveCriticalSection(&ctx->handles.lock);
 
 	return 0;
+}
+
+/*
+ * Cancel an op's overlapped request. AFD (Winsock) cancels every pending
+ * request of the same kind on the socket, not only the one named by
+ * lpOverlapped, so the handle's cancel generation is bumped first: the
+ * consumer re-issues any other op on the handle whose abort arrives with a
+ * stale generation (reissue_collateral_abort). The op itself must already be
+ * in IOCP_OP_IO_CANCEL so that its own abort is reported.
+ */
+static BOOL cancel_overlapped_io(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	EnterCriticalSection(&ctx->handles.lock);
+	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, op->fd);
+	if (entry) {
+		entry->cancel_gen++;
+	}
+	LeaveCriticalSection(&ctx->handles.lock);
+
+	return CancelIoEx((HANDLE) op->fd, &op->overlapped);
 }
 
 /*
@@ -732,7 +784,7 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	HANDLE h = op->fd;
 
-	int ret = ensure_handle_associated(ctx, h);
+	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -763,7 +815,7 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	HANDLE h = op->fd;
 
-	int ret = ensure_handle_associated(ctx, h);
+	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -803,7 +855,7 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
  */
 static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
-	int ret = ensure_handle_associated(ctx, op->fd);
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -830,7 +882,7 @@ static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
-	int ret = ensure_handle_associated(ctx, op->fd);
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -865,11 +917,21 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
  * (and LINK/DRAIN/link-timeout machinery) as every other op.
  */
 
-static VOID CALLBACK ior_iocp_work_callback(PTP_CALLBACK_INSTANCE instance, PVOID param)
+static VOID CALLBACK ior_iocp_work_callback(
+		PTP_CALLBACK_INSTANCE instance, PVOID param, PTP_WORK work)
 {
 	(void) instance;
+	(void) work;
 	ior_iocp_op *op = param;
 	ior_ctx_iocp *ctx = op->work_owner;
+
+	// Claim the op before running anything: a cancel that claims it first
+	// (IOCP_OP_WORK -> IOCP_OP_DONE) completes it as -ECANCELED itself and
+	// the callback must not touch it any more.
+	int expected = IOCP_OP_WORK;
+	if (!atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_WORK_RUNNING)) {
+		return;
+	}
 
 	op->work_res = op->work_fn(&op->token, op->work_arg);
 
@@ -916,16 +978,19 @@ static int issue_work(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	atomic_init(&op->token.cancelled, 0);
 	op->token.shutdown = &ctx->shutdown;
 
+	// A work object per op (rather than TrySubmitThreadpoolCallback) so that a
+	// cancel can withdraw the callback while it is still queued.
+	op->tp_work = CreateThreadpoolWork(ior_iocp_work_callback, op, &ctx->work_env);
+	if (!op->tp_work) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
+	}
+
 	// Reserve the active_count slot up front, like arm_timer: the callback
 	// completes from another thread, so it must post with the slot already held.
 	atomic_fetch_add(&ctx->active_count, 1);
 	atomic_store(&op->state, IOCP_OP_WORK);
 
-	if (!TrySubmitThreadpoolCallback(ior_iocp_work_callback, op, &ctx->work_env)) {
-		atomic_fetch_sub(&ctx->active_count, 1);
-		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
-	}
-
+	SubmitThreadpoolWork(op->tp_work);
 	return 0;
 }
 
@@ -1444,11 +1509,17 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			bool is_poll = guarded->opcode == IOR_OP_POLL;
 			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
+			} else {
+				// Still under timers.lock: the consumer resolves the pair
+				// under it before the guarded op can be reaped and recycled,
+				// and it judges a collateral abort under it too (see
+				// reissue_collateral_abort), so mark and cancel here.
+				int expected = IOCP_OP_IO;
+				atomic_compare_exchange_strong(&guarded->state, &expected, IOCP_OP_IO_CANCEL);
+				cancel_overlapped_io(ctx, guarded);
 			}
 			LeaveCriticalSection(&tm->lock);
-			if (!token_cancel) {
-				CancelIoEx((HANDLE) guarded->fd, &guarded->overlapped);
-			} else if (is_poll) {
+			if (is_poll) {
 				iocp_poller_wake(&ctx->poller);
 			}
 			post_armed_op(ctx, op, ERROR_TIMEOUT);
@@ -1607,7 +1678,8 @@ static bool iocp_cancel_match(const ior_iocp_op *op, const ior_iocp_op *c)
  * path), -EALREADY if it is executing and cannot be interrupted, -ENOENT if
  * it completed meanwhile. Each state's owner arbitrates: the pending list
  * under sched_lock, the timer heap under timers.lock, the kernel for
- * overlapped I/O (CancelIoEx), the token for work and poll ops.
+ * overlapped I/O (CancelIoEx), a CAS on the state for queued work, the token
+ * for running work and poll ops.
  */
 static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
@@ -1640,14 +1712,26 @@ static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			return 0;
 		}
 
-		case IOCP_OP_IO:
-			// The -ECANCELED completion arrives through the port; a completion
-			// that already raced in keeps its real result (io_uring does the
-			// same).
-			if (CancelIoEx((HANDLE) op->fd, &op->overlapped)) {
+		case IOCP_OP_IO: {
+			// Mark it first so the consumer reports the abort rather than
+			// treating it as collateral damage of another cancel on the same
+			// handle. The -ECANCELED completion arrives through the port; a
+			// completion that already raced in keeps its real result
+			// (io_uring does the same).
+			int expected = IOCP_OP_IO;
+			if (!atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_IO_CANCEL)) {
+				return -ENOENT;
+			}
+			if (cancel_overlapped_io(ctx, op)) {
 				return 0;
 			}
-			return GetLastError() == ERROR_NOT_FOUND ? -ENOENT : -EALREADY;
+			DWORD err = GetLastError();
+			// Nothing to cancel: it is completing on its own. Unmark it so a
+			// queued collateral abort is still re-issued rather than reported.
+			expected = IOCP_OP_IO_CANCEL;
+			atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_IO);
+			return err == ERROR_NOT_FOUND ? -ENOENT : -EALREADY;
+		}
 
 		case IOCP_OP_TIMER: {
 			timer_mgr *tm = &ctx->timers;
@@ -1665,9 +1749,26 @@ static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			return 0;
 		}
 
-		case IOCP_OP_WORK:
-			// A queued or running threadpool callback cannot be withdrawn;
-			// flag it so it can return early.
+		case IOCP_OP_WORK: {
+			// Not started: claim it so the callback returns without running
+			// the function (its CAS to IOCP_OP_WORK_RUNNING fails), withdraw
+			// it from the pool queue and complete it here. The wait only
+			// covers a callback that was already dispatched and is now
+			// returning.
+			int expected = IOCP_OP_WORK;
+			if (!atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_DONE)) {
+				return -ENOENT; // started meanwhile; a rescan sees IOCP_OP_WORK_RUNNING
+			}
+			WaitForThreadpoolWorkCallbacks(op->tp_work, TRUE);
+			CloseThreadpoolWork(op->tp_work);
+			op->tp_work = NULL;
+			post_armed_op(ctx, op, ERROR_OPERATION_ABORTED);
+			return 0;
+		}
+
+		case IOCP_OP_WORK_RUNNING:
+			// A running callback cannot be interrupted; flag it so it can
+			// return early.
 			atomic_store_explicit(&op->token.cancelled, 1, memory_order_release);
 			return -EALREADY;
 
@@ -1700,8 +1801,9 @@ static int issue_cancel(ior_ctx_iocp *ctx, ior_iocp_op *c)
 				continue;
 			}
 			int state = atomic_load(&op->state);
-			if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE) {
-				continue;
+			if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE
+					|| state == IOCP_OP_IO_CANCEL) {
+				continue; // IO_CANCEL: already being cancelled, its CQE is on its way
 			}
 			if (!iocp_cancel_match(op, c)) {
 				continue;
@@ -1715,6 +1817,68 @@ static int issue_cancel(ior_ctx_iocp *ctx, ior_iocp_op *c)
 
 	c->work_res = ret;
 	return post_synthetic_completion(ctx, c, ERROR_SUCCESS, 0);
+}
+
+/*
+ * Collateral aborts. When CancelIoEx() names one pending request on a socket,
+ * AFD aborts every pending request of that kind on the socket (both recvs
+ * complete with ERROR_OPERATION_ABORTED when only one was cancelled), so a
+ * cancel op or a fired link timeout takes the target's neighbours down with
+ * it. Such an abort is recognised by exclusion and undone by re-issuing the
+ * request: the op was not itself marked for cancellation (IOCP_OP_IO_CANCEL),
+ * its link timeout has not fired, and the handle's cancel generation moved
+ * while it was in flight. An abort with an unchanged generation is genuine
+ * (the handle was closed, or cancelled behind the library's back) and is
+ * reported as -ECANCELED. Returns true if the op is back in flight.
+ *
+ * Runs under timers.lock so it is ordered against the link timeout firing:
+ * the timer thread marks and cancels the guarded op under that lock, so
+ * either the timeout is still armed here (and will cancel the re-issued
+ * request), or it has fired and this abort is its doing.
+ */
+static bool reissue_collateral_abort(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD bytes_transferred)
+{
+	// Only a request that moved no data can be replayed verbatim: a partial
+	// write or send re-issued in full would duplicate what already went out,
+	// and a partial read or recv would drop what already came in. Report
+	// such an abort instead (it is not expected from AFD, which aborts only
+	// requests it has not started serving).
+	if (bytes_transferred != 0) {
+		return false;
+	}
+
+	int (*issue)(ior_ctx_iocp *, ior_iocp_op *);
+	switch (op->opcode) {
+		case IOR_OP_READ:
+			issue = issue_read;
+			break;
+		case IOR_OP_WRITE:
+			issue = issue_write;
+			break;
+		case IOR_OP_SEND:
+			issue = issue_send;
+			break;
+		case IOR_OP_RECV:
+			issue = issue_recv;
+			break;
+		default:
+			return false;
+	}
+
+	EnterCriticalSection(&ctx->timers.lock);
+	bool collateral = atomic_load(&op->state) == IOCP_OP_IO
+			&& (!op->link_timeout || op->link_timeout->timer_armed)
+			&& handle_cancel_gen(ctx, op->fd) != op->io_cancel_gen;
+	if (collateral) {
+		// Return the aborted request's active_count slot; issue_* reserves a
+		// new one (or posts a synthetic failure if the handle is gone).
+		atomic_fetch_sub(&ctx->active_count, 1);
+		memset(&op->overlapped, 0, sizeof(op->overlapped));
+		(void) issue(ctx, op);
+	}
+	LeaveCriticalSection(&ctx->timers.lock);
+
+	return collateral;
 }
 
 static void sched_kick_drain(ior_ctx_iocp *ctx)
@@ -2307,8 +2471,21 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	ior_iocp_op *op = (ior_iocp_op *) overlapped;
 
 	if (!op->is_synthetic) {
+		if (gle == ERROR_OPERATION_ABORTED
+				&& reissue_collateral_abort(ctx, op, bytes_transferred)) {
+			// Back in flight; nothing completed from the caller's view.
+			return -EAGAIN;
+		}
 		op->error_code = gle;
 		op->bytes_transferred = ok ? bytes_transferred : 0;
+		atomic_store(&op->state, IOCP_OP_DONE);
+	}
+
+	if (op->tp_work) {
+		// The callback has posted this completion, so it is done with the
+		// work object (or is just returning from it, which a close tolerates).
+		CloseThreadpoolWork(op->tp_work);
+		op->tp_work = NULL;
 	}
 
 #ifndef NDEBUG
