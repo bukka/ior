@@ -19,6 +19,9 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Timer/timeout operations
 - Async cancellation of submitted operations (`ior_prep_cancel`,
   `ior_prep_cancel_fd`), with io_uring semantics on every backend
+- A completion notification descriptor (`ior_notify_fd`) for embedding a
+  context in an existing event loop: an eventfd on io_uring and the threads
+  backend, a loopback socket on Windows
 - Splice operations (native on Linux, emulated elsewhere)
 - Operation chaining with `IOR_SQE_IO_LINK`
 - Ordering with `IOR_SQE_IO_DRAIN`
@@ -272,6 +275,15 @@ int32_t ior_cqe_get_res(ior_ctx *ctx, ior_cqe *cqe);
 
 // Get completion flags
 uint32_t ior_cqe_get_flags(ior_ctx *ctx, ior_cqe *cqe);
+```
+
+### Completion Notification
+```c
+// Descriptor readable once completions are posted, like io_uring's
+// registered eventfd: wait on it in your own loop, reap with
+// ior_peek_cqe() until -EAGAIN, then clear it. Owned by the context.
+ior_fd_t ior_notify_fd(ior_ctx *ctx);
+int ior_notify_clear(ior_ctx *ctx);
 ```
 
 ### Backend Information

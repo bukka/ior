@@ -288,6 +288,17 @@ uint32_t ior_cqe_get_flags(ior_ctx *ctx, ior_cqe *cqe)
 	return (ctx && cqe) ? ctx->ops->cqe_get_flags(cqe) : 0;
 }
 
+/* Completion notification */
+ior_fd_t ior_notify_fd(ior_ctx *ctx)
+{
+	return ctx ? ctx->ops->notify_fd(ctx->backend_ctx) : IOR_INVALID_FD;
+}
+
+int ior_notify_clear(ior_ctx *ctx)
+{
+	return ctx ? ctx->ops->notify_clear(ctx->backend_ctx) : -EINVAL;
+}
+
 /* Backend info */
 ior_backend_type ior_get_backend_type(ior_ctx *ctx)
 {

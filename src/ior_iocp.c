@@ -206,6 +206,37 @@ typedef struct iocp_poller {
 	uint32_t active_cap;
 } iocp_poller;
 
+/*
+ * Completion pump for ior_notify_fd(). Kernel I/O completes straight into
+ * the port with no ior code running, so a loop that wants a waitable
+ * descriptor needs a thread that dequeues on its behalf: the pump moves raw
+ * packets into a staging queue and sends a byte on a loopback UDP pair
+ * (WSAPoll can only wait on sockets). The consumer then takes packets from
+ * staging instead of the port, and all completion processing stays on the
+ * consumer thread. Started lazily by the first ior_notify_fd() call; a context
+ * that never asks keeps dequeuing from the port directly.
+ */
+typedef struct pump_entry {
+	LPOVERLAPPED overlapped;
+	DWORD bytes;
+	DWORD error; // ERROR_SUCCESS, or the packet's GetLastError()
+} pump_entry;
+
+typedef struct iocp_pump {
+	CRITICAL_SECTION lock;
+	CONDITION_VARIABLE cv; // staging became non-empty
+	HANDLE thread; // NULL until ior_notify_fd()
+	SOCKET wake_tx;
+	SOCKET wake_rx;
+	pump_entry *entries; // circular, protected by lock
+	uint32_t head;
+	uint32_t count;
+	uint32_t cap;
+} iocp_pump;
+
+// Completion key of the packet that tells the pump thread to exit.
+#define IOCP_PUMP_STOP_KEY ((ULONG_PTR) - 2)
+
 /* QPC frequency, initialized once during backend init.
  *
  * Stored as an atomic so that the publishing thread's write is observed with
@@ -247,6 +278,9 @@ typedef struct ior_ctx_iocp {
 
 	// IOR_OP_POLL readiness multiplexer
 	iocp_poller poller;
+
+	// ior_notify_fd() completion pump
+	iocp_pump pump;
 
 	// Handle association tracking
 	handle_set handles;
@@ -2152,6 +2186,12 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	ctx->poller.wake_rx = INVALID_SOCKET;
 	atomic_store(&ctx->poller.stop, 0);
 
+	// Completion pump bookkeeping; started by the first ior_notify_fd().
+	InitializeCriticalSection(&ctx->pump.lock);
+	InitializeConditionVariable(&ctx->pump.cv);
+	ctx->pump.wake_tx = INVALID_SOCKET;
+	ctx->pump.wake_rx = INVALID_SOCKET;
+
 	atomic_store(&ctx->shutdown, 0);
 
 	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_WORK | IOR_FEAT_POLL_ADD;
@@ -2210,6 +2250,11 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		free(ctx->poller.pfds);
 	}
 	DeleteCriticalSection(&ctx->poller.lock);
+
+	// Stop the completion pump (after every producer thread): what it staged
+	// is reclaimed, what is still in the port is drained below.
+	iocp_pump_stop(ctx);
+	DeleteCriticalSection(&ctx->pump.lock);
 
 	// Drain timers without posting
 	EnterCriticalSection(&ctx->timers.lock);
@@ -2433,6 +2478,182 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 	return (int) submitted;
 }
 
+/* ================= Completion pump (ior_notify_fd) ================= */
+
+static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
+{
+	ior_ctx_iocp *ctx = arg;
+	iocp_pump *p = &ctx->pump;
+
+	for (;;) {
+		DWORD bytes = 0;
+		ULONG_PTR key = 0;
+		LPOVERLAPPED overlapped = NULL;
+		BOOL ok = GetQueuedCompletionStatus(ctx->iocp_handle, &bytes, &key, &overlapped, INFINITE);
+		DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+
+		if (!overlapped) {
+			if (key == IOCP_PUMP_STOP_KEY || err == ERROR_ABANDONED_WAIT_0) {
+				break;
+			}
+			continue; // stray packet (external PostQueuedCompletionStatus)
+		}
+
+		EnterCriticalSection(&p->lock);
+		if (p->count == p->cap) {
+			// Cannot happen: every op has at most one packet in flight and the
+			// queue is sized past the op pool. Grow anyway rather than lose one.
+			uint32_t cap = p->cap * 2;
+			pump_entry *entries = malloc(cap * sizeof(*entries));
+			if (entries) {
+				for (uint32_t i = 0; i < p->count; i++) {
+					entries[i] = p->entries[(p->head + i) % p->cap];
+				}
+				free(p->entries);
+				p->entries = entries;
+				p->head = 0;
+				p->cap = cap;
+			}
+		}
+		if (p->count < p->cap) {
+			pump_entry *e = &p->entries[(p->head + p->count) % p->cap];
+			e->overlapped = overlapped;
+			e->bytes = bytes;
+			e->error = err;
+			p->count++;
+		}
+		WakeConditionVariable(&p->cv);
+		LeaveCriticalSection(&p->lock);
+
+		char b = 0;
+		(void) send(p->wake_tx, &b, 1, 0);
+	}
+	return 0;
+}
+
+/*
+ * Take one packet from staging, waiting up to timeout_ms for one to arrive
+ * (0 = poll, INFINITE = forever). Returns 0, -EAGAIN (timeout 0, none) or
+ * -ETIMEDOUT.
+ */
+static int iocp_pump_pop(ior_ctx_iocp *ctx, DWORD timeout_ms, pump_entry *out)
+{
+	iocp_pump *p = &ctx->pump;
+
+	EnterCriticalSection(&p->lock);
+	while (p->count == 0) {
+		if (timeout_ms == 0) {
+			LeaveCriticalSection(&p->lock);
+			return -EAGAIN;
+		}
+		if (!SleepConditionVariableCS(&p->cv, &p->lock, timeout_ms)
+				&& GetLastError() == ERROR_TIMEOUT) {
+			LeaveCriticalSection(&p->lock);
+			return -ETIMEDOUT;
+		}
+	}
+	*out = p->entries[p->head];
+	p->head = (p->head + 1) % p->cap;
+	p->count--;
+	LeaveCriticalSection(&p->lock);
+	return 0;
+}
+
+/*
+ * Start the pump: a loopback UDP pair for the wakeup (both ends
+ * non-blocking) and the thread. Runs on the consumer thread, so the switch
+ * from direct dequeuing to staging happens between two of its own dequeues.
+ */
+static int iocp_pump_ensure(ior_ctx_iocp *ctx)
+{
+	iocp_pump *p = &ctx->pump;
+	if (p->thread) {
+		return 0;
+	}
+
+	SOCKET rx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	SOCKET tx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (rx == INVALID_SOCKET || tx == INVALID_SOCKET) {
+		goto fail;
+	}
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = 0;
+	int alen = sizeof(addr);
+	if (bind(rx, (struct sockaddr *) &addr, sizeof(addr)) != 0
+			|| getsockname(rx, (struct sockaddr *) &addr, &alen) != 0
+			|| connect(tx, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+		goto fail;
+	}
+	u_long nonblock = 1;
+	if (ioctlsocket(rx, FIONBIO, &nonblock) != 0 || ioctlsocket(tx, FIONBIO, &nonblock) != 0) {
+		goto fail;
+	}
+
+	p->cap = ctx->pool_size + 16;
+	p->entries = malloc(p->cap * sizeof(*p->entries));
+	if (!p->entries) {
+		goto fail;
+	}
+	p->head = 0;
+	p->count = 0;
+	p->wake_rx = rx;
+	p->wake_tx = tx;
+	p->thread = CreateThread(NULL, 0, iocp_pump_thread_main, ctx, 0, NULL);
+	if (!p->thread) {
+		p->wake_rx = INVALID_SOCKET;
+		p->wake_tx = INVALID_SOCKET;
+		goto fail;
+	}
+	return 0;
+
+fail:
+	free(p->entries);
+	p->entries = NULL;
+	p->cap = 0;
+	if (rx != INVALID_SOCKET) {
+		closesocket(rx);
+	}
+	if (tx != INVALID_SOCKET) {
+		closesocket(tx);
+	}
+	return -ENOMEM;
+}
+
+/*
+ * Stop the pump (destroy only). Packets it staged but the consumer never took
+ * are reclaimed here; packets still in the port are left to the drain loop.
+ */
+static void iocp_pump_stop(ior_ctx_iocp *ctx)
+{
+	iocp_pump *p = &ctx->pump;
+	if (!p->thread) {
+		return;
+	}
+
+	PostQueuedCompletionStatus(ctx->iocp_handle, 0, IOCP_PUMP_STOP_KEY, NULL);
+	WaitForSingleObject(p->thread, INFINITE);
+	CloseHandle(p->thread);
+	p->thread = NULL;
+
+	while (p->count > 0) {
+		ior_iocp_op *op = (ior_iocp_op *) p->entries[p->head].overlapped;
+		p->head = (p->head + 1) % p->cap;
+		p->count--;
+		atomic_fetch_sub(&ctx->active_count, 1);
+		free_op(ctx, op);
+	}
+	free(p->entries);
+	p->entries = NULL;
+	closesocket(p->wake_tx);
+	closesocket(p->wake_rx);
+	p->wake_tx = INVALID_SOCKET;
+	p->wake_rx = INVALID_SOCKET;
+}
+
 /* Dequeue one completion and push into ready queue */
 static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 {
@@ -2444,11 +2665,25 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	DWORD bytes_transferred = 0;
 	ULONG_PTR completion_key = 0;
 	LPOVERLAPPED overlapped = NULL;
+	BOOL ok;
+	DWORD gle;
 
-	BOOL ok = GetQueuedCompletionStatus(
-			ctx->iocp_handle, &bytes_transferred, &completion_key, &overlapped, timeout_ms);
-
-	DWORD gle = ok ? ERROR_SUCCESS : GetLastError();
+	if (ctx->pump.thread) {
+		// The pump owns the port: take the packet it staged.
+		pump_entry e;
+		int ret = iocp_pump_pop(ctx, timeout_ms, &e);
+		if (ret < 0) {
+			return ret;
+		}
+		overlapped = e.overlapped;
+		bytes_transferred = e.bytes;
+		gle = e.error;
+		ok = gle == ERROR_SUCCESS;
+	} else {
+		ok = GetQueuedCompletionStatus(
+				ctx->iocp_handle, &bytes_transferred, &completion_key, &overlapped, timeout_ms);
+		gle = ok ? ERROR_SUCCESS : GetLastError();
+	}
 
 	if (!ok) {
 		if (overlapped == NULL) {
@@ -2983,6 +3218,34 @@ static uint32_t ior_iocp_backend_cqe_get_flags(ior_cqe *cqe)
 	return cqe->iocp.flags;
 }
 
+/* ================= Completion notification ================= */
+
+static ior_fd_t ior_iocp_backend_notify_fd(void *backend_ctx)
+{
+	if (!backend_ctx) {
+		return IOR_INVALID_FD;
+	}
+	ior_ctx_iocp *ctx = backend_ctx;
+	if (iocp_pump_ensure(ctx) < 0) {
+		return IOR_INVALID_FD;
+	}
+	return (ior_fd_t) ctx->pump.wake_rx;
+}
+
+static int ior_iocp_backend_notify_clear(void *backend_ctx)
+{
+	if (!backend_ctx) {
+		return -EINVAL;
+	}
+	ior_ctx_iocp *ctx = backend_ctx;
+	if (!ctx->pump.thread) {
+		return -EINVAL;
+	}
+	char buf[64];
+	while (recv(ctx->pump.wake_rx, buf, sizeof(buf), 0) > 0) { }
+	return 0;
+}
+
 /* ================= Backend info ================= */
 
 static const char *ior_iocp_backend_name(void)
@@ -3029,6 +3292,8 @@ const ior_backend_ops ior_iocp_ops = {
 	.cqe_get_data = ior_iocp_backend_cqe_get_data,
 	.cqe_get_res = ior_iocp_backend_cqe_get_res,
 	.cqe_get_flags = ior_iocp_backend_cqe_get_flags,
+	.notify_fd = ior_iocp_backend_notify_fd,
+	.notify_clear = ior_iocp_backend_notify_clear,
 	.backend_name = ior_iocp_backend_name,
 	.get_features = ior_iocp_backend_get_features,
 };

@@ -704,6 +704,43 @@ int32_t ior_cqe_get_res(ior_ctx *ctx, ior_cqe *cqe);
  */
 uint32_t ior_cqe_get_flags(ior_ctx *ctx, ior_cqe *cqe);
 
+/* Completion notification */
+
+/**
+ * Descriptor that becomes readable when completions are posted, for a loop
+ * that embeds a context without making ior its blocking wait.
+ *
+ * Behaves like io_uring's registered eventfd on every backend: it is signalled
+ * for each completion posted to the queue and is never cleared by ior, so a
+ * loop waits for it to be readable, reaps with ior_peek_cqe() until nothing
+ * is pending, and clears it with ior_notify_clear(). A signal may be observed
+ * before or after the completion it announces is visible to a peek; a spurious
+ * wakeup that finds nothing is harmless. Mixing this with ior_wait_cqe() is
+ * fine (the wait clears the descriptor as part of its own blocking).
+ *
+ * On the io_uring backend this is an eventfd registered with the ring (created
+ * on first call); on the threads backend the eventfd or pipe workers already
+ * signal; on Windows the readable end of a loopback socket pair fed by a
+ * thread that pumps the completion port (started on first call), so that
+ * WSAPoll() can wait on it. The descriptor is owned by the context and closed
+ * by ior_queue_exit(); never close it.
+ *
+ * @param ctx  I/O context.
+ * @return The descriptor (a SOCKET cast to ior_fd_t on Windows), or
+ *         IOR_INVALID_FD if it could not be created.
+ */
+ior_fd_t ior_notify_fd(ior_ctx *ctx);
+
+/**
+ * Consume the pending signals of ior_notify_fd(), making it not readable until
+ * the next completion is posted. Call it after reaping. Never blocks.
+ *
+ * @param ctx  I/O context.
+ * @return 0 on success, -EINVAL if ior_notify_fd() has not been called, or a
+ *         negative errno.
+ */
+int ior_notify_clear(ior_ctx *ctx);
+
 /* Backend info */
 
 /**

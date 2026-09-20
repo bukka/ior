@@ -16,6 +16,9 @@
 #endif
 
 #include "test_utils.h"
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -290,6 +293,16 @@ int test_set_nonblocking(ior_fd_t fd)
 	return 0;
 }
 
+int test_wait_readable(ior_fd_t fd, int timeout_ms)
+{
+	WSAPOLLFD pfd = { .fd = (SOCKET) fd, .events = POLLRDNORM };
+	int ret = WSAPoll(&pfd, 1, timeout_ms);
+	if (ret == SOCKET_ERROR) {
+		return -EIO;
+	}
+	return ret > 0 ? 1 : 0;
+}
+
 #else /* POSIX */
 
 char *create_temp_file(const char *content, size_t len)
@@ -355,6 +368,19 @@ int test_set_nonblocking(ior_fd_t fd)
 		return -errno;
 	}
 	return 0;
+}
+
+int test_wait_readable(ior_fd_t fd, int timeout_ms)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	int ret;
+	do {
+		ret = poll(&pfd, 1, timeout_ms);
+	} while (ret < 0 && errno == EINTR);
+	if (ret < 0) {
+		return -errno;
+	}
+	return ret > 0 ? 1 : 0;
 }
 
 #endif /* _WIN32 */

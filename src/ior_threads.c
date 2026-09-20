@@ -501,6 +501,27 @@ static uint32_t ior_threads_backend_cqe_get_flags(ior_cqe *cqe)
 	return cqe->threads.flags;
 }
 
+/* Completion notification: the event every completion already signals. */
+
+static ior_fd_t ior_threads_backend_notify_fd(void *backend_ctx)
+{
+	if (!backend_ctx) {
+		return IOR_INVALID_FD;
+	}
+	ior_ctx_threads *ctx = backend_ctx;
+	return ior_threads_event_get_fd(&ctx->event);
+}
+
+static int ior_threads_backend_notify_clear(void *backend_ctx)
+{
+	if (!backend_ctx) {
+		return -EINVAL;
+	}
+	ior_ctx_threads *ctx = backend_ctx;
+	int ret = ior_threads_event_clear(&ctx->event);
+	return ret < 0 ? ret : 0;
+}
+
 /* Backend info */
 
 static const char *ior_threads_backend_name(void)
@@ -548,6 +569,8 @@ const ior_backend_ops ior_threads_ops = {
 	.cqe_get_data = ior_threads_backend_cqe_get_data,
 	.cqe_get_res = ior_threads_backend_cqe_get_res,
 	.cqe_get_flags = ior_threads_backend_cqe_get_flags,
+	.notify_fd = ior_threads_backend_notify_fd,
+	.notify_clear = ior_threads_backend_notify_clear,
 	.backend_name = ior_threads_backend_name,
 	.get_features = ior_threads_backend_get_features,
 };

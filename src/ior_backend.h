@@ -165,6 +165,10 @@ typedef struct ior_backend_ops {
 	int32_t (*cqe_get_res)(ior_cqe *cqe);
 	uint32_t (*cqe_get_flags)(ior_cqe *cqe);
 
+	/* Completion notification descriptor */
+	ior_fd_t (*notify_fd)(void *backend_ctx);
+	int (*notify_clear)(void *backend_ctx);
+
 	/* Backend info */
 	const char *(*backend_name)(void);
 	uint32_t (*get_features)(void *backend_ctx);

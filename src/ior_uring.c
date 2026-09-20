@@ -12,6 +12,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <poll.h>
+#include <unistd.h>
+#include <sys/eventfd.h>
 #include <liburing.h>
 
 typedef struct ior_uring_job ior_uring_job;
@@ -42,6 +44,8 @@ typedef struct ior_ctx_uring {
 	 */
 	pthread_mutex_t jobs_lock;
 	ior_uring_job *jobs_head; // doubly linked via live_next/live_prev
+
+	int notify_fd; // eventfd registered with the ring; -1 until requested
 } ior_ctx_uring;
 
 /*
@@ -442,6 +446,7 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	}
 
 	ctx->flags = params->flags;
+	ctx->notify_fd = -1;
 	atomic_init(&ctx->shutdown, 0);
 
 	if (pthread_mutex_init(&ctx->poster_lock, NULL) != 0) {
@@ -526,6 +531,10 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 		job = next;
 	}
 
+	if (ctx->notify_fd >= 0) {
+		io_uring_unregister_eventfd(&ctx->ring);
+		close(ctx->notify_fd);
+	}
 	pthread_mutex_destroy(&ctx->jobs_lock);
 	pthread_mutex_destroy(&ctx->poster_lock);
 	io_uring_queue_exit(&ctx->ring);
@@ -859,6 +868,49 @@ static uint32_t ior_uring_backend_cqe_get_flags(ior_cqe *cqe)
 	return c->flags;
 }
 
+/*
+ * Completion notification: an eventfd the kernel signals for every CQE,
+ * including those the poster ring injects with MSG_RING. Registered lazily.
+ */
+
+static ior_fd_t ior_uring_backend_notify_fd(void *backend_ctx)
+{
+	if (!backend_ctx) {
+		return IOR_INVALID_FD;
+	}
+	ior_ctx_uring *ctx = backend_ctx;
+	if (ctx->notify_fd >= 0) {
+		return ctx->notify_fd;
+	}
+
+	int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (efd < 0) {
+		return IOR_INVALID_FD;
+	}
+	if (io_uring_register_eventfd(&ctx->ring, efd) < 0) {
+		close(efd);
+		return IOR_INVALID_FD;
+	}
+	ctx->notify_fd = efd;
+	return efd;
+}
+
+static int ior_uring_backend_notify_clear(void *backend_ctx)
+{
+	if (!backend_ctx) {
+		return -EINVAL;
+	}
+	ior_ctx_uring *ctx = backend_ctx;
+	if (ctx->notify_fd < 0) {
+		return -EINVAL;
+	}
+	uint64_t val;
+	if (read(ctx->notify_fd, &val, sizeof(val)) < 0 && errno != EAGAIN) {
+		return -errno;
+	}
+	return 0;
+}
+
 /* Backend info */
 
 static const char *ior_uring_backend_name(void)
@@ -906,6 +958,8 @@ const ior_backend_ops ior_uring_ops = {
 	.cqe_get_data = ior_uring_backend_cqe_get_data,
 	.cqe_get_res = ior_uring_backend_cqe_get_res,
 	.cqe_get_flags = ior_uring_backend_cqe_get_flags,
+	.notify_fd = ior_uring_backend_notify_fd,
+	.notify_clear = ior_uring_backend_notify_clear,
 	.backend_name = ior_uring_backend_name,
 	.get_features = ior_uring_backend_get_features,
 };
