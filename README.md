@@ -280,8 +280,14 @@ uint32_t ior_cqe_get_flags(ior_ctx *ctx, ior_cqe *cqe);
 ### Completion Notification
 ```c
 // Descriptor readable once completions are posted, like io_uring's
-// registered eventfd: wait on it in your own loop, reap with
-// ior_peek_cqe() until -EAGAIN, then clear it. Owned by the context.
+// registered eventfd: wait on it in your own loop, clear it, then reap
+// with ior_peek_cqe() until -EAGAIN. Owned by the context.
+//
+// Clear before reaping, not after: a completion is posted before its
+// signal, so clearing afterwards can drain the signal of one that landed
+// while you were reaping, leaving it unreaped with the descriptor idle.
+// Then reap until the queue is empty - a clear consumes every pending
+// signal, so anything left over is not announced again.
 ior_fd_t ior_notify_fd(ior_ctx *ctx);
 int ior_notify_clear(ior_ctx *ctx);
 ```
