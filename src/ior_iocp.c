@@ -2543,6 +2543,23 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	}
 
 	/*
+	 * Abort overlapped I/O still in flight: a parked recv or accept never
+	 * completes on its own, and the drain below would wait for it forever.
+	 * Each op is cancelled by its own OVERLAPPED rather than by handle, so a
+	 * handle the caller closed long ago and the kernel has since reused for
+	 * something else cannot be hit (CancelIoEx on it just fails). Every
+	 * producer thread is stopped by now, so nothing is issued after this pass.
+	 */
+	for (uint32_t i = 0; i < ctx->pool_size; i++) {
+		ior_iocp_op *op = &ctx->op_pool[i];
+		int state = atomic_load(&op->state);
+		if (state == IOCP_OP_IO || state == IOCP_OP_IO_CANCEL) {
+			atomic_store(&op->state, IOCP_OP_IO_CANCEL);
+			CancelIoEx((HANDLE) op->fd, &op->overlapped);
+		}
+	}
+
+	/*
 	 * Drain all in-flight completions from the IOCP.
 	 *
 	 * active_count tracks ops that have been posted to the IOCP
@@ -2560,9 +2577,9 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		if (!ok && overlapped == NULL) {
 			DWORD gle = GetLastError();
 			if (gle == WAIT_TIMEOUT || gle == ERROR_TIMEOUT) {
-				// Timeout with nothing dequeued; keep trying briefly.
-				// Safety valve: if nothing arrives after several rounds,
-				// break to avoid hanging forever during teardown.
+				// Nothing dequeued this round. Every counted completion is on
+				// its way (the pass above cancelled what was parked), so keep
+				// waiting rather than free the pool under the kernel's writes.
 				continue;
 			}
 			if (gle == ERROR_ABANDONED_WAIT_0) {

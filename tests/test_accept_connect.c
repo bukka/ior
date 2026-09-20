@@ -19,6 +19,7 @@
 #define TAG_CANCEL ((void *) 0x4)
 #define TAG_SEND ((void *) 0x5)
 #define TAG_RECV ((void *) 0x6)
+#define TAG_ACCEPT2 ((void *) 0x7)
 
 typedef struct ac_state {
 	ior_ctx *ctx;
@@ -244,6 +245,68 @@ static void test_accept_cancel(void **state)
 	s->accepted = accepted_fd(res[(uintptr_t) TAG_ACCEPT]);
 }
 
+/*
+ * Two accepts parked on one listener, one cancelled: only the target ends
+ * -ECANCELED, the other keeps waiting and takes the next connection. On
+ * IOCP that exercises the collateral-abort re-issue, since AFD aborts every
+ * pending AcceptEx on the listener when one is cancelled.
+ */
+static void test_accept_two_cancel_one(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	int32_t res[MAX_TAG];
+
+	submit_accept(s, NULL, NULL, 0);
+	ior_sqe *a2 = ior_get_sqe(s->ctx);
+	assert_non_null(a2);
+	ior_prep_accept(s->ctx, a2, s->listener, NULL, NULL, 0);
+	ior_sqe_set_data(s->ctx, a2, TAG_ACCEPT2);
+	assert_true(ior_submit(s->ctx) >= 0);
+	ior_cqe *cqe = NULL;
+	ior_timespec to = { .tv_sec = 0, .tv_nsec = 20000000 };
+	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
+
+	ior_sqe *c = ior_get_sqe(s->ctx);
+	assert_non_null(c);
+	ior_prep_cancel(s->ctx, c, TAG_ACCEPT);
+	ior_sqe_set_data(s->ctx, c, TAG_CANCEL);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 2, res);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	assert_int_equal(res[(uintptr_t) TAG_ACCEPT], -ECANCELED);
+
+	// The other accept is still parked, not failed alongside.
+	to.tv_nsec = 50000000;
+	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
+
+	submit_connect(s);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 2, res);
+	assert_int_equal(res[(uintptr_t) TAG_CONNECT], 0);
+	s->accepted = accepted_fd(res[(uintptr_t) TAG_ACCEPT2]);
+}
+
+// A context torn down with an accept still parked: exit must not hang, and
+// the listener must be closable afterwards.
+static void test_accept_pending_at_exit(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+
+	submit_accept(s, NULL, NULL, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	ior_cqe *cqe = NULL;
+	ior_timespec to = { .tv_sec = 0, .tv_nsec = 20000000 };
+	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
+
+	uint64_t start = test_monotonic_now_ns();
+	ior_queue_exit(s->ctx);
+	s->ctx = NULL;
+	assert_true(test_monotonic_now_ns() - start < 2000000000ULL);
+
+	// Teardown closes the listener; the context must not be needed for that.
+	assert_return_code(ior_queue_init(32, &s->ctx), 0);
+}
+
 // A pending accept bounded by a link timeout.
 static void test_accept_link_timeout(void **state)
 {
@@ -303,6 +366,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_connect_then_accept, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(test_connect_refused, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(test_accept_cancel, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(test_accept_two_cancel_one, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(test_accept_pending_at_exit, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(test_accept_link_timeout, setup_ac, teardown_ac),
 #ifndef _WIN32
 		cmocka_unit_test_setup_teardown(test_accept_flags, setup_ac, teardown_ac),

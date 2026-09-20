@@ -579,7 +579,9 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
  * IOR_SETUP_FD_NONBLOCK), starts the connection and waits for writability on
  * its poller, so the op is cancellable and never occupies a worker. On
  * Windows an unbound socket is bound to the wildcard address first, as
- * ConnectEx requires.
+ * ConnectEx requires. A connect that fails or is cancelled leaves the socket
+ * unusable for another connect on every backend, as connect(2) and
+ * ConnectEx do; create a fresh socket to retry.
  *
  * @param ctx      I/O context.
  * @param sqe      Entry from ior_get_sqe().
