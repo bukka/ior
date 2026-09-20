@@ -1725,12 +1725,12 @@ static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			if (cancel_overlapped_io(ctx, op)) {
 				return 0;
 			}
-			DWORD err = GetLastError();
-			// Nothing to cancel: it is completing on its own. Unmark it so a
-			// queued collateral abort is still re-issued rather than reported.
-			expected = IOCP_OP_IO_CANCEL;
-			atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_IO);
-			return err == ERROR_NOT_FOUND ? -ENOENT : -EALREADY;
+			// Nothing to cancel: it is completing on its own, and its queued
+			// packet - a real result, or an abort another cancel on the handle
+			// already caused - is reported as it is. The mark stays: re-issuing
+			// a collateral abort now would put an op the caller was told has
+			// completed back in flight, with no CQE until data arrives.
+			return GetLastError() == ERROR_NOT_FOUND ? -ENOENT : -EALREADY;
 		}
 
 		case IOCP_OP_TIMER: {
