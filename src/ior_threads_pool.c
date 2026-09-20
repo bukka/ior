@@ -581,7 +581,9 @@ static int ior_threads_pool_rw_needs_nonblock(const ior_sqe *sqe)
  * A probe cannot replace this for writes: poll() promises only SO_SNDLOWAT
  * bytes of room, while a blocking write does not return until all of len is
  * queued, so a write larger than the free space parks the worker however
- * ready the descriptor looked. Returns 0 if the descriptor is non-blocking.
+ * ready the descriptor looked. Skipped entirely when the caller has declared
+ * its descriptors non-blocking with IOR_SETUP_FD_NONBLOCK. Returns 0 if the
+ * descriptor is non-blocking.
  */
 static int ior_threads_pool_set_nonblock(int fd)
 {
@@ -861,6 +863,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		int nowait = ior_threads_pool_rw_nowait(&w->sqe);
 		int unready = 0;
 		if (events && !w->ready && ior_threads_pool_rw_needs_nonblock(&w->sqe)
+				&& !(pool->ctx->flags & IOR_SETUP_FD_NONBLOCK)
 				&& ior_threads_pool_set_nonblock(w->sqe.threads.fd) < 0) {
 			unready = !ior_threads_pool_fd_ready(w->sqe.threads.fd, events);
 		}

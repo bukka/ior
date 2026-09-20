@@ -119,6 +119,18 @@ typedef struct ior_timespec {
 #define IOR_SETUP_IOPOLL (1U << 1)
 /** Defer task work until the next submit. */
 #define IOR_SETUP_DEFER (1U << 2)
+/**
+ * Every descriptor submitted to this context is already in non-blocking mode.
+ *
+ * The thread backend otherwise puts a descriptor in non-blocking mode before
+ * an operation that has no per-call non-blocking flag, costing one ioctl; this
+ * flag says the caller has done it already and the ioctl can be skipped. Set
+ * it only if that holds for every descriptor you submit: an operation on a
+ * descriptor that does block occupies a worker thread until it completes, and
+ * cannot be cancelled meanwhile. Ignored by the io_uring and IOCP backends,
+ * which never change descriptor state.
+ */
+#define IOR_SETUP_FD_NONBLOCK (1U << 3)
 /** @} */
 
 /**

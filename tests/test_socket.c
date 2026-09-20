@@ -452,6 +452,50 @@ static void test_socket_send_larger_than_buffer(void **state)
 	free(buf);
 }
 
+/*
+ * IOR_SETUP_FD_NONBLOCK: the caller promises its descriptors are already
+ * non-blocking, so the backend skips putting them in that mode. The short-send
+ * behaviour above must be unchanged, since the promise holds here.
+ */
+static void test_socket_setup_fd_nonblock(void **state)
+{
+	(void) state;
+
+	ior_params params;
+	memset(&params, 0, sizeof(params));
+	params.flags = IOR_SETUP_FD_NONBLOCK;
+
+	ior_ctx *ctx = NULL;
+	assert_return_code(ior_queue_init_params(32, &ctx, &params), 0);
+	assert_non_null(ctx);
+
+	ior_fd_t sock[2];
+	assert_return_code(test_make_socketpair(sock), 0);
+	assert_return_code(test_set_nonblocking(sock[0]), 0);
+	assert_return_code(test_set_nonblocking(sock[1]), 0);
+
+	int sndbuf = 8192;
+	(void) setsockopt(sock[0], SOL_SOCKET, SO_SNDBUF, (void *) &sndbuf, sizeof(sndbuf));
+	(void) setsockopt(sock[1], SOL_SOCKET, SO_RCVBUF, (void *) &sndbuf, sizeof(sndbuf));
+
+	size_t len = 4u * 1024 * 1024;
+	char *buf = calloc(1, len);
+	assert_non_null(buf);
+
+	ior_sqe *snd = ior_get_sqe(ctx);
+	assert_non_null(snd);
+	ior_prep_send(ctx, snd, sock[0], buf, (unsigned) len, 0);
+	int32_t res = submit_one_and_get_res(ctx, snd, (void *) 0x75);
+
+	assert_true(res > 0);
+	assert_true((size_t) res < len);
+
+	free(buf);
+	test_close_fd(sock[0]);
+	test_close_fd(sock[1]);
+	ior_queue_exit(ctx);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -481,6 +525,7 @@ int main(void)
 #endif
 		cmocka_unit_test_setup_teardown(
 				test_socket_send_larger_than_buffer, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test(test_socket_setup_fd_nonblock),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

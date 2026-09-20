@@ -343,6 +343,19 @@ handle a partial result and submit the remainder. io_uring issues socket ops
 non-blocking in the kernel and needs no descriptor change; IOCP uses
 overlapped I/O and needs none either.
 
+If your descriptors are non-blocking already - as they are when you pre-poll
+them yourself - pass `IOR_SETUP_FD_NONBLOCK` at setup and the backend skips
+the ioctl entirely:
+
+```c
+ior_params params = { .flags = IOR_SETUP_FD_NONBLOCK };
+ior_queue_init_params(256, &ctx, &params);
+```
+
+The promise must hold for every descriptor submitted to that context. An
+operation on one that does block occupies its worker thread until it
+completes, and cannot be cancelled meanwhile.
+
 ### IOCP Backend Design
 
 The Windows IOCP backend maps the io_uring submit/complete model onto an I/O
