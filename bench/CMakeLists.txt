@@ -11,6 +11,7 @@ set(BENCH_SOURCES
     scenario_mixed.c
     scenario_work.c
     scenario_cancel.c
+    scenario_connect.c
 )
 
 if(WIN32)

@@ -79,6 +79,29 @@ int bench_ensure_dir(const char *path);
  */
 ior_fd_t bench_open_tmpfile(const char *dir, uint64_t size);
 
+/*
+ * Create a listening loopback TCP socket on an ephemeral port (backlog
+ * SOMAXCONN). Fills *addr and *addrlen with the address to connect to.
+ * Returns 0 or a negative errno-style code; close it with bench_close_fd().
+ */
+int bench_make_listener(ior_fd_t *fd, struct sockaddr_storage *addr, socklen_t *addrlen);
+
+/*
+ * Create an unconnected TCP socket for ior_prep_connect() (WSA_FLAG_OVERLAPPED
+ * on Windows). Returns 0 or a negative errno-style code.
+ */
+int bench_make_tcp_socket(ior_fd_t *fd);
+
+/*
+ * Close a connected socket with a reset (SO_LINGER, zero timeout) so it leaves
+ * no TIME_WAIT behind: connection churn would otherwise exhaust the ephemeral
+ * port range within seconds.
+ */
+void bench_close_fd_abort(ior_fd_t fd);
+
+/* The accepted socket an IOR_OP_ACCEPT completion carries in res (>= 0). */
+ior_fd_t bench_fd_from_res(int32_t res);
+
 /* Close a descriptor returned by bench_make_tcp_pair() or bench_open_tmpfile(). */
 void bench_close_fd(ior_fd_t fd);
 
