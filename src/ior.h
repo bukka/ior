@@ -68,8 +68,9 @@ typedef struct ior_timespec {
 /**
  * @name Operation codes
  * Identify the type of operation an SQE carries; set by the ior_prep_*()
- * helpers. NOP/READ/WRITE/TIMER/SPLICE/SEND/RECV are implemented; the remaining
- * socket opcodes are reserved and not yet wired to prep helpers.
+ * helpers. NOP/READ/WRITE/TIMER/SPLICE/SEND/RECV/LINK_TIMEOUT/WORK/POLL/
+ * ASYNC_CANCEL are implemented; the remaining socket opcodes are reserved and
+ * not yet wired to prep helpers.
  * @{
  */
 /** No-op; completes immediately with result 0. */
@@ -102,6 +103,8 @@ typedef struct ior_timespec {
 /** Wait for fd readiness (ior_prep_poll_add); completes with an IOR_POLL_*
  *  mask in res. */
 #define IOR_OP_POLL 13
+/** Cancel a submitted operation (ior_prep_cancel, ior_prep_cancel_fd). */
+#define IOR_OP_ASYNC_CANCEL 14
 /** @} */
 
 /**
@@ -191,8 +194,9 @@ typedef enum {
 /** Kernel submission polling is supported. */
 #define IOR_FEAT_SQPOLL (1U << 4)
 /** User work callbacks are supported (ior_prep_work). Set by every backend:
- *  the io_uring backend requires liburing 2.2+ and kernel 5.18+
- *  (IORING_OP_MSG_RING) and is only selected when they are available;
+ *  the io_uring backend requires liburing 2.2+ and kernel 5.19+
+ *  (IORING_OP_MSG_RING, cancel by descriptor) and is only selected when they
+ *  are available;
  *  otherwise the threads backend is used. */
 #define IOR_FEAT_WORK (1U << 5)
 /** @} */
@@ -465,7 +469,8 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *
  * On the threads backend, cancellation is effective for read/write/send/recv on
  * pollable descriptors (sockets, pipes); a guarded op on a regular file runs to
- * completion uncancelled.
+ * completion uncancelled. If the guarded op is cancelled with ior_prep_cancel()
+ * instead, both it and this link timeout complete with -ECANCELED.
  *
  * @param ctx    I/O context.
  * @param sqe    Entry from ior_get_sqe(), submitted right after the guarded op.
@@ -521,6 +526,50 @@ void ior_prep_recv(
  * @param poll_mask  Events to wait for (IOR_POLL_IN, IOR_POLL_OUT, ...).
  */
 void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
+
+/**
+ * Prepare a cancellation of a submitted operation, matched by user data.
+ *
+ * Cancellation follows io_uring: the cancel is itself an operation with its
+ * own completion, and the target completes separately with -ECANCELED. The
+ * cancel's res is:
+ *   - 0: the target was found and cancelled; its CQE (res == -ECANCELED)
+ *     follows, as does the CQE of a link timeout attached to it (also
+ *     -ECANCELED) and of every later entry in its link chain;
+ *   - -ENOENT: no matching operation is in flight (it already completed, or
+ *     was never submitted);
+ *   - -EALREADY: the target was found but is executing and cannot be
+ *     interrupted (a work callback, a syscall on a regular file); it completes
+ *     on its own with its real result. A running work callback sees
+ *     ior_work_cancelled() return non-zero so it can return early.
+ * If several in-flight operations share the user data, one of them is
+ * cancelled per call.
+ *
+ * Both CQEs must be reaped: the target's buffers stay in use until its own
+ * completion arrives, whatever the cancel reported. A link timeout cannot be
+ * targeted directly (-ENOENT); cancel its guarded operation instead. Entries
+ * that were prepared but not yet submitted cannot be cancelled.
+ *
+ * @param ctx        I/O context.
+ * @param sqe        Entry from ior_get_sqe().
+ * @param user_data  The pointer set with ior_sqe_set_data() on the target.
+ */
+void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data);
+
+/**
+ * Prepare a cancellation of one operation submitted on a descriptor.
+ *
+ * Like ior_prep_cancel() but matches by descriptor (read, write, send, recv,
+ * poll, splice); operations without one (timeouts, work, no-ops) never match.
+ * One operation is cancelled per call, so to tear down everything on a
+ * descriptor submit cancels until one completes with -ENOENT. An invalid
+ * descriptor completes with -EBADF.
+ *
+ * @param ctx  I/O context.
+ * @param sqe  Entry from ior_get_sqe().
+ * @param fd   Descriptor whose operation to cancel.
+ */
+void ior_prep_cancel_fd(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd);
 
 /**
  * @brief Opaque per-operation handle passed to a work callback.

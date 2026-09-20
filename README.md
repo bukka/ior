@@ -17,6 +17,8 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Read and write operations
 - Socket send and receive operations
 - Timer/timeout operations
+- Async cancellation of submitted operations (`ior_prep_cancel`,
+  `ior_prep_cancel_fd`), with io_uring semantics on every backend
 - Splice operations (native on Linux, emulated elsewhere)
 - Operation chaining with `IOR_SQE_IO_LINK`
 - Ordering with `IOR_SQE_IO_DRAIN`
@@ -243,6 +245,14 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
 // Splice operation (Linux only)
 void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in,
                      int fd_out, uint64_t off_out, unsigned nbytes, unsigned flags);
+
+// Cancel a submitted operation by its user data, or one operation on a
+// descriptor (repeat until -ENOENT to cancel all of them). The cancel
+// completes with 0 (found and cancelled), -ENOENT (nothing in flight) or
+// -EALREADY (running, cannot be interrupted); the target completes with
+// -ECANCELED, as do its link timeout and the rest of its link chain.
+void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data);
+void ior_prep_cancel_fd(ior_ctx *ctx, ior_sqe *sqe, int fd);
 ```
 
 ### SQE/CQE Accessors
@@ -302,6 +312,10 @@ IOR automatically selects the best available backend:
 The thread pool backend uses:
 - Lock-free ring buffers for submission and completion queues
 - Out-of-order completion support for maximum parallelism
+- A single readiness poller thread (epoll/kqueue/poll) that gates blocking
+  read/write/send/recv on pollable descriptors, so workers never block on a
+  socket, non-blocking descriptors never spin on `EAGAIN`, and pending
+  operations stay cancellable
 - Operation chaining with `IOR_SQE_IO_LINK` flag
 - Ordering guarantees with `IOR_SQE_IO_DRAIN` flag
 - eventfd (Linux/FreeBSD 13+) or pipe-based notification

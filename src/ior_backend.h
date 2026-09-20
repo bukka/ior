@@ -17,6 +17,9 @@ struct ior_work_token {
 	const _Atomic int *shutdown; /* may be NULL */
 };
 
+/* Set in a cancel op's flags by prep_cancel_fd: match by fd, not user data. */
+#define IOR_CANCEL_BY_FD (1U << 0)
+
 /* Backend-specific SQE structures */
 #ifdef IOR_HAVE_URING
 #include <liburing.h>
@@ -49,6 +52,7 @@ typedef struct ior_sqe_threads {
 		uint32_t splice_flags;
 		uint32_t timeout_flags;
 		uint32_t poll_events;
+		uint32_t cancel_flags;
 	};
 	uint64_t user_data;
 	union {
@@ -148,6 +152,8 @@ typedef struct ior_backend_ops {
 	void (*prep_send)(ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags);
 	void (*prep_recv)(ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
 	void (*prep_poll_add)(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
+	void (*prep_cancel)(ior_sqe *sqe, uint64_t user_data);
+	void (*prep_cancel_fd)(ior_sqe *sqe, ior_fd_t fd);
 	/* Optional (NULL = work ops unsupported). Takes backend_ctx because some
 	 * backends record per-op state beyond the SQE (e.g. io_uring's job list). */
 	int (*prep_work)(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg);

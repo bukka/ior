@@ -30,6 +30,7 @@ set(TESTS
     test_slow_op
     test_sq_reuse
     test_work
+    test_cancel
 )
 
 # Add test for splice only on Linux with splice support

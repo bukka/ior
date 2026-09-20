@@ -447,6 +447,22 @@ static void ior_threads_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_
 	sqe->threads.poll_events = poll_mask;
 }
 
+static void ior_threads_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_ASYNC_CANCEL;
+	sqe->threads.fd = IOR_INVALID_FD;
+	sqe->threads.addr = user_data;
+}
+
+static void ior_threads_backend_prep_cancel_fd(ior_sqe *sqe, ior_fd_t fd)
+{
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_ASYNC_CANCEL;
+	sqe->threads.fd = fd;
+	sqe->threads.cancel_flags = IOR_CANCEL_BY_FD;
+}
+
 static int ior_threads_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	(void) backend_ctx;
@@ -524,6 +540,8 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_send = ior_threads_backend_prep_send,
 	.prep_recv = ior_threads_backend_prep_recv,
 	.prep_poll_add = ior_threads_backend_prep_poll_add,
+	.prep_cancel = ior_threads_backend_prep_cancel,
+	.prep_cancel_fd = ior_threads_backend_prep_cancel_fd,
 	.prep_work = ior_threads_backend_prep_work,
 	.sqe_set_data = ior_threads_backend_sqe_set_data,
 	.sqe_set_flags = ior_threads_backend_sqe_set_flags,

@@ -34,6 +34,14 @@ typedef struct ior_ctx_uring {
 	struct io_uring poster; // side ring, valid when wp != NULL
 	ior_uring_job *pending_head; // prepped-not-dispatched jobs (submitter thread only)
 	ior_uring_job *pending_tail;
+
+	/*
+	 * Dispatched jobs, for IOR_OP_ASYNC_CANCEL: the kernel only ever sees
+	 * their placeholder NOPs, so a cancel by user data is matched against
+	 * this list at submit time and resolved in userspace.
+	 */
+	pthread_mutex_t jobs_lock;
+	ior_uring_job *jobs_head; // doubly linked via live_next/live_prev
 } ior_ctx_uring;
 
 /*
@@ -53,6 +61,10 @@ enum {
 struct ior_uring_job {
 	ior_worker_pool_job pj; // pool FIFO node
 	ior_uring_job *next_pending; // prep-to-submit list link
+	ior_uring_job *live_next; // ctx->jobs_head list, under jobs_lock
+	ior_uring_job *live_prev;
+	int live_linked;
+	int cancel_drop; // refs a cancel took over (worker's, timer's) to drop
 	ior_ctx_uring *ctx;
 	ior_work_fn fn;
 	void *arg;
@@ -70,9 +82,30 @@ struct ior_uring_job {
 	_Atomic int refs;
 };
 
+// jobs_lock held.
+static void ior_uring_job_unlink_locked(ior_ctx_uring *ctx, ior_uring_job *job)
+{
+	if (!job->live_linked) {
+		return;
+	}
+	if (job->live_prev) {
+		job->live_prev->live_next = job->live_next;
+	} else {
+		ctx->jobs_head = job->live_next;
+	}
+	if (job->live_next) {
+		job->live_next->live_prev = job->live_prev;
+	}
+	job->live_linked = 0;
+}
+
 static void ior_uring_job_release(ior_uring_job *job)
 {
 	if (atomic_fetch_sub(&job->refs, 1) == 1) {
+		ior_ctx_uring *ctx = job->ctx;
+		pthread_mutex_lock(&ctx->jobs_lock);
+		ior_uring_job_unlink_locked(ctx, job);
+		pthread_mutex_unlock(&ctx->jobs_lock);
 		free(job);
 	}
 }
@@ -248,8 +281,8 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 							= (struct __kernel_timespec *) (uintptr_t) next->addr;
 					if (kts && kts->tv_sec >= 0 && kts->tv_nsec >= 0
 							&& kts->tv_nsec < 1000000000LL) {
-						uint64_t ts_ns = (uint64_t) kts->tv_sec * 1000000000ULL
-								+ (uint64_t) kts->tv_nsec;
+						uint64_t ts_ns
+								= (uint64_t) kts->tv_sec * 1000000000ULL + (uint64_t) kts->tv_nsec;
 						lt_deadline_ns = (next->timeout_flags & IORING_TIMEOUT_ABS)
 								? ts_ns
 								: ior_worker_pool_monotonic_ns() + ts_ns;
@@ -267,13 +300,23 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 
 		if (job->lt_armed) {
 			atomic_store(&job->refs, 2); // worker + timer
-			if (ior_worker_pool_arm_timer(ctx->wp, lt_deadline_ns, ior_uring_lt_fired,
-						ior_uring_lt_dropped, job)
+			if (ior_worker_pool_arm_timer(
+						ctx->wp, lt_deadline_ns, ior_uring_lt_fired, ior_uring_lt_dropped, job)
 					< 0) {
 				job->lt_armed = 0;
 				atomic_store(&job->refs, 1);
 			}
 		}
+
+		pthread_mutex_lock(&ctx->jobs_lock);
+		job->live_prev = NULL;
+		job->live_next = ctx->jobs_head;
+		if (ctx->jobs_head) {
+			ctx->jobs_head->live_prev = job;
+		}
+		ctx->jobs_head = job;
+		job->live_linked = 1;
+		pthread_mutex_unlock(&ctx->jobs_lock);
 
 		job->pj.next = NULL;
 		if (last) {
@@ -286,6 +329,103 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 	}
 
 	ior_worker_pool_submit(ctx->wp, first, last, count);
+}
+
+/*
+ * Cancel one dispatched job per io_uring semantics (jobs_lock held). A job
+ * that has not started is taken out of the pool FIFO (or, if a worker just
+ * popped it, flagged so the worker skips it) and both its CQEs are posted
+ * here; a running one only gets its token flagged (-EALREADY). A cancelled
+ * job is pushed on *drop (via next_pending) with the refs it took over, to be
+ * released once the lock is gone.
+ */
+static int ior_uring_cancel_job_locked(ior_ctx_uring *ctx, ior_uring_job *job, ior_uring_job **drop)
+{
+	int expected = IOR_URING_JOB_QUEUED;
+	if (atomic_compare_exchange_strong(&job->state, &expected, IOR_URING_JOB_CANCELLED)) {
+		atomic_store_explicit(&job->token.cancelled, 1, memory_order_release);
+		ior_uring_job_unlink_locked(ctx, job);
+		job->cancel_drop = 0;
+		// Off the FIFO: the worker's ref is ours to drop. Otherwise a worker
+		// already popped it and drops its own ref when it sees CANCELLED.
+		if (ior_worker_pool_cancel_job(ctx->wp, &job->pj) == 0) {
+			job->cancel_drop++;
+		}
+		// The link timeout no longer needs to fire.
+		if (job->lt_armed && ior_worker_pool_cancel_timer(ctx->wp, job) == 0) {
+			job->cancel_drop++;
+		}
+		ior_uring_post_cqe(ctx, job->user_data, -ECANCELED);
+		if (job->has_lt) {
+			ior_uring_post_cqe(ctx, job->lt_user_data, -ECANCELED);
+		}
+		job->next_pending = *drop;
+		*drop = job;
+		return 0;
+	}
+	if (expected == IOR_URING_JOB_RUNNING) {
+		atomic_store_explicit(&job->token.cancelled, 1, memory_order_release);
+		return -EALREADY;
+	}
+	return -ENOENT;
+}
+
+/*
+ * Resolve staged ASYNC_CANCEL sqes against the dispatched work jobs, which
+ * the kernel cannot see. A cancel by user data that matches a job is
+ * executed here: its sqe becomes a skipped NOP and its result is posted
+ * through the poster ring. Cancels by fd never match a job. Runs on the
+ * submitter thread while the SQ is still staged.
+ */
+static void ior_uring_intercept_cancels(ior_ctx_uring *ctx)
+{
+	struct io_uring_sq *sq = &ctx->ring.sq;
+	unsigned mask = sq->ring_entries - 1;
+
+	for (unsigned pos = sq->sqe_head; pos != sq->sqe_tail; pos++) {
+		struct io_uring_sqe *s = &sq->sqes[pos & mask];
+		if (s->opcode != IORING_OP_ASYNC_CANCEL) {
+			continue;
+		}
+		if (s->cancel_flags & IORING_ASYNC_CANCEL_FD) {
+			continue;
+		}
+		uint64_t key = s->addr;
+
+		int ret = -ENOENT;
+		ior_uring_job *drop = NULL;
+		pthread_mutex_lock(&ctx->jobs_lock);
+		for (ior_uring_job *job = ctx->jobs_head; job; job = job->live_next) {
+			if (job->user_data != key) {
+				continue;
+			}
+			ret = ior_uring_cancel_job_locked(ctx, job, &drop);
+			if (ret != -ENOENT) {
+				break;
+			}
+		}
+		pthread_mutex_unlock(&ctx->jobs_lock);
+
+		// Drop the refs of jobs that will never be run or timed now.
+		while (drop) {
+			ior_uring_job *j = drop;
+			drop = j->next_pending;
+			int n = j->cancel_drop; // the last release frees j
+			for (int i = 0; i < n; i++) {
+				ior_uring_job_release(j);
+			}
+		}
+
+		if (ret == -ENOENT) {
+			continue; // no job matched: the kernel handles it
+		}
+
+		uint64_t user_data = s->user_data;
+		io_uring_prep_nop(s);
+		s->flags |= IOSQE_CQE_SKIP_SUCCESS;
+		s->user_data = 0;
+		ior_uring_post_cqe(ctx, user_data, ret);
+	}
 }
 
 /* Backend operations */
@@ -308,6 +448,11 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 		free(ctx);
 		return -ENOMEM;
 	}
+	if (pthread_mutex_init(&ctx->jobs_lock, NULL) != 0) {
+		pthread_mutex_destroy(&ctx->poster_lock);
+		free(ctx);
+		return -ENOMEM;
+	}
 
 	// Prepare io_uring params
 	struct io_uring_params uring_params = { 0 };
@@ -320,6 +465,7 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	// Initialize io_uring - if kernel doesn't support it, this fails
 	int ret = io_uring_queue_init_params(params->sq_entries, &ctx->ring, &uring_params);
 	if (ret < 0) {
+		pthread_mutex_destroy(&ctx->jobs_lock);
 		pthread_mutex_destroy(&ctx->poster_lock);
 		free(ctx);
 		return ret;
@@ -343,6 +489,7 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	}
 	if (!msg_ring_ok) {
 		io_uring_queue_exit(&ctx->ring);
+		pthread_mutex_destroy(&ctx->jobs_lock);
 		pthread_mutex_destroy(&ctx->poster_lock);
 		free(ctx);
 		return -ENOSYS;
@@ -379,6 +526,7 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 		job = next;
 	}
 
+	pthread_mutex_destroy(&ctx->jobs_lock);
 	pthread_mutex_destroy(&ctx->poster_lock);
 	io_uring_queue_exit(&ctx->ring);
 	free(ctx);
@@ -405,8 +553,12 @@ static int ior_uring_backend_submit(void *backend_ctx)
 	}
 
 	ior_ctx_uring *ctx = backend_ctx;
-	// Work jobs must be harvested while their placeholder SQEs are still staged.
+	// Work jobs must be harvested while their placeholder SQEs are still
+	// staged; cancels then see the jobs submitted just before them.
 	ior_uring_dispatch_pending(ctx);
+	if (ctx->wp) {
+		ior_uring_intercept_cancels(ctx);
+	}
 	int ret = io_uring_submit(&ctx->ring);
 	return ret < 0 ? -errno : ret;
 }
@@ -418,8 +570,11 @@ static int ior_uring_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr
 	}
 
 	ior_ctx_uring *ctx = backend_ctx;
-	// Work jobs must be harvested while their placeholder SQEs are still staged.
+	// See ior_uring_backend_submit.
 	ior_uring_dispatch_pending(ctx);
+	if (ctx->wp) {
+		ior_uring_intercept_cancels(ctx);
+	}
 	int ret = io_uring_submit_and_wait(&ctx->ring, wait_nr);
 	return ret < 0 ? -errno : ret;
 }
@@ -598,6 +753,20 @@ static void ior_uring_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t 
 	io_uring_prep_poll_add(s, (int) fd, poll_mask);
 }
 
+static void ior_uring_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_cancel64(s, user_data, 0);
+}
+
+// Cancel by descriptor needs kernel 5.19+ (checked at configure time).
+static void ior_uring_backend_prep_cancel_fd(ior_sqe *sqe, ior_fd_t fd)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	// io_uring uses int fd - cast from ior_fd_t (which is int on Linux)
+	io_uring_prep_cancel_fd(s, (int) fd, 0);
+}
+
 static int ior_uring_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	ior_ctx_uring *ctx = backend_ctx;
@@ -729,6 +898,8 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_send = ior_uring_backend_prep_send,
 	.prep_recv = ior_uring_backend_prep_recv,
 	.prep_poll_add = ior_uring_backend_prep_poll_add,
+	.prep_cancel = ior_uring_backend_prep_cancel,
+	.prep_cancel_fd = ior_uring_backend_prep_cancel_fd,
 	.prep_work = ior_uring_backend_prep_work,
 	.sqe_set_data = ior_uring_backend_sqe_set_data,
 	.sqe_set_flags = ior_uring_backend_sqe_set_flags,

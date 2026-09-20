@@ -14,6 +14,9 @@
  * the backend must not treat the offset as a file position for a socket fd.
  */
 #include "test_utils.h"
+#ifndef _WIN32
+#include <sys/socket.h>
+#endif
 
 /* Fixture: a ctx plus a connected stream socket pair. sock[0] and sock[1]
  * are the two ends; bytes written to one are readable from the other. */
@@ -324,6 +327,75 @@ static void test_socket_recv_after_peer_close(void **state)
 	assert_int_equal(res, 0);
 }
 
+/*
+ * A recv on a non-blocking socket with nothing to read must wait for data
+ * rather than fail with -EAGAIN: the backend gates the syscall on readiness
+ * (io_uring does this natively; the threads backend parks the op on its
+ * poller). The peer sends only after the recv has been submitted.
+ */
+static void test_socket_nonblocking_recv_waits(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+	assert_return_code(test_set_nonblocking(s->sock[1]), 0);
+
+	char buf[32];
+	memset(buf, 0, sizeof(buf));
+
+	ior_sqe *rcv = ior_get_sqe(s->ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, sizeof(buf), 0);
+	ior_sqe_set_data(s->ctx, rcv, (void *) 0x70);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	// Nothing to read yet: the recv must still be pending.
+	ior_timespec to = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50ms
+	ior_cqe *cqe = NULL;
+	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
+
+	const char *msg = "late";
+	unsigned len = (unsigned) strlen(msg);
+	ior_sqe *snd = ior_get_sqe(s->ctx);
+	assert_non_null(snd);
+	ior_prep_send(s->ctx, snd, s->sock[0], msg, len, 0);
+	ior_sqe_set_data(s->ctx, snd, (void *) 0x71);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	int got_recv = 0, got_send = 0;
+	while (!got_recv || !got_send) {
+		int ret = ior_wait_cqe(s->ctx, &cqe);
+		if (ret == -EINTR) {
+			continue;
+		}
+		assert_return_code(ret, 0);
+		uintptr_t tag = (uintptr_t) ior_cqe_get_data(s->ctx, cqe);
+		int32_t res = ior_cqe_get_res(s->ctx, cqe);
+		if (tag == 0x70) {
+			assert_int_equal(res, (int32_t) len);
+			assert_memory_equal(buf, msg, len);
+			got_recv = 1;
+		} else {
+			assert_int_equal(tag, 0x71);
+			assert_int_equal(res, (int32_t) len);
+			got_send = 1;
+		}
+		ior_cqe_seen(s->ctx, cqe);
+	}
+}
+
+#ifdef MSG_DONTWAIT
+/* MSG_DONTWAIT is honoured as with io_uring: no data means -EAGAIN at once. */
+static void test_socket_recv_dontwait(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	char buf[32];
+	ior_sqe *rcv = ior_get_sqe(s->ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, sizeof(buf), MSG_DONTWAIT);
+	assert_int_equal(submit_one_and_get_res(s->ctx, rcv, (void *) 0x72), -EAGAIN);
+}
+#endif
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -343,6 +415,12 @@ int main(void)
 				test_socket_partial_recv, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test_setup_teardown(
 				test_socket_recv_after_peer_close, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_nonblocking_recv_waits, setup_socketpair, teardown_socketpair),
+#ifdef MSG_DONTWAIT
+		cmocka_unit_test_setup_teardown(
+				test_socket_recv_dontwait, setup_socketpair, teardown_socketpair),
+#endif
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

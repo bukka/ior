@@ -52,6 +52,22 @@ typedef struct handle_set {
 
 struct ior_ctx_iocp;
 
+/*
+ * Where a submitted op currently is, for IOR_OP_ASYNC_CANCEL. Set at each
+ * issue point before the op can complete, DONE once its completion is posted
+ * (or dequeued), FREE while on the free list or merely prepped.
+ */
+enum {
+	IOCP_OP_FREE = 0,
+	IOCP_OP_DEFERRED, /* drain-deferred head in the pending list */
+	IOCP_OP_LINKED, /* behind a link (or a paired link timeout); not cancellable */
+	IOCP_OP_IO, /* overlapped I/O in flight */
+	IOCP_OP_TIMER, /* armed on the timer thread */
+	IOCP_OP_WORK, /* callback submitted to the threadpool */
+	IOCP_OP_POLL, /* registered with the poller */
+	IOCP_OP_DONE,
+};
+
 /* IOCP operation structure - wraps OVERLAPPED */
 typedef struct ior_iocp_op {
 	OVERLAPPED overlapped; // MUST be first for GetQueuedCompletionStatus casting
@@ -122,6 +138,12 @@ typedef struct ior_iocp_op {
 	int32_t work_res;
 	struct ior_ctx_iocp *work_owner;
 	struct ior_work_token token;
+
+	// IOR_OP_ASYNC_CANCEL: what to match (user data, or fd with IOR_CANCEL_BY_FD).
+	uint64_t cancel_key;
+	uint32_t cancel_flags;
+
+	_Atomic int state; // IOCP_OP_*
 
 	// Free list linkage (preserved across prep_*)
 	struct ior_iocp_op *next_free;
@@ -515,6 +537,10 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	atomic_init(&op->token.cancelled, 0);
 	op->token.shutdown = NULL;
 
+	op->cancel_key = 0;
+	op->cancel_flags = 0;
+	atomic_store(&op->state, IOCP_OP_FREE);
+
 	return op;
 }
 
@@ -523,6 +549,8 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	if (!op) {
 		return;
 	}
+
+	atomic_store(&op->state, IOCP_OP_FREE);
 
 	EnterCriticalSection(&ctx->pool_lock);
 
@@ -617,6 +645,7 @@ static int post_synthetic_completion(
 	op->error_code = error_code;
 	op->bytes_transferred = bytes_transferred;
 	op->is_synthetic = true;
+	atomic_store(&op->state, IOCP_OP_DONE);
 
 	MemoryBarrier();
 
@@ -643,6 +672,7 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 	op->is_synthetic = true;
 	op->error_code = error_code;
 	op->bytes_transferred = 0;
+	atomic_store(&op->state, IOCP_OP_DONE);
 
 	MemoryBarrier();
 
@@ -709,6 +739,7 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
+	atomic_store(&op->state, IOCP_OP_IO);
 
 	BOOL result = ReadFile(h, op->buf, op->len, NULL, &op->overlapped);
 	if (result) {
@@ -739,6 +770,7 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
+	atomic_store(&op->state, IOCP_OP_IO);
 
 	BOOL result = WriteFile(h, op->buf, op->len, NULL, &op->overlapped);
 	if (result) {
@@ -778,6 +810,7 @@ static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	op->wsabuf.buf = (CHAR *) op->buf;
 	op->wsabuf.len = op->len;
+	atomic_store(&op->state, IOCP_OP_IO);
 
 	int rc = WSASend((SOCKET) op->fd, &op->wsabuf, 1, NULL, op->sock_flags, &op->overlapped, NULL);
 	if (rc == 0) {
@@ -804,6 +837,7 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	op->wsabuf.buf = (CHAR *) op->buf;
 	op->wsabuf.len = op->len;
+	atomic_store(&op->state, IOCP_OP_IO);
 
 	// sock_flags is an in/out parameter for WSARecv and must remain valid for
 	// the whole async operation, hence it lives in the op.
@@ -885,6 +919,7 @@ static int issue_work(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	// Reserve the active_count slot up front, like arm_timer: the callback
 	// completes from another thread, so it must post with the slot already held.
 	atomic_fetch_add(&ctx->active_count, 1);
+	atomic_store(&op->state, IOCP_OP_WORK);
 
 	if (!TrySubmitThreadpoolCallback(ior_iocp_work_callback, op, &ctx->work_env)) {
 		atomic_fetch_sub(&ctx->active_count, 1);
@@ -939,8 +974,7 @@ static void iocp_poller_wake(iocp_poller *p)
 static void iocp_poller_drain_wake(iocp_poller *p)
 {
 	char buf[64];
-	while (recv(p->wake_rx, buf, sizeof(buf), 0) > 0) {
-	}
+	while (recv(p->wake_rx, buf, sizeof(buf), 0) > 0) { }
 }
 
 /* Remove slot i by swapping in the last active entry. */
@@ -1156,6 +1190,7 @@ static int issue_poll(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	// Reserve the active_count slot up front, like issue_work: the poller
 	// thread completes the op, so it must post with the slot already held.
 	atomic_fetch_add(&ctx->active_count, 1);
+	atomic_store(&op->state, IOCP_OP_POLL);
 
 	iocp_poller *p = &ctx->poller;
 	EnterCriticalSection(&p->lock);
@@ -1174,8 +1209,10 @@ static void op_to_cqe(ior_iocp_op *op)
 
 	if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
-	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL) {
-		// The callback's return value (or ready poll mask), not a byte count.
+	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL
+			|| op->opcode == IOR_OP_ASYNC_CANCEL) {
+		// The callback's return value (ready poll mask, cancel result), not
+		// a byte count.
 		op->cqe.iocp.res = op->work_res;
 	} else {
 		op->cqe.iocp.res = (int32_t) op->bytes_transferred;
@@ -1403,8 +1440,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			ior_iocp_op *guarded = op->guarded;
 			// Work and poll ops have no OVERLAPPED I/O to cancel: flag their
 			// token instead (the poller drops a flagged op once woken).
-			bool token_cancel
-					= guarded->opcode == IOR_OP_WORK || guarded->opcode == IOR_OP_POLL;
+			bool token_cancel = guarded->opcode == IOR_OP_WORK || guarded->opcode == IOR_OP_POLL;
 			bool is_poll = guarded->opcode == IOR_OP_POLL;
 			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
@@ -1423,6 +1459,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 		op->is_synthetic = true;
 		op->error_code = ERROR_TIMEOUT;
 		op->bytes_transferred = 0;
+		atomic_store(&op->state, IOCP_OP_DONE);
 
 		MemoryBarrier();
 
@@ -1461,6 +1498,7 @@ static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	op->timer_deadline_ns = deadline;
 	op->timer_armed = true;
 	op->timer_cancelled = false;
+	atomic_store(&op->state, IOCP_OP_TIMER);
 
 	int ret = timer_heap_push(tm, op);
 	if (ret == 0) {
@@ -1495,6 +1533,7 @@ static void arm_link_timeout(ior_ctx_iocp *ctx, ior_iocp_op *guarded)
 	EnterCriticalSection(&tm->lock);
 	lt->timer_deadline_ns = deadline;
 	lt->timer_armed = true;
+	atomic_store(&lt->state, IOCP_OP_LINKED); // cancelled through its guarded op
 	int ret = timer_heap_push(tm, lt);
 	if (ret == 0) {
 		atomic_fetch_add(&ctx->active_count, 1);
@@ -1536,6 +1575,146 @@ static void cancel_link_chain(ior_ctx_iocp *ctx, ior_iocp_op *first)
 
 		cur = next;
 	}
+}
+
+/* ================= IOR_OP_ASYNC_CANCEL ================= */
+
+static bool iocp_op_has_fd(uint8_t opcode)
+{
+	switch (opcode) {
+		case IOR_OP_READ:
+		case IOR_OP_WRITE:
+		case IOR_OP_SEND:
+		case IOR_OP_RECV:
+		case IOR_OP_POLL:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool iocp_cancel_match(const ior_iocp_op *op, const ior_iocp_op *c)
+{
+	if (c->cancel_flags & IOR_CANCEL_BY_FD) {
+		return iocp_op_has_fd(op->opcode) && op->fd == c->fd;
+	}
+	return op->user_data == c->cancel_key;
+}
+
+/*
+ * Cancel one in-flight op per io_uring semantics: 0 if it will complete with
+ * -ECANCELED (its link timeout and chain follow through the normal dequeue
+ * path), -EALREADY if it is executing and cannot be interrupted, -ENOENT if
+ * it completed meanwhile. Each state's owner arbitrates: the pending list
+ * under sched_lock, the timer heap under timers.lock, the kernel for
+ * overlapped I/O (CancelIoEx), the token for work and poll ops.
+ */
+static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	switch (atomic_load(&op->state)) {
+		case IOCP_OP_DEFERRED: {
+			EnterCriticalSection(&ctx->sched_lock);
+			bool found = op->drain_deferred;
+			if (found) {
+				pending_remove_locked(ctx, op);
+				op->drain_deferred = false;
+			}
+			LeaveCriticalSection(&ctx->sched_lock);
+			if (!found) {
+				return -ENOENT;
+			}
+			// Never issued: its link timeout was never armed and its chain
+			// never started, so resolve both here.
+			ior_iocp_op *rest = op->link_next;
+			op->link_next = NULL;
+			ior_iocp_op *lt = op->link_timeout;
+			op->link_timeout = NULL;
+			(void) post_synthetic_completion(ctx, op, ERROR_OPERATION_ABORTED, 0);
+			if (lt) {
+				lt->guarded = NULL;
+				(void) post_synthetic_completion(ctx, lt, ERROR_OPERATION_ABORTED, 0);
+			}
+			if (rest) {
+				cancel_link_chain(ctx, rest);
+			}
+			return 0;
+		}
+
+		case IOCP_OP_IO:
+			// The -ECANCELED completion arrives through the port; a completion
+			// that already raced in keeps its real result (io_uring does the
+			// same).
+			if (CancelIoEx((HANDLE) op->fd, &op->overlapped)) {
+				return 0;
+			}
+			return GetLastError() == ERROR_NOT_FOUND ? -ENOENT : -EALREADY;
+
+		case IOCP_OP_TIMER: {
+			timer_mgr *tm = &ctx->timers;
+			EnterCriticalSection(&tm->lock);
+			bool won = op->timer_armed && !op->guarded;
+			if (won) {
+				op->timer_armed = false;
+				timer_heap_remove(tm, op);
+			}
+			LeaveCriticalSection(&tm->lock);
+			if (!won) {
+				return -ENOENT; // firing right now
+			}
+			post_armed_op(ctx, op, ERROR_OPERATION_ABORTED);
+			return 0;
+		}
+
+		case IOCP_OP_WORK:
+			// A queued or running threadpool callback cannot be withdrawn;
+			// flag it so it can return early.
+			atomic_store_explicit(&op->token.cancelled, 1, memory_order_release);
+			return -EALREADY;
+
+		case IOCP_OP_POLL:
+			// The poller drops a flagged op as -ECANCELED once woken.
+			atomic_store_explicit(&op->token.cancelled, 1, memory_order_release);
+			iocp_poller_wake(&ctx->poller);
+			return 0;
+
+		default:
+			return -ENOENT;
+	}
+}
+
+/*
+ * Execute a cancel op inline, like io_uring does at submit: scan the op pool
+ * for the first in-flight match and post the result as this op's completion.
+ */
+static int issue_cancel(ior_ctx_iocp *ctx, ior_iocp_op *c)
+{
+	int32_t ret;
+
+	if ((c->cancel_flags & IOR_CANCEL_BY_FD) && (c->fd == NULL || c->fd == INVALID_HANDLE_VALUE)) {
+		ret = -EBADF;
+	} else {
+		ret = -ENOENT;
+		for (uint32_t i = 0; i < ctx->pool_size; i++) {
+			ior_iocp_op *op = &ctx->op_pool[i];
+			if (op == c) {
+				continue;
+			}
+			int state = atomic_load(&op->state);
+			if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE) {
+				continue;
+			}
+			if (!iocp_cancel_match(op, c)) {
+				continue;
+			}
+			ret = iocp_cancel_one(ctx, op);
+			if (ret != -ENOENT) {
+				break;
+			}
+		}
+	}
+
+	c->work_res = ret;
+	return post_synthetic_completion(ctx, c, ERROR_SUCCESS, 0);
 }
 
 static void sched_kick_drain(ior_ctx_iocp *ctx)
@@ -1604,6 +1783,7 @@ static int start_link_next(ior_ctx_iocp *ctx, ior_iocp_op *next)
 	if ((next->sqe_flags & IOR_SQE_IO_DRAIN) && !drain_satisfied(ctx, next)) {
 		EnterCriticalSection(&ctx->sched_lock);
 		next->drain_deferred = true;
+		atomic_store(&next->state, IOCP_OP_DEFERRED);
 		pending_enqueue_locked(ctx, next);
 		LeaveCriticalSection(&ctx->sched_lock);
 		return 0;
@@ -1661,6 +1841,9 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 		case IOR_OP_TIMER:
 			return arm_timer(ctx, op);
+
+		case IOR_OP_ASYNC_CANCEL:
+			return issue_cancel(ctx, op);
 
 		case IOR_OP_LINK_TIMEOUT:
 			// A paired link timeout is armed via its guarded op, never issued
@@ -2009,6 +2192,7 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		// op is issued, not submitted as a standalone op. Still count it: its
 		// SQE was consumed, and other backends report both entries of the pair.
 		if (op->opcode == IOR_OP_LINK_TIMEOUT && op->guarded) {
+			atomic_store(&op->state, IOCP_OP_LINKED);
 			submitted++;
 			prev = op;
 			continue;
@@ -2025,6 +2209,7 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		if (prev && (prev->sqe_flags & IOR_SQE_IO_LINK)) {
 			prev->link_next = op;
 			op->linked_deferred = true;
+			atomic_store(&op->state, IOCP_OP_LINKED);
 		} else {
 			op->linked_deferred = false;
 		}
@@ -2049,6 +2234,7 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 			// Head but drain-deferred
 			EnterCriticalSection(&ctx->sched_lock);
 			op->drain_deferred = true;
+			atomic_store(&op->state, IOCP_OP_DEFERRED);
 			pending_enqueue_locked(ctx, op);
 			LeaveCriticalSection(&ctx->sched_lock);
 			ret = 0;
@@ -2559,6 +2745,26 @@ static void ior_iocp_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t p
 	op->poll_mask = poll_mask;
 }
 
+static void ior_iocp_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_ASYNC_CANCEL;
+	op->fd = NULL;
+	op->cancel_key = user_data;
+	op->cancel_flags = 0;
+}
+
+static void ior_iocp_backend_prep_cancel_fd(ior_sqe *sqe, ior_fd_t fd)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_ASYNC_CANCEL;
+	op->fd = fd;
+	op->cancel_key = 0;
+	op->cancel_flags = IOR_CANCEL_BY_FD;
+}
+
 static int ior_iocp_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	(void) backend_ctx;
@@ -2638,6 +2844,8 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_send = ior_iocp_backend_prep_send,
 	.prep_recv = ior_iocp_backend_prep_recv,
 	.prep_poll_add = ior_iocp_backend_prep_poll_add,
+	.prep_cancel = ior_iocp_backend_prep_cancel,
+	.prep_cancel_fd = ior_iocp_backend_prep_cancel_fd,
 	.prep_work = ior_iocp_backend_prep_work,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,
 	.sqe_set_flags = ior_iocp_backend_sqe_set_flags,

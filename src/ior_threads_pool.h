@@ -27,6 +27,24 @@ typedef struct ior_ctx_threads {
 } ior_ctx_threads;
 
 /*
+ * Where a submitted op currently is, for IOR_OP_ASYNC_CANCEL. Every hand-over
+ * to a worker, the poller or the timer thread is a compare-and-swap that
+ * fails once a cancel has claimed the op (CANCELLED), and every cancel claim
+ * is a compare-and-swap from the specific waiting state, so exactly one side
+ * decides how the op completes.
+ */
+enum {
+	IOR_WORK_FREE = 0, /* on the free list */
+	IOR_WORK_QUEUED, /* chain head in the worker pool FIFO, or just popped */
+	IOR_WORK_LINKED, /* chain member behind its head; not cancellable */
+	IOR_WORK_RUNNING, /* on a worker: syscall or callback in progress */
+	IOR_WORK_DRAINING, /* on a worker: waiting for IO_DRAIN */
+	IOR_WORK_TIMER, /* armed on the timer thread */
+	IOR_WORK_POLLING, /* registered with the poller */
+	IOR_WORK_CANCELLED, /* claimed by a cancel; completes with -ECANCELED */
+};
+
+/*
  * A submitted operation, copied out of the SQ ring at submit time. Workers
  * consume these from the shared worker pool's dispatch queue, so a slow op
  * never pins an SQ slot. Items live in a fixed pool and move between the free
@@ -37,9 +55,13 @@ typedef struct ior_work {
 	ior_worker_pool_job job; // FIFO node while queued as a chain head
 	ior_sqe sqe; // copied submission entry
 	uint64_t seq; // submission order, for IO_DRAIN
-	struct ior_work *next; // free-list link
+	struct ior_work *next; // free-list link (scratch link while allocated)
 	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
+	_Atomic int state; // IOR_WORK_*
 	struct ior_work_token token; // IOR_OP_WORK only: cancellation handle
+	struct ior_work_token *cur_token; // token the running callback observes
+	uint64_t deadline_ns; // link-timeout deadline once computed (0 = none)
+	int ready; // rw op: the poller reported readiness, skip the probe
 } ior_work;
 
 /*
@@ -62,6 +84,12 @@ struct ior_threads_pool {
 
 	// Statistics
 	_Atomic uint64_t tasks_completed;
+
+	/*
+	 * Set (under work_lock) when destroy begins: the poller must then fail
+	 * ops it would otherwise hand back to the worker pool.
+	 */
+	_Atomic int shutdown;
 
 	/*
 	 * Free-at-submit dispatch. submit() copies each SQE into a work item and

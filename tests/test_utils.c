@@ -281,6 +281,15 @@ fail:
 	return -EIO;
 }
 
+int test_set_nonblocking(ior_fd_t fd)
+{
+	u_long nonblock = 1;
+	if (ioctlsocket((SOCKET) fd, FIONBIO, &nonblock) != 0) {
+		return -EIO;
+	}
+	return 0;
+}
+
 #else /* POSIX */
 
 char *create_temp_file(const char *content, size_t len)
@@ -336,6 +345,15 @@ int test_make_socketpair(ior_fd_t fds[2])
 	}
 	fds[0] = sv[0];
 	fds[1] = sv[1];
+	return 0;
+}
+
+int test_set_nonblocking(ior_fd_t fd)
+{
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+		return -errno;
+	}
 	return 0;
 }
 
