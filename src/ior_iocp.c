@@ -2201,6 +2201,8 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	return 0;
 }
 
+static void iocp_pump_stop(ior_ctx_iocp *ctx); // forward
+
 static void ior_iocp_backend_destroy(void *backend_ctx)
 {
 	if (!backend_ctx) {
@@ -2499,6 +2501,13 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 			continue; // stray packet (external PostQueuedCompletionStatus)
 		}
 
+		// Signal before staging: by the time the consumer can take the
+		// packet, the byte announcing it is already on the wakeup socket, so
+		// an ior_notify_clear() after reaping is never followed by a late byte
+		// for a completion the consumer has already taken.
+		char b = 0;
+		(void) send(p->wake_tx, &b, 1, 0);
+
 		EnterCriticalSection(&p->lock);
 		if (p->count == p->cap) {
 			// Cannot happen: every op has at most one packet in flight and the
@@ -2524,9 +2533,6 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 		}
 		WakeConditionVariable(&p->cv);
 		LeaveCriticalSection(&p->lock);
-
-		char b = 0;
-		(void) send(p->wake_tx, &b, 1, 0);
 	}
 	return 0;
 }
