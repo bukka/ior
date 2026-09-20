@@ -394,6 +394,33 @@ static void test_socket_recv_dontwait(void **state)
 	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, sizeof(buf), MSG_DONTWAIT);
 	assert_int_equal(submit_one_and_get_res(s->ctx, rcv, (void *) 0x72), -EAGAIN);
 }
+
+/*
+ * The same on the send side, which must not park or block a worker once the
+ * send buffer is full. macOS reaches -EAGAIN through the readiness probe
+ * rather than the flag, which its send(2) ignores.
+ */
+static void test_socket_send_dontwait(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	char buf[4096];
+	memset(buf, 0x5a, sizeof(buf));
+
+	/* Fill the pipe: nobody reads sock[1], so this ends in -EAGAIN. */
+	int32_t res;
+	size_t guard = 0;
+	do {
+		ior_sqe *snd = ior_get_sqe(s->ctx);
+		assert_non_null(snd);
+		ior_prep_send(s->ctx, snd, s->sock[0], buf, sizeof(buf), MSG_DONTWAIT);
+		res = submit_one_and_get_res(s->ctx, snd, (void *) 0x73);
+		assert_true(res > 0 || res == -EAGAIN);
+		assert_true(++guard < 65536); /* never fills: fail rather than spin */
+	} while (res > 0);
+
+	assert_int_equal(res, -EAGAIN);
+}
 #endif
 
 int main(void)
@@ -420,6 +447,8 @@ int main(void)
 #ifdef MSG_DONTWAIT
 		cmocka_unit_test_setup_teardown(
 				test_socket_recv_dontwait, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_send_dontwait, setup_socketpair, teardown_socketpair),
 #endif
 	};
 

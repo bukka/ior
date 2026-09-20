@@ -545,15 +545,30 @@ static int ior_threads_pool_rw_nowait(const ior_sqe *sqe)
 }
 
 /*
- * Does the op need a readiness probe before its syscall? Only a read or
- * write at the current position: the descriptor may be a blocking socket or
- * pipe and read(2) has no per-call non-blocking flag. send/recv are issued
- * with MSG_DONTWAIT instead (one syscall when ready), and positioned I/O is
- * regular-file semantics that runs to completion, as on io_uring's worker
- * queue.
+ * XNU's sosend() decides on SS_NBIO (the O_NONBLOCK descriptor flag) alone, so
+ * send(2) blocks on a full send buffer however it is asked not to. Its
+ * soreceive() does honour MSG_DONTWAIT, so recv is unaffected.
+ */
+#ifdef IOR_PLATFORM_MACOS
+#define IOR_SEND_HONOURS_DONTWAIT 0
+#else
+#define IOR_SEND_HONOURS_DONTWAIT 1
+#endif
+
+/*
+ * Does the op need a readiness probe before its syscall? Only one that cannot
+ * ask the kernel for a non-blocking attempt of its own: a read or write at the
+ * current position (read(2) has no per-call non-blocking flag and the
+ * descriptor may be a blocking socket or pipe), and send where MSG_DONTWAIT is
+ * ignored. Elsewhere send/recv are issued with that flag instead (one syscall
+ * when ready), and positioned I/O is regular-file semantics that runs to
+ * completion, as on io_uring's worker queue.
  */
 static int ior_threads_pool_rw_probe(const ior_sqe *sqe)
 {
+	if (!IOR_SEND_HONOURS_DONTWAIT && sqe->threads.opcode == IOR_OP_SEND) {
+		return 1;
+	}
 	return (sqe->threads.opcode == IOR_OP_READ || sqe->threads.opcode == IOR_OP_WRITE)
 			&& sqe->threads.off == IOR_OFF_NONE;
 }
@@ -819,16 +834,15 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		ior_work *after = lt ? lt->chain : next;
 
 		/*
-		 * Readiness gate: poll ops always wait on the poller; positionless
-		 * read/write only when the probe says the descriptor is not ready.
-		 * Other rw ops run at once and park below if they would block.
+		 * Readiness gate: poll ops always wait on the poller; a probed op
+		 * (see rw_probe) only when the probe says the descriptor is not
+		 * ready. Other rw ops run at once and park below if they would block.
 		 */
 		short events = ior_threads_pool_rw_events(&w->sqe);
-		int gate = opcode == IOR_OP_POLL;
-		if (events && !w->ready && ior_threads_pool_rw_probe(&w->sqe)
-				&& !ior_threads_pool_fd_ready(w->sqe.threads.fd, events)) {
-			gate = 1;
-		}
+		int nowait = ior_threads_pool_rw_nowait(&w->sqe);
+		int unready = events && !w->ready && ior_threads_pool_rw_probe(&w->sqe)
+				&& !ior_threads_pool_fd_ready(w->sqe.threads.fd, events);
+		int gate = opcode == IOR_OP_POLL || (unready && !nowait);
 		if (gate) {
 			uint32_t mask = opcode == IOR_OP_POLL ? w->sqe.threads.poll_events
 												  : (events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT);
@@ -855,6 +869,26 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		}
 		if (w->ready) {
 			w->ready = 0;
+		}
+
+		/*
+		 * Probed not ready with MSG_DONTWAIT asked for: answer -EAGAIN here,
+		 * since the syscall would block rather than report it. A cancel that
+		 * claimed the op still wins.
+		 */
+		if (unready && nowait) {
+			int res = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0 ? -ECANCELED : -EAGAIN;
+			ior_threads_pool_finish_res(pool, w, res);
+			count++;
+			if (lt) {
+				ior_threads_pool_finish_res(pool, lt, -ECANCELED);
+				count++;
+			}
+			if (has_link) {
+				cancel = 1; // a failed linked op breaks the chain
+			}
+			w = after;
+			continue;
 		}
 
 		/*
@@ -902,7 +936,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		 */
 		ior_cqe cqe;
 		w->cur_token = &w->token;
-		int may_park = events && !ior_threads_pool_rw_nowait(&w->sqe)
+		int may_park = events && !nowait
 				&& (opcode == IOR_OP_SEND || opcode == IOR_OP_RECV
 						|| ior_threads_pool_rw_probe(&w->sqe));
 		if (ior_threads_pool_enter(w, may_park ? IOR_WORK_TRYING : IOR_WORK_RUNNING) < 0) {
@@ -1047,7 +1081,9 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len,
 					sqe->threads.rw_flags);
 			const void *buf = (const void *) (uintptr_t) sqe->threads.addr;
-			// Never block a worker: readiness is waited for on the poller.
+			// Never block a worker: readiness is waited for on the poller,
+			// reached by this EAGAIN or by the preceding probe where the flag
+			// is ignored (see IOR_SEND_HONOURS_DONTWAIT).
 			ssize_t ret = send(sqe->threads.fd, buf, sqe->threads.len,
 					(int) sqe->threads.rw_flags | MSG_DONTWAIT);
 			cqe->threads.res = (ret < 0) ? -errno : ret;

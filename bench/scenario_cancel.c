@@ -125,7 +125,13 @@ static int issue_pending(cancel_ctx *s, uint32_t ci)
 		if (!sqe) {
 			return 0;
 		}
-		c->race = roll_race(s);
+		/*
+		 * Only race on a drained connection: a cancel that beats the recv
+		 * leaves its payload behind, and racing again would grow the backlog
+		 * until the receive window closed for good. This round's recv takes
+		 * the leftover instead, keeping the backlog at one message.
+		 */
+		c->race = c->unread ? 0 : roll_race(s);
 		c->awaiting = c->race ? 3 : 2;
 		c->seen_recv = c->seen_cancel = c->seen_send = 0;
 		ior_prep_recv(s->ior, sqe, c->client, c->rbuf, s->msg_size, 0);
