@@ -15,6 +15,7 @@
 #define TAG_TMO ((void *) 0x2) // its link timeout
 #define TAG_NEXT ((void *) 0x3) // the op linked after it
 #define TAG_CANCEL ((void *) 0x10) // the cancel itself
+#define TAG_CANCEL2 ((void *) 0x11) // a second cancel in the same batch
 #define TAG_OP2 ((void *) 0x4) // a second target
 #define TAG_TIMER ((void *) 0x5)
 
@@ -346,6 +347,39 @@ static void test_cancel_fd(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 	reap_tags(s->ctx, 1, res, seen);
 	assert_int_equal(res[(uintptr_t) TAG_CANCEL], -ENOENT);
+}
+
+/*
+ * Two recvs on one socket cancelled in the same batch. Every CQE must arrive
+ * promptly: each cancel finds its target (0) or a completion already queued
+ * for it (-ENOENT, which IOCP answers for the second: AFD aborts every pending
+ * recv on the socket when the first is cancelled), but a cancel that answers
+ * -ENOENT must never leave its target back in flight with no CQE.
+ */
+static void test_cancel_two_same_socket_batch(void **state)
+{
+	cancel_state *s = (cancel_state *) *state;
+	char buf[64], buf2[64];
+	int32_t res[MAX_TAG];
+	char seen[MAX_TAG];
+
+	submit_recv(s, buf, sizeof(buf), TAG_OP, 0);
+	submit_recv(s, buf2, sizeof(buf2), TAG_OP2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	cancel_msleep(20);
+
+	submit_cancel(s, TAG_OP);
+	ior_sqe *c2 = ior_get_sqe(s->ctx);
+	assert_non_null(c2);
+	ior_prep_cancel(s->ctx, c2, TAG_OP2);
+	ior_sqe_set_data(s->ctx, c2, TAG_CANCEL2);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	reap_tags(s->ctx, 4, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	assert_true(res[(uintptr_t) TAG_CANCEL2] == 0 || res[(uintptr_t) TAG_CANCEL2] == -ENOENT);
+	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
+	assert_int_equal(res[(uintptr_t) TAG_OP2], -ECANCELED);
 }
 
 // A cancelled recv on a socket that becomes readable later must not consume
@@ -728,6 +762,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_cancel_guarded, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_chain, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_fd, setup_cancel, teardown_cancel),
+		cmocka_unit_test_setup_teardown(
+				test_cancel_two_same_socket_batch, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(
 				test_cancel_recv_data_intact, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_work_running, setup_cancel, teardown_cancel),
