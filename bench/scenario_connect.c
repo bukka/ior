@@ -99,6 +99,7 @@ typedef struct connect_ctx {
 	uint32_t nslots;
 	uint64_t inflight;
 	uint64_t rounds;
+	uint64_t port_stalls; /* connects the kernel had no ephemeral port for */
 	uint32_t *ready;
 	uint32_t ready_count;
 	uint32_t ready_cap;
@@ -235,7 +236,15 @@ static void harvest_one(connect_ctx *s, ior_cqe *cqe)
 	switch (kind) {
 		case K_CONNECT:
 			if (res != 0) {
-				bench_metrics_error(s->m);
+				/* The ephemeral range cycles every couple of seconds at these
+				 * rates, so the kernel occasionally has no port to give. That
+				 * is the machine's limit rather than a failure of the op:
+				 * count it and let the slot start over. */
+				if (res == -EADDRNOTAVAIL) {
+					s->port_stalls++;
+				} else {
+					bench_metrics_error(s->m);
+				}
 				client_reset(s, i);
 				break;
 			}
@@ -282,7 +291,10 @@ static void harvest_one(connect_ctx *s, ior_cqe *cqe)
 		}
 
 		case K_CANCEL:
-			if (res != 0 && res != -ENOENT) {
+			/* -EALREADY: the accept was inside its non-blocking attempt. The
+			 * cancel still claims it, so it finishes rather than parking
+			 * again and the drain is not held up. */
+			if (res != 0 && res != -ENOENT && res != -EALREADY) {
 				bench_metrics_error(s->m);
 			}
 			break;
@@ -421,7 +433,8 @@ int bench_run_connect(const bench_options *opts, bench_metrics *m, const char **
 		bench_metrics_stop(m);
 	}
 
-	fprintf(stderr, "connect outcomes: rounds=%llu\n", (unsigned long long) s.rounds);
+	fprintf(stderr, "connect outcomes: rounds=%llu port_stalls=%llu\n", (unsigned long long) s.rounds,
+			(unsigned long long) s.port_stalls);
 
 out:
 	if (s.clients) {
