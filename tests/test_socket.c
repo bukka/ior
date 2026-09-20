@@ -423,11 +423,16 @@ static void test_socket_send_dontwait(void **state)
 }
 #endif
 
+#ifndef _WIN32
 /*
  * A send larger than the socket buffer completes short rather than occupying
  * its worker until the peer drains. Readiness alone cannot give this: poll()
  * promises only SO_SNDLOWAT bytes of room, while a blocking send does not
  * return until all of len is queued.
+ *
+ * Not on IOCP: an overlapped WSASend never completes short - AFD takes the
+ * whole buffer (4 MiB into 8 KiB buffers with no reader completes in full),
+ * so there is nothing to observe and no worker to protect.
  */
 static void test_socket_send_larger_than_buffer(void **state)
 {
@@ -451,11 +456,14 @@ static void test_socket_send_larger_than_buffer(void **state)
 	assert_true((size_t) res < len);
 	free(buf);
 }
+#endif
 
 /*
  * IOR_SETUP_FD_NONBLOCK: the caller promises its descriptors are already
  * non-blocking, so the backend skips putting them in that mode. The short-send
- * behaviour above must be unchanged, since the promise holds here.
+ * behaviour above must be unchanged, since the promise holds here. On IOCP the
+ * flag is ignored (overlapped I/O never changes descriptor state), so the
+ * check there is that a context set up with it still does plain I/O.
  */
 static void test_socket_setup_fd_nonblock(void **state)
 {
@@ -474,6 +482,7 @@ static void test_socket_setup_fd_nonblock(void **state)
 	assert_return_code(test_set_nonblocking(sock[0]), 0);
 	assert_return_code(test_set_nonblocking(sock[1]), 0);
 
+#ifndef _WIN32
 	int sndbuf = 8192;
 	(void) setsockopt(sock[0], SOL_SOCKET, SO_SNDBUF, (void *) &sndbuf, sizeof(sndbuf));
 	(void) setsockopt(sock[1], SOL_SOCKET, SO_RCVBUF, (void *) &sndbuf, sizeof(sndbuf));
@@ -491,6 +500,24 @@ static void test_socket_setup_fd_nonblock(void **state)
 	assert_true((size_t) res < len);
 
 	free(buf);
+#else
+	const char *msg = "nonblock";
+	unsigned len = (unsigned) strlen(msg);
+
+	ior_sqe *snd = ior_get_sqe(ctx);
+	assert_non_null(snd);
+	ior_prep_send(ctx, snd, sock[0], msg, len, 0);
+	assert_int_equal(submit_one_and_get_res(ctx, snd, (void *) 0x75), (int32_t) len);
+
+	char buf[32];
+	memset(buf, 0, sizeof(buf));
+	ior_sqe *rcv = ior_get_sqe(ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(ctx, rcv, sock[1], buf, sizeof(buf), 0);
+	assert_int_equal(submit_one_and_get_res(ctx, rcv, (void *) 0x76), (int32_t) len);
+	assert_memory_equal(buf, msg, len);
+#endif
+
 	test_close_fd(sock[0]);
 	test_close_fd(sock[1]);
 	ior_queue_exit(ctx);
@@ -523,8 +550,10 @@ int main(void)
 		cmocka_unit_test_setup_teardown(
 				test_socket_send_dontwait, setup_socketpair, teardown_socketpair),
 #endif
+#ifndef _WIN32
 		cmocka_unit_test_setup_teardown(
 				test_socket_send_larger_than_buffer, setup_socketpair, teardown_socketpair),
+#endif
 		cmocka_unit_test(test_socket_setup_fd_nonblock),
 	};
 
