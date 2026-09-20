@@ -14,6 +14,9 @@
  * the backend must not treat the offset as a file position for a socket fd.
  */
 #include "test_utils.h"
+#ifndef _WIN32
+#include <sys/socket.h>
+#endif
 
 /* Fixture: a ctx plus a connected stream socket pair. sock[0] and sock[1]
  * are the two ends; bytes written to one are readable from the other. */
@@ -324,6 +327,202 @@ static void test_socket_recv_after_peer_close(void **state)
 	assert_int_equal(res, 0);
 }
 
+/*
+ * A recv on a non-blocking socket with nothing to read must wait for data
+ * rather than fail with -EAGAIN: the backend gates the syscall on readiness
+ * (io_uring does this natively; the threads backend parks the op on its
+ * poller). The peer sends only after the recv has been submitted.
+ */
+static void test_socket_nonblocking_recv_waits(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+	assert_return_code(test_set_nonblocking(s->sock[1]), 0);
+
+	char buf[32];
+	memset(buf, 0, sizeof(buf));
+
+	ior_sqe *rcv = ior_get_sqe(s->ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, sizeof(buf), 0);
+	ior_sqe_set_data(s->ctx, rcv, (void *) 0x70);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	// Nothing to read yet: the recv must still be pending.
+	ior_timespec to = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50ms
+	ior_cqe *cqe = NULL;
+	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
+
+	const char *msg = "late";
+	unsigned len = (unsigned) strlen(msg);
+	ior_sqe *snd = ior_get_sqe(s->ctx);
+	assert_non_null(snd);
+	ior_prep_send(s->ctx, snd, s->sock[0], msg, len, 0);
+	ior_sqe_set_data(s->ctx, snd, (void *) 0x71);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	int got_recv = 0, got_send = 0;
+	while (!got_recv || !got_send) {
+		int ret = ior_wait_cqe(s->ctx, &cqe);
+		if (ret == -EINTR) {
+			continue;
+		}
+		assert_return_code(ret, 0);
+		uintptr_t tag = (uintptr_t) ior_cqe_get_data(s->ctx, cqe);
+		int32_t res = ior_cqe_get_res(s->ctx, cqe);
+		if (tag == 0x70) {
+			assert_int_equal(res, (int32_t) len);
+			assert_memory_equal(buf, msg, len);
+			got_recv = 1;
+		} else {
+			assert_int_equal(tag, 0x71);
+			assert_int_equal(res, (int32_t) len);
+			got_send = 1;
+		}
+		ior_cqe_seen(s->ctx, cqe);
+	}
+}
+
+#ifdef MSG_DONTWAIT
+/* MSG_DONTWAIT is honoured as with io_uring: no data means -EAGAIN at once. */
+static void test_socket_recv_dontwait(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	char buf[32];
+	ior_sqe *rcv = ior_get_sqe(s->ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(s->ctx, rcv, s->sock[1], buf, sizeof(buf), MSG_DONTWAIT);
+	assert_int_equal(submit_one_and_get_res(s->ctx, rcv, (void *) 0x72), -EAGAIN);
+}
+
+/*
+ * The same on the send side, which must not park or block a worker once the
+ * send buffer is full. macOS reaches -EAGAIN through the readiness probe
+ * rather than the flag, which its send(2) ignores.
+ */
+static void test_socket_send_dontwait(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	char buf[4096];
+	memset(buf, 0x5a, sizeof(buf));
+
+	/* Fill the pipe: nobody reads sock[1], so this ends in -EAGAIN. */
+	int32_t res;
+	size_t guard = 0;
+	do {
+		ior_sqe *snd = ior_get_sqe(s->ctx);
+		assert_non_null(snd);
+		ior_prep_send(s->ctx, snd, s->sock[0], buf, sizeof(buf), MSG_DONTWAIT);
+		res = submit_one_and_get_res(s->ctx, snd, (void *) 0x73);
+		assert_true(res > 0 || res == -EAGAIN);
+		assert_true(++guard < 65536); /* never fills: fail rather than spin */
+	} while (res > 0);
+
+	assert_int_equal(res, -EAGAIN);
+}
+#endif
+
+#ifndef _WIN32
+/*
+ * A send larger than the socket buffer completes short rather than occupying
+ * its worker until the peer drains. Readiness alone cannot give this: poll()
+ * promises only SO_SNDLOWAT bytes of room, while a blocking send does not
+ * return until all of len is queued.
+ *
+ * Not on IOCP: an overlapped WSASend never completes short - AFD takes the
+ * whole buffer (4 MiB into 8 KiB buffers with no reader completes in full),
+ * so there is nothing to observe and no worker to protect.
+ */
+static void test_socket_send_larger_than_buffer(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	int sndbuf = 8192;
+	(void) setsockopt(s->sock[0], SOL_SOCKET, SO_SNDBUF, (void *) &sndbuf, sizeof(sndbuf));
+	(void) setsockopt(s->sock[1], SOL_SOCKET, SO_RCVBUF, (void *) &sndbuf, sizeof(sndbuf));
+
+	/* Far more than the buffers can hold, and nobody reads sock[1]. */
+	size_t len = 4u * 1024 * 1024;
+	char *buf = calloc(1, len);
+	assert_non_null(buf);
+
+	ior_sqe *snd = ior_get_sqe(s->ctx);
+	assert_non_null(snd);
+	ior_prep_send(s->ctx, snd, s->sock[0], buf, (unsigned) len, 0);
+	int32_t res = submit_one_and_get_res(s->ctx, snd, (void *) 0x74);
+
+	assert_true(res > 0);
+	assert_true((size_t) res < len);
+	free(buf);
+}
+#endif
+
+/*
+ * IOR_SETUP_FD_NONBLOCK: the caller promises its descriptors are already
+ * non-blocking, so the backend skips putting them in that mode. The short-send
+ * behaviour above must be unchanged, since the promise holds here. On IOCP the
+ * flag is ignored (overlapped I/O never changes descriptor state), so the
+ * check there is that a context set up with it still does plain I/O.
+ */
+static void test_socket_setup_fd_nonblock(void **state)
+{
+	(void) state;
+
+	ior_params params;
+	memset(&params, 0, sizeof(params));
+	params.flags = IOR_SETUP_FD_NONBLOCK;
+
+	ior_ctx *ctx = NULL;
+	assert_return_code(ior_queue_init_params(32, &ctx, &params), 0);
+	assert_non_null(ctx);
+
+	ior_fd_t sock[2];
+	assert_return_code(test_make_socketpair(sock), 0);
+	assert_return_code(test_set_nonblocking(sock[0]), 0);
+	assert_return_code(test_set_nonblocking(sock[1]), 0);
+
+#ifndef _WIN32
+	int sndbuf = 8192;
+	(void) setsockopt(sock[0], SOL_SOCKET, SO_SNDBUF, (void *) &sndbuf, sizeof(sndbuf));
+	(void) setsockopt(sock[1], SOL_SOCKET, SO_RCVBUF, (void *) &sndbuf, sizeof(sndbuf));
+
+	size_t len = 4u * 1024 * 1024;
+	char *buf = calloc(1, len);
+	assert_non_null(buf);
+
+	ior_sqe *snd = ior_get_sqe(ctx);
+	assert_non_null(snd);
+	ior_prep_send(ctx, snd, sock[0], buf, (unsigned) len, 0);
+	int32_t res = submit_one_and_get_res(ctx, snd, (void *) 0x75);
+
+	assert_true(res > 0);
+	assert_true((size_t) res < len);
+
+	free(buf);
+#else
+	const char *msg = "nonblock";
+	unsigned len = (unsigned) strlen(msg);
+
+	ior_sqe *snd = ior_get_sqe(ctx);
+	assert_non_null(snd);
+	ior_prep_send(ctx, snd, sock[0], msg, len, 0);
+	assert_int_equal(submit_one_and_get_res(ctx, snd, (void *) 0x75), (int32_t) len);
+
+	char buf[32];
+	memset(buf, 0, sizeof(buf));
+	ior_sqe *rcv = ior_get_sqe(ctx);
+	assert_non_null(rcv);
+	ior_prep_recv(ctx, rcv, sock[1], buf, sizeof(buf), 0);
+	assert_int_equal(submit_one_and_get_res(ctx, rcv, (void *) 0x76), (int32_t) len);
+	assert_memory_equal(buf, msg, len);
+#endif
+
+	test_close_fd(sock[0]);
+	test_close_fd(sock[1]);
+	ior_queue_exit(ctx);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -343,6 +542,19 @@ int main(void)
 				test_socket_partial_recv, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test_setup_teardown(
 				test_socket_recv_after_peer_close, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_nonblocking_recv_waits, setup_socketpair, teardown_socketpair),
+#ifdef MSG_DONTWAIT
+		cmocka_unit_test_setup_teardown(
+				test_socket_recv_dontwait, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_socket_send_dontwait, setup_socketpair, teardown_socketpair),
+#endif
+#ifndef _WIN32
+		cmocka_unit_test_setup_teardown(
+				test_socket_send_larger_than_buffer, setup_socketpair, teardown_socketpair),
+#endif
+		cmocka_unit_test(test_socket_setup_fd_nonblock),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

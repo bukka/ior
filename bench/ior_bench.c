@@ -27,27 +27,30 @@ typedef int (*scenario_fn)(const bench_options *, bench_metrics *, const char **
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s <socket|file|mixed|work|all> [options]\n", prog);
+	printf("Usage: %s <socket|file|mixed|work|cancel|all> [options]\n", prog);
 	printf("       %s --smoke\n\n", prog);
 	printf("Scenarios:\n");
 	printf("  socket   real loopback TCP request/response (PHP-style guarded recv)\n");
 	printf("  file     file read/write at a target queue depth\n");
 	printf("  mixed    read/write/nop/timeout/work blend (multi-producer completion stress)\n");
 	printf("  work     user work callbacks on the worker pool at a target queue depth\n");
-	printf("  all      run socket (none+linked), file, mixed and work (none+linked)\n\n");
+	printf("  cancel   parked recvs cancelled under load, optionally racing incoming data\n");
+	printf("  all      run socket (none+linked), file, mixed, work (none+linked) and cancel\n\n");
 	printf("Run length (default: --duration 2.0):\n");
 	printf("  --duration SEC     run each scenario for SEC seconds\n");
 	printf("  --ops N            instead, stop after N completed units of work\n\n");
 	printf("Workload:\n");
-	printf("  --conns N          socket: concurrent connections (default 64)\n");
+	printf("  --conns N          socket/cancel: concurrent connections (default 64)\n");
 	printf("  --files N          file/mixed: number of files (default 8/4)\n");
 	printf("  --depth N          file/mixed/work: operations in flight (default 32/64/64)\n");
-	printf("  --msg-size B       socket: payload bytes per direction (default 256)\n");
+	printf("  --msg-size B       socket/cancel: payload bytes per direction (default 256)\n");
 	printf("  --block-size B     file/mixed: bytes per read/write (default 4096)\n");
 	printf("  --file-size B      file/mixed: size of each temp file (default 16MiB)\n");
 	printf("  --work-us U        work: CPU spin per callback in microseconds (default 5)\n");
 	printf("  --timer none|linked  socket/work: guard ops with a linked timeout (default none)\n");
 	printf("  --timeout-ms M     socket/work: guard timeout in ms (default 5000)\n");
+	printf("  --race-pct P       cancel: %% of rounds sending data in the cancel's batch (default "
+		   "50)\n");
 	printf("  --workspace DIR    directory for temp files (default platform tmp/ior)\n");
 	printf("  --sq-entries N     submission queue size hint\n\n");
 	printf("Output:\n");
@@ -73,6 +76,7 @@ static void defaults(bench_options *o)
 	o->work_us = 5;
 	o->timer_mode = BENCH_TIMER_NONE;
 	o->timeout_ms = 5000;
+	o->race_pct = 50;
 	o->workspace = NULL;
 	o->sq_entries = 0;
 }
@@ -149,6 +153,14 @@ static int run_smoke(void)
 	o.timer_mode = BENCH_TIMER_LINKED;
 	errors += run_one(bench_run_work, "work", "timer=linked", &o, 0);
 
+	/* cancel: parked recvs cancelled, half of them racing incoming data */
+	defaults(&o);
+	o.conns = 64;
+	o.ops = 2000;
+	o.duration_s = 0;
+	o.race_pct = 50;
+	errors += run_one(bench_run_cancel, "cancel", "race=50%", &o, 0);
+
 	printf("\nsmoke result: %s (errors=%llu)\n", errors ? "FAIL" : "PASS",
 			(unsigned long long) errors);
 	return errors ? 1 : 0;
@@ -201,6 +213,8 @@ int main(int argc, char **argv)
 			o.work_us = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--timeout-ms") == 0) {
 			o.timeout_ms = (uint32_t) parse_u64(NEXT());
+		} else if (strcmp(a, "--race-pct") == 0) {
+			o.race_pct = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--sq-entries") == 0) {
 			o.sq_entries = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--workspace") == 0) {
@@ -257,6 +271,10 @@ int main(int argc, char **argv)
 	} else if (strcmp(scenario, "work") == 0) {
 		const char *label = o.timer_mode == BENCH_TIMER_LINKED ? "timer=linked" : "timer=none";
 		errors = run_one(bench_run_work, "work", label, &o, csv);
+	} else if (strcmp(scenario, "cancel") == 0) {
+		char label[32];
+		snprintf(label, sizeof(label), "race=%u%%", o.race_pct);
+		errors = run_one(bench_run_cancel, "cancel", label, &o, csv);
 	} else if (strcmp(scenario, "all") == 0) {
 		bench_options so = o;
 		so.timer_mode = BENCH_TIMER_NONE;
@@ -270,6 +288,7 @@ int main(int argc, char **argv)
 		errors += run_one(bench_run_work, "work", "timer=none", &so, csv);
 		so.timer_mode = BENCH_TIMER_LINKED;
 		errors += run_one(bench_run_work, "work", "timer=linked", &so, csv);
+		errors += run_one(bench_run_cancel, "cancel", "race=50%", &o, csv);
 	} else {
 		fprintf(stderr, "unknown scenario: %s\n", scenario);
 		usage(argv[0]);

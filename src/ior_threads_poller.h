@@ -19,28 +19,37 @@
 typedef struct ior_threads_poller ior_threads_poller;
 
 /*
- * Completion callback, invoked on the poller thread. res is the ready
- * IOR_POLL_* mask (> 0), -ETIME (deadline reached), -ECANCELED (poller
- * shutdown), or another negative errno (e.g. -EBADF). Must not block for
- * long and must not call back into the poller.
+ * Completion callback, invoked on the poller thread with no poller lock held.
+ * res is the ready IOR_POLL_* mask (> 0), -ETIME (deadline reached),
+ * -ECANCELED (cancelled or poller shutdown), or another negative errno (e.g.
+ * -EBADF). Must not block for long and must not call back into the poller.
  */
 typedef void (*ior_threads_poller_cb)(void *owner, void *req, int res);
 
 /* Create the poller and start its thread. */
-int ior_threads_poller_create(ior_threads_poller **poller_out, void *owner,
-		ior_threads_poller_cb cb);
+int ior_threads_poller_create(
+		ior_threads_poller **poller_out, void *owner, ior_threads_poller_cb cb);
 
 /*
  * Register a one-shot readiness request. ior_mask is an IOR_POLL_* mask;
  * deadline_ns is an absolute monotonic deadline (0 = none). Thread-safe
  * against the poller thread, but not against destroy().
  */
-int ior_threads_poller_add(ior_threads_poller *poller, int fd, uint32_t ior_mask,
-		uint64_t deadline_ns, void *req);
+int ior_threads_poller_add(
+		ior_threads_poller *poller, int fd, uint32_t ior_mask, uint64_t deadline_ns, void *req);
+
+/*
+ * Cancel a pending request. Returns 0 if it was found: it then completes with
+ * -ECANCELED on the poller thread, whatever readiness it may see meanwhile.
+ * Returns -ENOENT if it has already been dispatched (its callback has run or
+ * is running) or was never added. Thread-safe against add() and the poller
+ * thread, but not against destroy().
+ */
+int ior_threads_poller_cancel(ior_threads_poller *poller, void *req);
 
 /*
  * Complete all pending requests with -ECANCELED, then stop and join the
- * poller thread. No add() may run concurrently or after.
+ * poller thread. No add() or cancel() may run concurrently or after.
  */
 void ior_threads_poller_destroy(ior_threads_poller *poller);
 

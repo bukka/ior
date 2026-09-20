@@ -17,6 +17,8 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Read and write operations
 - Socket send and receive operations
 - Timer/timeout operations
+- Async cancellation of submitted operations (`ior_prep_cancel`,
+  `ior_prep_cancel_fd`), with io_uring semantics on every backend
 - Splice operations (native on Linux, emulated elsewhere)
 - Operation chaining with `IOR_SQE_IO_LINK`
 - Ordering with `IOR_SQE_IO_DRAIN`
@@ -243,6 +245,14 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
 // Splice operation (Linux only)
 void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in,
                      int fd_out, uint64_t off_out, unsigned nbytes, unsigned flags);
+
+// Cancel a submitted operation by its user data, or one operation on a
+// descriptor (repeat until -ENOENT to cancel all of them). The cancel
+// completes with 0 (found and cancelled), -ENOENT (nothing in flight) or
+// -EALREADY (running, cannot be interrupted); the target completes with
+// -ECANCELED, as do its link timeout and the rest of its link chain.
+void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data);
+void ior_prep_cancel_fd(ior_ctx *ctx, ior_sqe *sqe, int fd);
 ```
 
 ### SQE/CQE Accessors
@@ -302,11 +312,49 @@ IOR automatically selects the best available backend:
 The thread pool backend uses:
 - Lock-free ring buffers for submission and completion queues
 - Out-of-order completion support for maximum parallelism
+- A single readiness poller thread (epoll/kqueue/poll) that parks
+  read/write/send/recv on pollable descriptors, so workers never block on a
+  socket, non-blocking descriptors never spin on `EAGAIN`, and pending
+  operations stay cancellable. Descriptors it cannot ask for a non-blocking
+  attempt per call are put in non-blocking mode (see below)
 - Operation chaining with `IOR_SQE_IO_LINK` flag
 - Ordering guarantees with `IOR_SQE_IO_DRAIN` flag
 - eventfd (Linux/FreeBSD 13+) or pipe-based notification
 - Dynamic worker thread scaling
 - Efficient work distribution and completion posting
+
+#### Descriptor blocking mode
+
+The thread backend may set `O_NONBLOCK` on a pollable descriptor you submit,
+and leaves it set. Do not rely on the blocking mode of a descriptor handed to
+ior, and do not assume a synchronous `read()` or `send()` of your own on that
+descriptor still waits.
+
+This is what lets a worker run an op that has no per-call non-blocking flag
+(`read`/`write` at the current position, and `send` on macOS, whose `sosend()`
+ignores `MSG_DONTWAIT`) without occupying a worker thread until the peer
+catches up. Readiness alone cannot give that guarantee for writes: `poll()`
+promises only `SO_SNDLOWAT` bytes of room, while a blocking write does not
+return until all of `len` is queued, so a write larger than the free space
+would wait however ready the descriptor looked.
+
+As on io_uring, a send or write may therefore complete short; callers must
+handle a partial result and submit the remainder. io_uring issues socket ops
+non-blocking in the kernel and needs no descriptor change; IOCP uses
+overlapped I/O and needs none either.
+
+If your descriptors are non-blocking already - as they are when you pre-poll
+them yourself - pass `IOR_SETUP_FD_NONBLOCK` at setup and the backend skips
+the ioctl entirely:
+
+```c
+ior_params params = { .flags = IOR_SETUP_FD_NONBLOCK };
+ior_queue_init_params(256, &ctx, &params);
+```
+
+The promise must hold for every descriptor submitted to that context. An
+operation on one that does block occupies its worker thread until it
+completes, and cannot be cancelled meanwhile.
 
 ### IOCP Backend Design
 

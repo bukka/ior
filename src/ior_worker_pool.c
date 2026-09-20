@@ -187,8 +187,8 @@ void ior_worker_pool_destroy(ior_worker_pool *pool)
 	free(pool);
 }
 
-void ior_worker_pool_submit(
-		ior_worker_pool *pool, ior_worker_pool_job *first, ior_worker_pool_job *last, uint32_t count)
+void ior_worker_pool_submit(ior_worker_pool *pool, ior_worker_pool_job *first,
+		ior_worker_pool_job *last, uint32_t count)
 {
 	if (!pool || !first || count == 0) {
 		return;
@@ -223,6 +223,37 @@ void ior_worker_pool_submit(
 
 	pthread_cond_broadcast(&pool->work_cond);
 	pthread_mutex_unlock(&pool->lock);
+}
+
+int ior_worker_pool_cancel_job(ior_worker_pool *pool, ior_worker_pool_job *job)
+{
+	if (!pool || !job) {
+		return -EINVAL;
+	}
+
+	int ret = -ENOENT;
+	pthread_mutex_lock(&pool->lock);
+	ior_worker_pool_job *prev = NULL;
+	for (ior_worker_pool_job *j = pool->job_head; j; prev = j, j = j->next) {
+		if (j != job) {
+			continue;
+		}
+		if (prev) {
+			prev->next = j->next;
+		} else {
+			pool->job_head = j->next;
+		}
+		if (pool->job_tail == j) {
+			pool->job_tail = prev;
+		}
+		j->next = NULL;
+		pool->jobs_pending--;
+		ret = 0;
+		break;
+	}
+	pthread_mutex_unlock(&pool->lock);
+
+	return ret;
 }
 
 uint32_t ior_worker_pool_num_threads(ior_worker_pool *pool)
@@ -417,6 +448,33 @@ int ior_worker_pool_arm_timer(ior_worker_pool *pool, uint64_t deadline_ns,
 	int ret = ior_worker_pool_timer_push(pool, timer);
 	if (ret == 0) {
 		pthread_cond_signal(&pool->timer_cond);
+	}
+	pthread_mutex_unlock(&pool->timer_lock);
+
+	return ret;
+}
+
+int ior_worker_pool_cancel_timer(ior_worker_pool *pool, void *arg)
+{
+	if (!pool) {
+		return -EINVAL;
+	}
+
+	int ret = -ENOENT;
+	pthread_mutex_lock(&pool->timer_lock);
+	for (uint32_t i = 0; i < pool->timer_heap_len; i++) {
+		if (pool->timer_heap[i].arg != arg) {
+			continue;
+		}
+		pool->timer_heap_len--;
+		if (i < pool->timer_heap_len) {
+			pool->timer_heap[i] = pool->timer_heap[pool->timer_heap_len];
+			/* Restore heap order from i: the moved entry may go either way. */
+			ior_worker_pool_timer_sift_down(pool, i);
+			ior_worker_pool_timer_sift_up(pool, i);
+		}
+		ret = 0;
+		break;
 	}
 	pthread_mutex_unlock(&pool->timer_lock);
 

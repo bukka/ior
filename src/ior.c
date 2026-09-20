@@ -218,6 +218,20 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
 	}
 }
 
+void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_cancel(sqe, (uint64_t) (uintptr_t) user_data);
+	}
+}
+
+void ior_prep_cancel_fd(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_cancel_fd(sqe, fd);
+	}
+}
+
 int ior_prep_work(ior_ctx *ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
 {
 	if (!ctx || !sqe || !fn) {
