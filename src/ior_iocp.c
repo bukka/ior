@@ -210,11 +210,13 @@ typedef struct iocp_poller {
  * Completion pump for ior_notify_fd(). Kernel I/O completes straight into
  * the port with no ior code running, so a loop that wants a waitable
  * descriptor needs a thread that dequeues on its behalf: the pump moves raw
- * packets into a staging queue and sends a byte on a loopback UDP pair
- * (WSAPoll can only wait on sockets). The consumer then takes packets from
- * staging instead of the port, and all completion processing stays on the
- * consumer thread. Started lazily by the first ior_notify_fd() call; a context
- * that never asks keeps dequeuing from the port directly.
+ * packets into a staging queue and keeps a byte on a loopback UDP pair
+ * (WSAPoll can only wait on sockets) while any completion has been staged
+ * since the last ior_notify_clear() - one byte per wake cycle, not per
+ * packet. The consumer then takes packets from staging instead of the port,
+ * and all completion processing stays on the consumer thread. Started lazily
+ * by the first ior_notify_fd() call; a context that never asks keeps
+ * dequeuing from the port directly.
  */
 typedef struct pump_entry {
 	LPOVERLAPPED overlapped;
@@ -232,6 +234,9 @@ typedef struct iocp_pump {
 	uint32_t head;
 	uint32_t count;
 	uint32_t cap;
+	// A wake byte is on the socket that ior_notify_clear() has not consumed
+	// yet, so further packets need not send another (protected by lock).
+	bool signalled;
 } iocp_pump;
 
 // Completion key of the packet that tells the pump thread to exit.
@@ -2501,13 +2506,6 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 			continue; // stray packet (external PostQueuedCompletionStatus)
 		}
 
-		// Signal before staging: by the time the consumer can take the
-		// packet, the byte announcing it is already on the wakeup socket, so
-		// an ior_notify_clear() after reaping is never followed by a late byte
-		// for a completion the consumer has already taken.
-		char b = 0;
-		(void) send(p->wake_tx, &b, 1, 0);
-
 		EnterCriticalSection(&p->lock);
 		if (p->count == p->cap) {
 			// Cannot happen: every op has at most one packet in flight and the
@@ -2530,6 +2528,23 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 			e->bytes = bytes;
 			e->error = err;
 			p->count++;
+		}
+		/*
+		 * Signal under the lock, after staging, and only if no byte is
+		 * outstanding. The lock makes "stage, then signal" atomic against the
+		 * consumer's "drain, then reset" in ior_notify_clear(), which rules
+		 * out both failure modes of a socket byte as a flag: a packet staged
+		 * after a clear always has a byte sent after that clear's drain (no
+		 * lost wakeup), and a packet the consumer has already taken had its
+		 * byte sent before it was taken, so a clear after reaping is never
+		 * followed by a late byte. Coalescing to one byte per wake cycle is
+		 * what keeps the pump off the send() syscall under load.
+		 */
+		if (!p->signalled) {
+			char b = 0;
+			if (send(p->wake_tx, &b, 1, 0) == 1) {
+				p->signalled = true;
+			}
 		}
 		WakeConditionVariable(&p->cv);
 		LeaveCriticalSection(&p->lock);
@@ -2606,6 +2621,7 @@ static int iocp_pump_ensure(ior_ctx_iocp *ctx)
 	}
 	p->head = 0;
 	p->count = 0;
+	p->signalled = false;
 	p->wake_rx = rx;
 	p->wake_tx = tx;
 	p->thread = CreateThread(NULL, 0, iocp_pump_thread_main, ctx, 0, NULL);
@@ -3247,8 +3263,14 @@ static int ior_iocp_backend_notify_clear(void *backend_ctx)
 	if (!ctx->pump.thread) {
 		return -EINVAL;
 	}
+	// Drain, then reset, under the pump lock: see iocp_pump_thread_main for
+	// why the pair must be atomic against "stage, then signal".
+	iocp_pump *p = &ctx->pump;
+	EnterCriticalSection(&p->lock);
 	char buf[64];
-	while (recv(ctx->pump.wake_rx, buf, sizeof(buf), 0) > 0) { }
+	while (recv(p->wake_rx, buf, sizeof(buf), 0) > 0) { }
+	p->signalled = false;
+	LeaveCriticalSection(&p->lock);
 	return 0;
 }
 
