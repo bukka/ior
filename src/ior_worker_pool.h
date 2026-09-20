@@ -111,19 +111,34 @@ void ior_worker_pool_destroy(ior_worker_pool *pool);
  * terminated by the pool) and provision worker threads so every queued or
  * running job can have one, capped at max_threads.
  */
-void ior_worker_pool_submit(
-		ior_worker_pool *pool, ior_worker_pool_job *first, ior_worker_pool_job *last, uint32_t count);
+void ior_worker_pool_submit(ior_worker_pool *pool, ior_worker_pool_job *first,
+		ior_worker_pool_job *last, uint32_t count);
+
+/*
+ * Dequeue a job that no worker has claimed yet. Returns 0 if it was removed
+ * from the FIFO (run() will never be called for it), -ENOENT if it is not
+ * queued: a worker already popped it, or it was never submitted.
+ */
+int ior_worker_pool_cancel_job(ior_worker_pool *pool, ior_worker_pool_job *job);
 
 /*
  * Arm a one-shot timer: fire(owner, arg) runs on the timer thread at/after
- * deadline_ns (absolute CLOCK_MONOTONIC). Returns 0 or -ENOMEM. There is no
- * cancel: owners that may resolve a deadline early arbitrate in the callback
- * (e.g. via an atomic state on `arg`) and treat a late firing as a no-op.
- * If the pool is destroyed before the deadline, fire never runs and
- * drop(owner, arg) - if non-NULL - runs instead during destroy.
+ * deadline_ns (absolute CLOCK_MONOTONIC). Returns 0 or -ENOMEM. Owners that
+ * may resolve a deadline early either cancel it with
+ * ior_worker_pool_cancel_timer() or arbitrate in the callback (e.g. via an
+ * atomic state on `arg`) and treat a late firing as a no-op. If the pool is
+ * destroyed before the deadline, fire never runs and drop(owner, arg) - if
+ * non-NULL - runs instead during destroy.
  */
 int ior_worker_pool_arm_timer(ior_worker_pool *pool, uint64_t deadline_ns,
 		ior_worker_pool_timer_fn fire, ior_worker_pool_timer_fn drop, void *arg);
+
+/*
+ * Remove the armed timer whose arg matches. Returns 0 if it was removed
+ * (neither fire nor drop will run for it), -ENOENT if no such timer is armed:
+ * it fired already, is firing right now, or was never armed.
+ */
+int ior_worker_pool_cancel_timer(ior_worker_pool *pool, void *arg);
 
 uint32_t ior_worker_pool_num_threads(ior_worker_pool *pool);
 

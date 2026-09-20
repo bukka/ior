@@ -20,20 +20,29 @@ typedef struct ior_poller_req {
 	uint32_t mask;
 	uint64_t deadline_ns; /* absolute monotonic, 0 = none */
 	void *req;
+	int cancelled; /* set by cancel(); completes with -ECANCELED */
+	int res; /* staged result on the done list */
 	struct ior_poller_req *next;
 } ior_poller_req;
 
+/*
+ * `lock` guards the incoming queue and the active list so that cancel() can
+ * find a request from any thread. The poller thread holds it for all list
+ * work and drops it only around poll() and around completion callbacks, which
+ * run with no poller lock held. cancel() only marks a request; the poller
+ * thread unlinks it, so the active list keeps matching the pfds it filled.
+ */
 struct ior_threads_poller {
 	pthread_t thread;
-	ior_threads_event event; /* wakeup for add()/destroy() */
+	ior_threads_event event; /* wakeup for add()/cancel()/destroy() */
 	pthread_mutex_t lock;
 	ior_poller_req *incoming_head;
 	ior_poller_req *incoming_tail;
 	_Atomic int shutdown;
 	void *owner;
 	ior_threads_poller_cb cb;
-	ior_poller_req *active; /* owned by the poller thread */
-	struct pollfd *pfds;    /* scratch, grown on demand */
+	ior_poller_req *active;
+	struct pollfd *pfds; /* scratch, grown on demand; poller thread only */
 	size_t pfds_cap;
 };
 
@@ -68,19 +77,31 @@ static uint32_t ior_poller_from_poll(short revents)
 	return mask;
 }
 
-static void ior_poller_complete(ior_threads_poller *poller, ior_poller_req *r, int res)
+/* Stage r for completion with res on the done list (lock held). */
+static void ior_poller_done_push(ior_poller_req **done, ior_poller_req *r, int res)
 {
-	poller->cb(poller->owner, r->req, res);
-	free(r);
+	r->res = res;
+	r->next = *done;
+	*done = r;
 }
 
+/* Complete a batch of unlinked requests; runs with the lock released. */
+static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req *done)
+{
+	while (done) {
+		ior_poller_req *next = done->next;
+		poller->cb(poller->owner, done->req, done->res);
+		free(done);
+		done = next;
+	}
+}
+
+/* Lock held. */
 static void ior_poller_ingest_incoming(ior_threads_poller *poller)
 {
-	pthread_mutex_lock(&poller->lock);
 	ior_poller_req *r = poller->incoming_head;
 	poller->incoming_head = NULL;
 	poller->incoming_tail = NULL;
-	pthread_mutex_unlock(&poller->lock);
 
 	while (r) {
 		ior_poller_req *next = r->next;
@@ -90,7 +111,7 @@ static void ior_poller_ingest_incoming(ior_threads_poller *poller)
 	}
 }
 
-/* Nearest deadline as a poll timeout in ms (-1 = none). */
+/* Nearest deadline as a poll timeout in ms (-1 = none). Lock held. */
 static int ior_poller_timeout_ms(ior_threads_poller *poller)
 {
 	uint64_t nearest = 0;
@@ -110,14 +131,47 @@ static int ior_poller_timeout_ms(ior_threads_poller *poller)
 	return ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
 }
 
-static void ior_poller_cancel_all(ior_threads_poller *poller)
+/* Lock held. */
+static void ior_poller_cancel_all(ior_threads_poller *poller, ior_poller_req **done)
 {
 	ior_poller_req *r = poller->active;
 	poller->active = NULL;
 	while (r) {
 		ior_poller_req *next = r->next;
-		ior_poller_complete(poller, r, -ECANCELED);
+		ior_poller_done_push(done, r, -ECANCELED);
 		r = next;
+	}
+}
+
+/*
+ * Resolve the active list after poll(): cancelled requests (-ECANCELED),
+ * ready ones (mask or -EBADF), then expired deadlines (-ETIME). pret <= 0
+ * means no revents are valid. Lock held.
+ */
+static void ior_poller_resolve(ior_threads_poller *poller, int pret, ior_poller_req **done)
+{
+	uint64_t now = ior_worker_pool_monotonic_ns();
+	size_t i = 1;
+	ior_poller_req **pp = &poller->active;
+	while (*pp) {
+		ior_poller_req *r = *pp;
+		short revents = pret > 0 ? poller->pfds[i].revents : 0;
+		i++;
+		if (r->cancelled) {
+			*pp = r->next;
+			ior_poller_done_push(done, r, -ECANCELED);
+		} else if (revents & POLLNVAL) {
+			*pp = r->next;
+			ior_poller_done_push(done, r, -EBADF);
+		} else if (revents) {
+			*pp = r->next;
+			ior_poller_done_push(done, r, (int) ior_poller_from_poll(revents));
+		} else if (r->deadline_ns && r->deadline_ns <= now) {
+			*pp = r->next;
+			ior_poller_done_push(done, r, -ETIME);
+		} else {
+			pp = &r->next;
+		}
 	}
 }
 
@@ -126,8 +180,12 @@ static void *ior_poller_thread(void *arg)
 	ior_threads_poller *poller = arg;
 
 	for (;;) {
+		ior_poller_req *done = NULL;
+
+		pthread_mutex_lock(&poller->lock);
 		ior_poller_ingest_incoming(poller);
 		if (atomic_load_explicit(&poller->shutdown, memory_order_acquire)) {
+			pthread_mutex_unlock(&poller->lock);
 			break;
 		}
 
@@ -143,7 +201,9 @@ static void *ior_poller_thread(void *arg)
 			}
 			struct pollfd *pfds = realloc(poller->pfds, cap * sizeof(*pfds));
 			if (!pfds) {
-				ior_poller_cancel_all(poller);
+				ior_poller_cancel_all(poller, &done);
+				pthread_mutex_unlock(&poller->lock);
+				ior_poller_complete_list(poller, done);
 				continue;
 			}
 			poller->pfds = pfds;
@@ -159,42 +219,33 @@ static void *ior_poller_thread(void *arg)
 			poller->pfds[i].events = ior_poller_to_poll(r->mask);
 			poller->pfds[i].revents = 0;
 		}
+		int timeout_ms = ior_poller_timeout_ms(poller);
+		pthread_mutex_unlock(&poller->lock);
 
-		int pret = poll(poller->pfds, (nfds_t) (nreqs + 1), ior_poller_timeout_ms(poller));
+		int pret = poll(poller->pfds, (nfds_t) (nreqs + 1), timeout_ms);
 		if (pret < 0 && errno != EINTR) {
 			break;
 		}
 
-		if (poller->pfds[0].revents) {
+		if (pret > 0 && poller->pfds[0].revents) {
 			ior_threads_event_clear(&poller->event);
 		}
 
-		/* Walk requests in the same order the pfds were filled. */
-		uint64_t now = ior_worker_pool_monotonic_ns();
-		i = 1;
-		ior_poller_req **pp = &poller->active;
-		while (*pp) {
-			ior_poller_req *r = *pp;
-			short revents = pret > 0 ? poller->pfds[i].revents : 0;
-			i++;
-			if (revents & POLLNVAL) {
-				*pp = r->next;
-				ior_poller_complete(poller, r, -EBADF);
-			} else if (revents) {
-				*pp = r->next;
-				ior_poller_complete(poller, r, (int) ior_poller_from_poll(revents));
-			} else if (r->deadline_ns && r->deadline_ns <= now) {
-				*pp = r->next;
-				ior_poller_complete(poller, r, -ETIME);
-			} else {
-				pp = &r->next;
-			}
-		}
+		/* Walk requests in the same order the pfds were filled: cancel() never
+		 * unlinks, and add() only appends to incoming, so the list is intact. */
+		pthread_mutex_lock(&poller->lock);
+		ior_poller_resolve(poller, pret, &done);
+		pthread_mutex_unlock(&poller->lock);
+		ior_poller_complete_list(poller, done);
 	}
 
 	/* Shutdown: fail everything still pending, including late arrivals. */
+	ior_poller_req *done = NULL;
+	pthread_mutex_lock(&poller->lock);
 	ior_poller_ingest_incoming(poller);
-	ior_poller_cancel_all(poller);
+	ior_poller_cancel_all(poller, &done);
+	pthread_mutex_unlock(&poller->lock);
+	ior_poller_complete_list(poller, done);
 	return NULL;
 }
 
@@ -233,8 +284,8 @@ int ior_threads_poller_create(
 	return 0;
 }
 
-int ior_threads_poller_add(ior_threads_poller *poller, int fd, uint32_t ior_mask,
-		uint64_t deadline_ns, void *req)
+int ior_threads_poller_add(
+		ior_threads_poller *poller, int fd, uint32_t ior_mask, uint64_t deadline_ns, void *req)
 {
 	if (!poller) {
 		return -EINVAL;
@@ -258,6 +309,35 @@ int ior_threads_poller_add(ior_threads_poller *poller, int fd, uint32_t ior_mask
 	poller->incoming_tail = r;
 	pthread_mutex_unlock(&poller->lock);
 
+	ior_threads_event_signal(&poller->event);
+	return 0;
+}
+
+int ior_threads_poller_cancel(ior_threads_poller *poller, void *req)
+{
+	if (!poller) {
+		return -EINVAL;
+	}
+
+	int found = 0;
+	pthread_mutex_lock(&poller->lock);
+	for (ior_poller_req *r = poller->incoming_head; r && !found; r = r->next) {
+		if (r->req == req && !r->cancelled) {
+			r->cancelled = 1;
+			found = 1;
+		}
+	}
+	for (ior_poller_req *r = poller->active; r && !found; r = r->next) {
+		if (r->req == req && !r->cancelled) {
+			r->cancelled = 1;
+			found = 1;
+		}
+	}
+	pthread_mutex_unlock(&poller->lock);
+
+	if (!found) {
+		return -ENOENT;
+	}
 	ior_threads_event_signal(&poller->event);
 	return 0;
 }

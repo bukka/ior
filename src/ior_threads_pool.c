@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <poll.h>
 #include <limits.h>
@@ -27,13 +28,12 @@ static void ior_threads_pool_run_job(void *owner, ior_worker_pool_job *job);
 static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *head);
 static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, ior_work_token *token);
-static void ior_threads_pool_process_single_sqe_timed(
-		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, int timeout_ms);
-static int ior_threads_pool_process_work_timed(
-		ior_threads_pool *pool, ior_work *w, ior_work *lt, ior_cqe *gcqe, ior_cqe *lcqe);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work);
+static int ior_threads_pool_timer_valid(const ior_work *work);
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
+static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res);
+static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self);
 #ifndef IOR_HAVE_SPLICE
 static ssize_t ior_threads_pool_emulate_splice(
 		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags);
@@ -68,8 +68,26 @@ static ior_work *ior_threads_pool_work_alloc(ior_threads_pool *pool)
 
 static void ior_threads_pool_work_release(ior_threads_pool *pool, ior_work *w)
 {
+	atomic_store_explicit(&w->state, IOR_WORK_FREE, memory_order_release);
 	w->next = pool->work_free;
 	pool->work_free = w;
+}
+
+/*
+ * Move w to `state` unless a cancel has claimed it, in which case it must
+ * complete with -ECANCELED instead (returns -ECANCELED).
+ */
+static int ior_threads_pool_enter(ior_work *w, int state)
+{
+	int expected = atomic_load_explicit(&w->state, memory_order_acquire);
+	for (;;) {
+		if (expected == IOR_WORK_CANCELLED) {
+			return -ECANCELED;
+		}
+		if (atomic_compare_exchange_weak(&w->state, &expected, state)) {
+			return 0;
+		}
+	}
 }
 
 // Mark a submission sequence completed and advance the contiguous drain front,
@@ -86,23 +104,35 @@ static void ior_threads_pool_drain_complete(ior_threads_pool *pool, uint64_t seq
 	pthread_mutex_unlock(&pool->drain_lock);
 }
 
-// Block until every op submitted before `seq` has completed (for IO_DRAIN).
-static void ior_threads_pool_drain_wait(ior_threads_pool *pool, uint64_t seq)
+// Block until every op submitted before w has completed (for IO_DRAIN), or
+// until a cancel claims w (-ECANCELED).
+static int ior_threads_pool_drain_wait(ior_threads_pool *pool, ior_work *w)
 {
+	if (ior_threads_pool_enter(w, IOR_WORK_DRAINING) < 0) {
+		return -ECANCELED;
+	}
 	pthread_mutex_lock(&pool->drain_lock);
-	while (pool->drain_upto < seq) {
+	while (pool->drain_upto < w->seq
+			&& atomic_load_explicit(&w->state, memory_order_acquire) != IOR_WORK_CANCELLED) {
 		pthread_cond_wait(&pool->drain_cond, &pool->drain_lock);
 	}
 	pthread_mutex_unlock(&pool->drain_lock);
+	return atomic_load_explicit(&w->state, memory_order_acquire) == IOR_WORK_CANCELLED ? -ECANCELED
+																					   : 0;
 }
 
 /*
  * Retire one operation: post its completion, record it for drain ordering,
- * return its work item to the pool, and drop the in-flight/outstanding counts so
- * get_sqe and worker provisioning see the freed capacity.
+ * return its work item to the pool, and drop the in-flight/outstanding counts
+ * so get_sqe and worker provisioning see the freed capacity. The item is
+ * marked DONE before the CQE is posted so that a cancel submitted by a
+ * consumer who has seen the CQE finds nothing in flight (-ENOENT) rather
+ * than a stale state.
  */
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe)
 {
+	atomic_store_explicit(&work->state, IOR_WORK_DONE, memory_order_release);
+
 	ior_threads_pool_post_completion(pool, cqe);
 	ior_threads_pool_drain_complete(pool, work->seq);
 
@@ -114,11 +144,51 @@ static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, c
 	atomic_fetch_sub(&pool->num_inflight, 1);
 }
 
+static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res)
+{
+	ior_cqe cqe;
+	memset(&cqe, 0, sizeof(cqe));
+	cqe.threads.user_data = work->sqe.threads.user_data;
+	cqe.threads.res = res;
+	ior_threads_pool_finish_op(pool, work, &cqe);
+}
+
 /*
- * Resolve a poll op handed off to the poller thread. The chain layout is
- * recovered from the work item itself: an immediately following LINK_TIMEOUT
- * is the guarding pair, anything after belongs to the chain remainder, which
- * resumes on the worker pool on success or is cancelled on failure.
+ * Hand a chain (head plus everything behind it) to the worker pool. Fails with
+ * -ECANCELED once destroy has begun: the pool is going away, so the caller
+ * completes the chain as cancelled instead. work_lock must be held.
+ */
+static int ior_threads_pool_dispatch_locked(ior_threads_pool *pool, ior_work *head)
+{
+	if (atomic_load_explicit(&pool->shutdown, memory_order_acquire)) {
+		return -ECANCELED;
+	}
+	atomic_store_explicit(&head->state, IOR_WORK_QUEUED, memory_order_release);
+	head->job.next = NULL;
+	ior_worker_pool_submit(pool->wp, &head->job, &head->job, 1);
+	return 0;
+}
+
+// Complete every op of a chain with -ECANCELED; returns how many.
+static uint64_t ior_threads_pool_cancel_chain(ior_threads_pool *pool, ior_work *w)
+{
+	uint64_t count = 0;
+	while (w) {
+		ior_work *next = w->chain;
+		ior_threads_pool_finish_res(pool, w, -ECANCELED);
+		count++;
+		w = next;
+	}
+	return count;
+}
+
+/*
+ * Resolve an op handed off to the poller thread: a poll op, or a
+ * read/write/send/recv gated on readiness. The chain layout is recovered from
+ * the work item itself: an immediately following LINK_TIMEOUT is the guarding
+ * pair, anything after belongs to the chain remainder, which resumes on the
+ * worker pool on success or is cancelled on failure. A ready rw op resumes on
+ * a worker as a whole (its syscall runs there); a ready poll op completes here.
  */
 static void ior_threads_pool_poll_done(void *owner, void *req, int res)
 {
@@ -126,47 +196,51 @@ static void ior_threads_pool_poll_done(void *owner, void *req, int res)
 	ior_work *w = req;
 	uint64_t count = 1;
 
+	// Claim the op back from the poller. A cancel that raced the poller's
+	// dispatch has promised -ECANCELED; honour it whatever the poller saw,
+	// deadline included (the link timeout is then cancelled too).
+	int prev = atomic_exchange(&w->state, IOR_WORK_RUNNING);
+	if (prev == IOR_WORK_CANCELLED) {
+		res = -ECANCELED;
+	}
+
 	ior_work *lt = NULL;
 	if ((w->sqe.threads.flags & IOR_SQE_IO_LINK) && w->chain
 			&& w->chain->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
 		lt = w->chain;
 	}
 	ior_work *rest = lt ? lt->chain : w->chain;
-	int failed = res < 0;
 
-	ior_cqe cqe;
-	memset(&cqe, 0, sizeof(cqe));
-	cqe.threads.user_data = w->sqe.threads.user_data;
-	// A poller deadline is a fired link timeout: the guarded poll is cancelled.
-	cqe.threads.res = (res == -ETIME) ? -ECANCELED : res;
-	ior_threads_pool_finish_op(pool, w, &cqe);
+	if (res > 0 && w->sqe.threads.opcode != IOR_OP_POLL) {
+		pthread_mutex_lock(&pool->work_lock);
+		w->ready = 1;
+		int ret = ior_threads_pool_dispatch_locked(pool, w);
+		pthread_mutex_unlock(&pool->work_lock);
+		if (ret == 0) {
+			return; // the worker owns w and its whole chain again
+		}
+		res = -ECANCELED;
+	}
+
+	int failed = res < 0;
+	// A poller deadline is a fired link timeout: the guarded op is cancelled.
+	ior_threads_pool_finish_res(pool, w, (res == -ETIME) ? -ECANCELED : res);
 
 	if (lt) {
-		ior_cqe lcqe;
-		memset(&lcqe, 0, sizeof(lcqe));
-		lcqe.threads.user_data = lt->sqe.threads.user_data;
-		lcqe.threads.res = (res == -ETIME) ? -ETIME : -ECANCELED;
-		ior_threads_pool_finish_op(pool, lt, &lcqe);
+		ior_threads_pool_finish_res(pool, lt, (res == -ETIME) ? -ETIME : -ECANCELED);
 		count++;
 	}
 
 	if (rest) {
-		if (failed) {
+		int ret = -ECANCELED;
+		if (!failed) {
+			pthread_mutex_lock(&pool->work_lock);
+			ret = ior_threads_pool_dispatch_locked(pool, rest);
+			pthread_mutex_unlock(&pool->work_lock);
+		}
+		if (ret < 0) {
 			// A failed linked op cancels the remainder, matching io_uring.
-			ior_work *r = rest;
-			while (r) {
-				ior_work *next = r->chain;
-				ior_cqe rcqe;
-				memset(&rcqe, 0, sizeof(rcqe));
-				rcqe.threads.user_data = r->sqe.threads.user_data;
-				rcqe.threads.res = -ECANCELED;
-				ior_threads_pool_finish_op(pool, r, &rcqe);
-				count++;
-				r = next;
-			}
-		} else {
-			rest->job.next = NULL;
-			ior_worker_pool_submit(pool->wp, &rest->job, &rest->job, 1);
+			count += ior_threads_pool_cancel_chain(pool, rest);
 		}
 	}
 
@@ -221,6 +295,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	pool->ctx = ctx;
 	atomic_init(&pool->tasks_completed, 0);
 	atomic_init(&pool->poller, NULL);
+	atomic_init(&pool->shutdown, 0);
 
 	/*
 	 * Work-item pool (free-at-submit). Capacity matches the CQ (the in-flight
@@ -237,6 +312,11 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		free(pool);
 		return NULL;
 	}
+	if (pthread_mutex_init(&pool->arm_lock, NULL) != 0) {
+		pthread_mutex_destroy(&pool->work_lock);
+		free(pool);
+		return NULL;
+	}
 
 	pool->work_items = calloc(pool->work_cap, sizeof(*pool->work_items));
 	uint32_t drain_cap = ior_threads_pool_round_up_pow2(pool->work_cap * 2);
@@ -246,6 +326,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 			|| pthread_mutex_init(&pool->drain_lock, NULL) != 0) {
 		free(pool->drain_done);
 		free(pool->work_items);
+		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
@@ -254,11 +335,13 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
 		free(pool->work_items);
+		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
 	}
 	for (uint32_t i = 0; i < pool->work_cap; i++) {
+		atomic_init(&pool->work_items[i].state, IOR_WORK_FREE);
 		pool->work_items[i].next = pool->work_free;
 		pool->work_free = &pool->work_items[i];
 	}
@@ -275,6 +358,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
 		free(pool->work_items);
+		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
@@ -300,6 +384,10 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 	 * head is enqueued, the rest hang off head->chain, so a worker drains a
 	 * chain as a unit (no mid-chain race). Chain heads are collected into a
 	 * local list here and handed to the worker pool in one submit below.
+	 *
+	 * A standalone cancel (no link or drain involvement) runs on this thread
+	 * once the batch is dispatched, like io_uring executes it at submit: it
+	 * then sees the ops submitted just before it.
 	 */
 	uint32_t consumed = atomic_load_explicit(&ctx->sq_ring.consumed, memory_order_relaxed);
 	uint32_t cached = atomic_load_explicit(&ctx->sq_ring.cached_tail, memory_order_acquire);
@@ -311,19 +399,37 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 	uint32_t njobs = 0;
 	ior_work *prev = NULL;
 	int prev_link = 0;
+	ior_work *cancels = NULL;
+	ior_work *cancels_tail = NULL;
 	for (uint32_t p = consumed; p != cached; p++) {
 		ior_work *w = ior_threads_pool_work_alloc(pool);
 		w->sqe = sqes[p & ctx->sq_ring.mask];
 		w->seq = pool->next_seq++;
 		w->chain = NULL;
+		w->cur_token = NULL;
+		w->deadline_ns = 0;
+		w->ready = 0;
 		if (w->sqe.threads.opcode == IOR_OP_WORK) {
 			atomic_init(&w->token.cancelled, 0);
 			w->token.shutdown = &pool->wp->shutdown;
 		}
-		int has_link = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
+		uint8_t flags = w->sqe.threads.flags;
+		int has_link = (flags & IOR_SQE_IO_LINK) != 0;
 		if (prev_link) {
+			atomic_store_explicit(&w->state, IOR_WORK_LINKED, memory_order_release);
 			prev->chain = w;
+		} else if (w->sqe.threads.opcode == IOR_OP_ASYNC_CANCEL
+				&& !(flags & (IOR_SQE_IO_LINK | IOR_SQE_IO_DRAIN))) {
+			atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
+			w->next = NULL;
+			if (cancels_tail) {
+				cancels_tail->next = w;
+			} else {
+				cancels = w;
+			}
+			cancels_tail = w;
 		} else {
+			atomic_store_explicit(&w->state, IOR_WORK_QUEUED, memory_order_release);
 			w->job.next = NULL;
 			if (last) {
 				last->next = &w->job;
@@ -347,6 +453,17 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 
 	// Staging slots are now free for reuse by get_sqe.
 	ior_threads_ring_consume(&ctx->sq_ring);
+
+	uint64_t done = 0;
+	while (cancels) {
+		ior_work *c = cancels;
+		cancels = c->next;
+		ior_threads_pool_finish_res(pool, c, ior_threads_pool_cancel(pool, c));
+		done++;
+	}
+	if (done) {
+		atomic_fetch_add(&pool->tasks_completed, done);
+	}
 }
 
 void ior_threads_pool_destroy(ior_threads_pool *pool)
@@ -354,6 +471,12 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	if (!pool) {
 		return;
 	}
+
+	// From here on the poller fails ops instead of handing them back to the
+	// worker pool, which is about to go away.
+	pthread_mutex_lock(&pool->work_lock);
+	atomic_store_explicit(&pool->shutdown, 1, memory_order_release);
+	pthread_mutex_unlock(&pool->work_lock);
 
 	// Shut down the shared pool: drains dispatched chains, drops pending
 	// timers without posting completions, and joins all threads.
@@ -368,6 +491,7 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	pthread_mutex_destroy(&pool->drain_lock);
 	free(pool->drain_done);
 	free(pool->work_items);
+	pthread_mutex_destroy(&pool->arm_lock);
 	pthread_mutex_destroy(&pool->work_lock);
 	free(pool);
 }
@@ -407,222 +531,139 @@ static void ior_threads_pool_run_job(void *owner, ior_worker_pool_job *job)
 
 // ===== Operation Processing =====
 
-/*
- * Process one dispatched work chain. A chain is a run of IO_LINK ops claimed as
- * a unit (head plus head->chain->...), so the whole chain is owned by this one
- * worker - no other worker can run a mid-chain op out of order. Ops run in order
- * until one fails, after which the remainder are cancelled (-ECANCELED), matching
- * io_uring link semantics.
- */
-static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *head)
+// poll(2) events an rw op waits for before its syscall, 0 for other opcodes.
+static short ior_threads_pool_rw_events(const ior_sqe *sqe)
 {
-	uint64_t count = 0;
-	ior_work *w = head;
-	int cancel = 0; // a prior linked op failed/timed out; cancel the rest
-
-	while (w) {
-		ior_work *next = w->chain;
-
-		if (cancel) {
-			ior_cqe cqe;
-			memset(&cqe, 0, sizeof(cqe));
-			cqe.threads.user_data = w->sqe.threads.user_data;
-			cqe.threads.res = -ECANCELED;
-			ior_threads_pool_finish_op(pool, w, &cqe);
-			count++;
-			w = next;
-			continue;
-		}
-
-		// DRAIN: wait until every earlier-submitted op has completed.
-		if (w->sqe.threads.flags & IOR_SQE_IO_DRAIN) {
-			ior_threads_pool_drain_wait(pool, w->seq);
-		}
-
-		// Timers run on the dedicated timer thread, which finishes the op on
-		// expiry. A timeout completes with -ETIME, breaking any following link.
-		if (w->sqe.threads.opcode == IOR_OP_TIMER) {
-			int linked = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
-			ior_threads_pool_arm_timer(pool, w);
-			count++;
-			if (linked) {
-				cancel = 1;
-			}
-			w = next;
-			continue;
-		}
-
-		/*
-		 * Poll ops never block a worker: hand them (with their guarding link
-		 * timeout and chain remainder) to the poller thread, which resolves
-		 * them in ior_threads_pool_poll_done.
-		 */
-		if (w->sqe.threads.opcode == IOR_OP_POLL) {
-			ior_work *lt = NULL;
-			if ((w->sqe.threads.flags & IOR_SQE_IO_LINK) && next
-					&& next->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
-				lt = next;
-			}
-			uint64_t deadline_ns = 0;
-			if (lt) {
-				ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->sqe.threads.addr;
-				if (ts) {
-					uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-					if (!(lt->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)) {
-						ns += ior_worker_pool_monotonic_ns();
-					}
-					deadline_ns = ns ? ns : 1; // 0 means "no deadline"
-				}
-			}
-
-			ior_threads_poller *poller = ior_threads_pool_get_poller(pool);
-			int ret = poller ? ior_threads_poller_add(poller, w->sqe.threads.fd,
-									  w->sqe.threads.poll_events, deadline_ns, w)
-							 : -ENOMEM;
-			if (ret == 0) {
-				// Ownership of w and its whole chain moved to the poller.
-				atomic_fetch_add(&pool->tasks_completed, count);
-				return;
-			}
-
-			// Registration failed: fail the op here, cancel any linked rest.
-			int linked = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
-			ior_cqe cqe;
-			memset(&cqe, 0, sizeof(cqe));
-			cqe.threads.user_data = w->sqe.threads.user_data;
-			cqe.threads.res = ret;
-			ior_threads_pool_finish_op(pool, w, &cqe);
-			count++;
-			if (linked) {
-				cancel = 1;
-			}
-			w = next;
-			continue;
-		}
-
-		int has_link = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
-
-		/*
-		 * Link timeout: a linked op immediately followed by a LINK_TIMEOUT runs
-		 * poll-gated against the timeout's deadline; both are completed here. The
-		 * pair is owned by this worker (claimed as one chain), so there is no race
-		 * over the link-timeout slot.
-		 */
-		if (has_link && next && next->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
-			// Capture the post-timeout successor before finishing (which frees the
-			// work items and may hand them to another thread).
-			ior_work *after = next->chain;
-
-			/*
-			 * A guarded work op cannot be poll-gated: the callback runs on this
-			 * worker while the timer thread arbitrates the deadline and flags
-			 * the token so the callback can bail out.
-			 */
-			if (w->sqe.threads.opcode == IOR_OP_WORK) {
-				ior_cqe gcqe, lcqe;
-				ior_threads_pool_process_work_timed(pool, w, next, &gcqe, &lcqe);
-				int failed = gcqe.threads.res < 0;
-				ior_threads_pool_finish_op(pool, w, &gcqe);
-				ior_threads_pool_finish_op(pool, next, &lcqe);
-				count += 2;
-
-				if (failed) {
-					cancel = 1; // a failed linked op breaks the chain
-				}
-				w = after;
-				continue;
-			}
-
-			ior_timespec *ts = (ior_timespec *) (uintptr_t) next->sqe.threads.addr;
-			int timeout_ms = -1;
-			if (ts) {
-				uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-				if (next->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS) {
-					uint64_t now = ior_worker_pool_monotonic_ns();
-					ns = (ns > now) ? ns - now : 0;
-				}
-				uint64_t ms = (ns + 999999ULL) / 1000000ULL;
-				timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
-			}
-
-			ior_cqe gcqe;
-			ior_threads_pool_process_single_sqe_timed(pool, &w->sqe, &gcqe, timeout_ms);
-			int cancelled = (gcqe.threads.res == -ECANCELED);
-			ior_threads_pool_finish_op(pool, w, &gcqe);
-			count++;
-
-			// -ETIME if the timeout cancelled the guarded op, else -ECANCELED.
-			ior_cqe lcqe;
-			memset(&lcqe, 0, sizeof(lcqe));
-			lcqe.threads.user_data = next->sqe.threads.user_data;
-			lcqe.threads.res = cancelled ? -ETIME : -ECANCELED;
-			ior_threads_pool_finish_op(pool, next, &lcqe);
-			count++;
-
-			if (cancelled) {
-				cancel = 1; // guarded op was cancelled; break the rest of the chain
-			}
-			w = after;
-			continue;
-		}
-
-		// Normal op.
-		ior_cqe cqe;
-		ior_threads_pool_process_single_sqe(pool, &w->sqe, &cqe, &w->token);
-		ior_threads_pool_finish_op(pool, w, &cqe);
-		count++;
-
-		if (has_link && cqe.threads.res < 0) {
-			cancel = 1; // a failed linked op breaks the chain
-		}
-		w = next;
-	}
-
-	atomic_fetch_add(&pool->tasks_completed, count);
-}
-
-/*
- * Run a guarded op bounded by a link timeout. For read/recv (POLLIN) and
- * write/send (POLLOUT) on pollable descriptors, wait for readiness up to
- * timeout_ms; on timeout the op is cancelled with -ECANCELED. Other opcodes
- * cannot be poll-gated and run to completion unbounded (the link timeout then
- * resolves as "op finished first"). On a regular file the poll returns ready
- * immediately, so the op runs uncancelled - matching io_uring.
- */
-static void ior_threads_pool_process_single_sqe_timed(
-		ior_threads_pool *pool, const ior_sqe *sqe, ior_cqe *cqe, int timeout_ms)
-{
-	short events;
 	switch (sqe->threads.opcode) {
 		case IOR_OP_READ:
 		case IOR_OP_RECV:
-			events = POLLIN;
-			break;
+			return POLLIN;
 		case IOR_OP_WRITE:
 		case IOR_OP_SEND:
-			events = POLLOUT;
-			break;
+			return POLLOUT;
 		default:
-			ior_threads_pool_process_single_sqe(pool, sqe, cqe, NULL);
-			return;
+			return 0;
 	}
+}
 
-	struct pollfd pfd = { .fd = sqe->threads.fd, .events = events };
+// MSG_DONTWAIT asks for -EAGAIN rather than a wait, as with io_uring.
+static int ior_threads_pool_rw_nowait(const ior_sqe *sqe)
+{
+	return (sqe->threads.opcode == IOR_OP_SEND || sqe->threads.opcode == IOR_OP_RECV)
+			&& (sqe->threads.rw_flags & MSG_DONTWAIT);
+}
+
+/*
+ * XNU's sosend() decides on SS_NBIO (the O_NONBLOCK descriptor flag) alone, so
+ * send(2) blocks on a full send buffer however it is asked not to. Its
+ * soreceive() does honour MSG_DONTWAIT, so recv is unaffected.
+ */
+#ifdef IOR_PLATFORM_MACOS
+#define IOR_SEND_HONOURS_DONTWAIT 0
+#else
+#define IOR_SEND_HONOURS_DONTWAIT 1
+#endif
+
+/*
+ * Does the op need the descriptor put in non-blocking mode before its syscall?
+ * Only one that cannot ask the kernel for a non-blocking attempt of its own: a
+ * read or write at the current position (read(2) has no per-call non-blocking
+ * flag and the descriptor may be a blocking socket or pipe), and send where
+ * MSG_DONTWAIT is ignored. Elsewhere send/recv are issued with that flag
+ * instead (one syscall, no descriptor state), and positioned I/O is
+ * regular-file semantics that runs to completion, as on io_uring's worker
+ * queue.
+ */
+static int ior_threads_pool_rw_needs_nonblock(const ior_sqe *sqe)
+{
+	if (!IOR_SEND_HONOURS_DONTWAIT && sqe->threads.opcode == IOR_OP_SEND) {
+		return 1;
+	}
+	return (sqe->threads.opcode == IOR_OP_READ || sqe->threads.opcode == IOR_OP_WRITE)
+			&& sqe->threads.off == IOR_OFF_NONE;
+}
+
+/*
+ * Take ownership of a descriptor's blocking mode, so its syscall reports
+ * -EAGAIN instead of waiting. One ioctl, where the alternative costs a poll().
+ * A probe cannot replace this for writes: poll() promises only SO_SNDLOWAT
+ * bytes of room, while a blocking write does not return until all of len is
+ * queued, so a write larger than the free space parks the worker however
+ * ready the descriptor looked. Skipped entirely when the caller has declared
+ * its descriptors non-blocking with IOR_SETUP_FD_NONBLOCK. Returns 0 if the
+ * descriptor is non-blocking.
+ */
+static int ior_threads_pool_set_nonblock(int fd)
+{
+	int on = 1;
+	return ioctl(fd, FIONBIO, &on) < 0 ? -1 : 0;
+}
+
+static int ior_threads_pool_res_would_block(int32_t res)
+{
+	return res == -EAGAIN || res == -EWOULDBLOCK;
+}
+
+/*
+ * Would the syscall proceed without blocking? Errors and POLLNVAL count as
+ * ready: the syscall reports them. Regular files are always ready. Only used
+ * where the blocking mode could not be taken over.
+ */
+static int ior_threads_pool_fd_ready(int fd, short events)
+{
+	struct pollfd pfd = { .fd = fd, .events = events };
 	int pret;
 	do {
-		pret = poll(&pfd, 1, timeout_ms);
+		pret = poll(&pfd, 1, 0);
 	} while (pret < 0 && errno == EINTR);
+	return pret != 0;
+}
 
-	if (pret > 0) {
-		// Ready: the syscall will not block significantly.
-		ior_threads_pool_process_single_sqe(pool, sqe, cqe, NULL);
-		return;
+// Absolute deadline of a link timeout, 0 for none (NULL timespec).
+static uint64_t ior_threads_pool_lt_deadline(const ior_work *lt)
+{
+	ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->sqe.threads.addr;
+	if (!ts) {
+		return 0;
+	}
+	uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	if (!(lt->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)) {
+		ns += ior_worker_pool_monotonic_ns();
+	}
+	return ns ? ns : 1;
+}
+
+/*
+ * Park w (with its guarding link timeout and chain remainder) on the poller
+ * thread, which resumes or resolves it in ior_threads_pool_poll_done. The
+ * registration happens under work_lock so that a cancel racing it either
+ * finds the registration or, having claimed the op first, is honoured here.
+ * Returns 0 once the poller owns the chain, else a negative errno and the
+ * caller still owns it.
+ */
+static int ior_threads_pool_hand_to_poller(
+		ior_threads_pool *pool, ior_work *w, ior_work *lt, uint32_t mask)
+{
+	if (lt && !w->deadline_ns) {
+		w->deadline_ns = ior_threads_pool_lt_deadline(lt);
+	}
+	ior_threads_poller *poller = ior_threads_pool_get_poller(pool);
+	if (!poller) {
+		return -ENOMEM;
 	}
 
-	memset(cqe, 0, sizeof(*cqe));
-	cqe->threads.user_data = sqe->threads.user_data;
-	// pret == 0 is the deadline (cancel); pret < 0 is a poll error.
-	cqe->threads.res = (pret == 0) ? -ECANCELED : -errno;
+	pthread_mutex_lock(&pool->work_lock);
+	int ret = ior_threads_pool_enter(w, IOR_WORK_POLLING);
+	if (ret == 0) {
+		w->ready = 0;
+		ret = ior_threads_poller_add(poller, w->sqe.threads.fd, mask, w->deadline_ns, w);
+		if (ret < 0) {
+			// Still ours, and about to fail: not claimable any more.
+			atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
+		}
+	}
+	pthread_mutex_unlock(&pool->work_lock);
+	return ret;
 }
 
 /*
@@ -668,46 +709,55 @@ static void ior_threads_pool_lt_dropped(void *owner, void *arg)
 }
 
 /*
- * Run a work op guarded by a link timeout. The callback cannot be poll-gated
- * or killed, so it always runs to completion on this worker; the deadline is
- * armed on the timer thread and only flags the token so the callback can
- * return early. Resolution (matching io_uring):
+ * Arm the deadline of a link timeout guarding a work op. The callback cannot
+ * be poll-gated or killed, so the deadline only flags the token so it can
+ * return early; returns the arbitration node (this worker's ref), or NULL
+ * when there is no valid deadline (NULL/invalid ts, alloc failure), in which
+ * case the pair degrades to "op finished first", like an unbounded poll gate.
+ */
+static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *lt)
+{
+	ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->sqe.threads.addr;
+	if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L) {
+		return NULL;
+	}
+
+	ior_threads_pool_lt_arb *arb = calloc(1, sizeof(*arb));
+	if (!arb) {
+		return NULL;
+	}
+	atomic_init(&arb->token.cancelled, 0);
+	arb->token.shutdown = &pool->wp->shutdown;
+	atomic_init(&arb->state, 0);
+	atomic_init(&arb->refs, 2); // this worker + the timer thread
+
+	uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	uint64_t deadline_ns = (lt->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
+			? ts_ns
+			: ior_worker_pool_monotonic_ns() + ts_ns;
+
+	if (ior_worker_pool_arm_timer(
+				pool->wp, deadline_ns, ior_threads_pool_lt_fired, ior_threads_pool_lt_dropped, arb)
+			< 0) {
+		free(arb);
+		return NULL;
+	}
+	return arb;
+}
+
+/*
+ * Run a work op guarded by a link timeout whose deadline `arb` (may be NULL)
+ * was armed by ior_threads_pool_lt_arb_arm. Resolution (matching io_uring):
  *   - callback finishes first: work res = callback's return, LT = -ECANCELED;
  *   - deadline fires while the callback runs: work res = callback's return
  *     (posted when it returns), LT = -ETIME.
- * With no valid deadline (NULL/invalid ts, alloc failure) the pair degrades to
- * "op finished first", like an unbounded poll gate. Returns non-zero if the
- * deadline fired.
+ * Returns non-zero if the deadline fired. The worker's arb ref is not
+ * dropped here.
  */
-static int ior_threads_pool_process_work_timed(
-		ior_threads_pool *pool, ior_work *w, ior_work *lt, ior_cqe *gcqe, ior_cqe *lcqe)
+static int ior_threads_pool_process_work_timed(ior_threads_pool *pool, ior_work *w, ior_work *lt,
+		ior_threads_pool_lt_arb *arb, ior_cqe *gcqe, ior_cqe *lcqe)
 {
-	ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->sqe.threads.addr;
-	ior_threads_pool_lt_arb *arb = NULL;
-
-	if (ts && ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000L) {
-		arb = calloc(1, sizeof(*arb));
-		if (arb) {
-			atomic_init(&arb->token.cancelled, 0);
-			arb->token.shutdown = &pool->wp->shutdown;
-			atomic_init(&arb->state, 0);
-			atomic_init(&arb->refs, 2); // this worker + the timer thread
-
-			uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-			uint64_t deadline_ns = (lt->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
-					? ts_ns
-					: ior_worker_pool_monotonic_ns() + ts_ns;
-
-			if (ior_worker_pool_arm_timer(pool->wp, deadline_ns, ior_threads_pool_lt_fired,
-						ior_threads_pool_lt_dropped, arb)
-					< 0) {
-				free(arb);
-				arb = NULL;
-			}
-		}
-	}
-
-	ior_threads_pool_process_single_sqe(pool, &w->sqe, gcqe, arb ? &arb->token : &w->token);
+	ior_threads_pool_process_single_sqe(pool, &w->sqe, gcqe, w->cur_token);
 
 	int fired = 0;
 	if (arb) {
@@ -715,7 +765,8 @@ static int ior_threads_pool_process_work_timed(
 		if (!atomic_compare_exchange_strong(&arb->state, &expected, 1)) {
 			fired = 1; // timer thread claimed the deadline while the callback ran
 		}
-		ior_threads_pool_lt_arb_release(arb);
+		// The caller drops the worker's ref once w is retired: until then a
+		// cancel may still flag the token through w->cur_token.
 	}
 
 	memset(lcqe, 0, sizeof(*lcqe));
@@ -723,6 +774,255 @@ static int ior_threads_pool_process_work_timed(
 	lcqe->threads.res = fired ? -ETIME : -ECANCELED;
 
 	return fired;
+}
+
+/*
+ * Process one dispatched work chain. A chain is a run of IO_LINK ops claimed as
+ * a unit (head plus head->chain->...), so the whole chain is owned by this one
+ * worker - no other worker can run a mid-chain op out of order. Ops run in order
+ * until one fails, after which the remainder are cancelled (-ECANCELED), matching
+ * io_uring link semantics.
+ *
+ * Blocking read/write/send/recv never block a worker: an op whose descriptor
+ * is not ready is parked on the poller (like io_uring's poll retry) and comes
+ * back here once it is, so it stays cancellable and a non-blocking descriptor
+ * never spins on EAGAIN.
+ */
+static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *head)
+{
+	uint64_t count = 0;
+	ior_work *w = head;
+	int cancel = 0; // a prior linked op failed/timed out; cancel the rest
+
+	while (w) {
+		ior_work *next = w->chain;
+		uint8_t opcode = w->sqe.threads.opcode;
+		int has_link = (w->sqe.threads.flags & IOR_SQE_IO_LINK) != 0;
+
+		if (cancel) {
+			ior_threads_pool_finish_res(pool, w, -ECANCELED);
+			count++;
+			w = next;
+			continue;
+		}
+
+		// DRAIN: wait until every earlier-submitted op has completed.
+		if ((w->sqe.threads.flags & IOR_SQE_IO_DRAIN) && ior_threads_pool_drain_wait(pool, w) < 0) {
+			ior_threads_pool_finish_res(pool, w, -ECANCELED);
+			count++;
+			if (has_link) {
+				cancel = 1;
+			}
+			w = next;
+			continue;
+		}
+
+		// Timers run on the dedicated timer thread, which finishes the op on
+		// expiry. A timeout completes with -ETIME, breaking any following link.
+		if (opcode == IOR_OP_TIMER) {
+			// An invalid timespec fails as a running op: a cancel then reports
+			// -EALREADY rather than claiming an op that completes -EINVAL.
+			int valid = ior_threads_pool_timer_valid(w);
+			if (ior_threads_pool_enter(w, valid ? IOR_WORK_TIMER : IOR_WORK_RUNNING) < 0) {
+				ior_threads_pool_finish_res(pool, w, -ECANCELED);
+			} else if (!valid) {
+				ior_threads_pool_finish_res(pool, w, -EINVAL);
+			} else {
+				ior_threads_pool_arm_timer(pool, w);
+			}
+			count++;
+			if (has_link) {
+				cancel = 1;
+			}
+			w = next;
+			continue;
+		}
+
+		// A cancel that is part of a chain (or drained) runs here in order.
+		if (opcode == IOR_OP_ASYNC_CANCEL) {
+			int res = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0
+					? -ECANCELED
+					: ior_threads_pool_cancel(pool, w);
+			ior_threads_pool_finish_res(pool, w, res);
+			count++;
+			if (has_link && res < 0) {
+				cancel = 1;
+			}
+			w = next;
+			continue;
+		}
+
+		/*
+		 * Link timeout: a linked op immediately followed by a LINK_TIMEOUT is
+		 * bounded by the timeout's deadline; both are completed together. The
+		 * pair is owned by this worker (claimed as one chain), so there is no
+		 * race over the link-timeout slot.
+		 */
+		ior_work *lt = NULL;
+		if (has_link && next && next->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
+			lt = next;
+		}
+		// Capture the post-timeout successor before finishing (which frees the
+		// work items and may hand them to another thread).
+		ior_work *after = lt ? lt->chain : next;
+
+		/*
+		 * Readiness gate: poll ops always wait on the poller. An rw op runs
+		 * at once and parks below if it would block, which needs a descriptor
+		 * that reports rather than waits; where the mode cannot be taken over
+		 * a readiness probe stands in, and an unready descriptor is parked
+		 * without attempting the syscall at all.
+		 */
+		short events = ior_threads_pool_rw_events(&w->sqe);
+		int nowait = ior_threads_pool_rw_nowait(&w->sqe);
+		int unready = 0;
+		if (events && !w->ready && ior_threads_pool_rw_needs_nonblock(&w->sqe)
+				&& !(pool->ctx->flags & IOR_SETUP_FD_NONBLOCK)
+				&& ior_threads_pool_set_nonblock(w->sqe.threads.fd) < 0) {
+			unready = !ior_threads_pool_fd_ready(w->sqe.threads.fd, events);
+		}
+		int gate = opcode == IOR_OP_POLL || (unready && !nowait);
+		if (gate) {
+			uint32_t mask = opcode == IOR_OP_POLL ? w->sqe.threads.poll_events
+												  : (events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT);
+			int ret = ior_threads_pool_hand_to_poller(pool, w, lt, mask);
+			if (ret == 0) {
+				// Ownership of w and its whole chain moved to the poller.
+				atomic_fetch_add(&pool->tasks_completed, count);
+				return;
+			}
+
+			// Registration failed (or a cancel claimed the op meanwhile): fail
+			// the op here, cancel any linked rest.
+			ior_threads_pool_finish_res(pool, w, ret);
+			count++;
+			if (lt) {
+				ior_threads_pool_finish_res(pool, lt, -ECANCELED);
+				count++;
+			}
+			if (has_link) {
+				cancel = 1;
+			}
+			w = after;
+			continue;
+		}
+		if (w->ready) {
+			w->ready = 0;
+		}
+
+		/*
+		 * Probed not ready with MSG_DONTWAIT asked for: answer -EAGAIN here,
+		 * since the syscall would wait rather than report it. A cancel that
+		 * claimed the op still wins.
+		 */
+		if (unready && nowait) {
+			int res = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0 ? -ECANCELED : -EAGAIN;
+			ior_threads_pool_finish_res(pool, w, res);
+			count++;
+			if (lt) {
+				ior_threads_pool_finish_res(pool, lt, -ECANCELED);
+				count++;
+			}
+			if (has_link) {
+				cancel = 1; // a failed linked op breaks the chain
+			}
+			w = after;
+			continue;
+		}
+
+		/*
+		 * A guarded work op cannot be poll-gated: the callback runs on this
+		 * worker while the timer thread arbitrates the deadline and flags
+		 * the token so the callback can bail out.
+		 */
+		if (lt && opcode == IOR_OP_WORK) {
+			ior_cqe gcqe, lcqe;
+			ior_threads_pool_lt_arb *arb = ior_threads_pool_lt_arb_arm(pool, lt);
+			// An async cancel flags this token (w stays RUNNING, and this
+			// worker holds arb, until the callback returns).
+			w->cur_token = arb ? &arb->token : &w->token;
+			if (ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0) {
+				memset(&gcqe, 0, sizeof(gcqe));
+				gcqe.threads.user_data = w->sqe.threads.user_data;
+				gcqe.threads.res = -ECANCELED;
+				memset(&lcqe, 0, sizeof(lcqe));
+				lcqe.threads.user_data = lt->sqe.threads.user_data;
+				lcqe.threads.res = -ECANCELED;
+			} else {
+				ior_threads_pool_process_work_timed(pool, w, lt, arb, &gcqe, &lcqe);
+			}
+			int failed = gcqe.threads.res < 0;
+			ior_threads_pool_finish_op(pool, w, &gcqe);
+			if (arb) {
+				// Only now: a cancel dereferences w->cur_token under work_lock
+				// while w is RUNNING, and finish_op took that lock to retire w.
+				ior_threads_pool_lt_arb_release(arb);
+			}
+			ior_threads_pool_finish_op(pool, lt, &lcqe);
+			count += 2;
+
+			if (failed) {
+				cancel = 1; // a failed linked op breaks the chain
+			}
+			w = after;
+			continue;
+		}
+
+		/*
+		 * Run the op now. The token pointer is published before the state so
+		 * a cancel that sees RUNNING can flag it. An rw op that may still park
+		 * (send/recv, positionless read/write) runs as TRYING instead: a
+		 * cancel can claim that, and the claim is honoured below by finishing
+		 * the op instead of parking it.
+		 */
+		ior_cqe cqe;
+		w->cur_token = &w->token;
+		int may_park = events && !nowait
+				&& (opcode == IOR_OP_SEND || opcode == IOR_OP_RECV
+						|| ior_threads_pool_rw_needs_nonblock(&w->sqe));
+		if (ior_threads_pool_enter(w, may_park ? IOR_WORK_TRYING : IOR_WORK_RUNNING) < 0) {
+			memset(&cqe, 0, sizeof(cqe));
+			cqe.threads.user_data = w->sqe.threads.user_data;
+			cqe.threads.res = -ECANCELED;
+		} else {
+			ior_threads_pool_process_single_sqe(pool, &w->sqe, &cqe, &w->token);
+
+			/*
+			 * The op would block (send/recv are always issued with
+			 * MSG_DONTWAIT; a non-blocking descriptor says so itself): park
+			 * on the poller and retry once it is ready, unless the caller
+			 * asked for MSG_DONTWAIT semantics. A cancel that claimed the op
+			 * meanwhile makes hand_to_poller fail with -ECANCELED, which is
+			 * then the result; a syscall that did complete keeps its real
+			 * result.
+			 */
+			if (events && ior_threads_pool_res_would_block(cqe.threads.res)
+					&& !ior_threads_pool_rw_nowait(&w->sqe)) {
+				uint32_t mask = events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT;
+				int ret = ior_threads_pool_hand_to_poller(pool, w, lt, mask);
+				if (ret == 0) {
+					atomic_fetch_add(&pool->tasks_completed, count);
+					return;
+				}
+				cqe.threads.res = ret;
+			}
+		}
+		ior_threads_pool_finish_op(pool, w, &cqe);
+		count++;
+
+		if (lt) {
+			// The guarded op finished first: its link timeout is cancelled.
+			ior_threads_pool_finish_res(pool, lt, -ECANCELED);
+			count++;
+		}
+
+		if (has_link && cqe.threads.res < 0) {
+			cancel = 1; // a failed linked op breaks the chain
+		}
+		w = after;
+	}
+
+	atomic_fetch_add(&pool->tasks_completed, count);
 }
 
 static void ior_threads_pool_process_single_sqe(
@@ -822,7 +1122,11 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len,
 					sqe->threads.rw_flags);
 			const void *buf = (const void *) (uintptr_t) sqe->threads.addr;
-			ssize_t ret = send(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
+			// Never block a worker: readiness is waited for on the poller.
+			// Where the flag is ignored (see IOR_SEND_HONOURS_DONTWAIT) the
+			// descriptor is put in non-blocking mode first, which XNU honours.
+			ssize_t ret = send(sqe->threads.fd, buf, sqe->threads.len,
+					(int) sqe->threads.rw_flags | MSG_DONTWAIT);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("send end: res=%d", cqe->threads.res);
 			break;
@@ -833,7 +1137,9 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len,
 					sqe->threads.rw_flags);
 			void *buf = (void *) (uintptr_t) sqe->threads.addr;
-			ssize_t ret = recv(sqe->threads.fd, buf, sqe->threads.len, (int) sqe->threads.rw_flags);
+			// Never block a worker: readiness is waited for on the poller.
+			ssize_t ret = recv(sqe->threads.fd, buf, sqe->threads.len,
+					(int) sqe->threads.rw_flags | MSG_DONTWAIT);
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("recv end: res=%d", cqe->threads.res);
 			break;
@@ -891,57 +1197,234 @@ static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_c
 
 // ===== Timers =====
 
-// Fires on the worker pool's timer thread when a timeout op expires.
+// Fires on the worker pool's timer thread when a timeout op expires. A cancel
+// that claimed the op after it was popped from the heap wins: -ECANCELED.
 static void ior_threads_pool_timer_fired(void *owner, void *arg)
 {
 	ior_threads_pool *pool = owner;
 	ior_work *work = arg;
 
-	ior_cqe cqe;
-	memset(&cqe, 0, sizeof(cqe));
-	cqe.threads.user_data = work->sqe.threads.user_data;
-	cqe.threads.res = -ETIME;
+	int prev = atomic_exchange(&work->state, IOR_WORK_RUNNING);
+	ior_threads_pool_finish_res(pool, work, prev == IOR_WORK_CANCELLED ? -ECANCELED : -ETIME);
+}
 
-	ior_threads_pool_finish_op(pool, work, &cqe);
+static int ior_threads_pool_timer_valid(const ior_work *work)
+{
+	ior_timespec *ts = (ior_timespec *) (uintptr_t) work->sqe.threads.addr;
+	return ts && ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000L;
 }
 
 /*
- * Arm a timeout. Validates the timespec and hands the work item to the shared
- * pool's timer thread, which finishes it on expiry. Invalid timespecs (and a
- * heap allocation failure) finish inline so the caller never has to
- * special-case them.
+ * Arm a timeout (already validated) on the shared pool's timer thread, which
+ * finishes it on expiry. A heap allocation failure finishes inline so the
+ * caller never has to special-case it. Arming happens under arm_lock so that
+ * a cancel racing it either finds the armed timer or, having claimed the op
+ * first, is honoured here - including when arming failed.
  */
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work)
 {
 	ior_timespec *ts = (ior_timespec *) (uintptr_t) work->sqe.threads.addr;
 	int err = 0;
 
-	if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L) {
-		err = EINVAL;
-	}
+	// IOR_TIMEOUT_ABS: ts is an absolute CLOCK_MONOTONIC deadline; otherwise
+	// it is a relative duration from now.
+	uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	uint64_t deadline_ns = (work->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
+			? ts_ns
+			: ior_worker_pool_monotonic_ns() + ts_ns;
 
-	if (!err) {
-		// IOR_TIMEOUT_ABS: ts is an absolute CLOCK_MONOTONIC deadline; otherwise
-		// it is a relative duration from now.
-		uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-		uint64_t deadline_ns = (work->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
-				? ts_ns
-				: ior_worker_pool_monotonic_ns() + ts_ns;
-
-		int ret = ior_worker_pool_arm_timer(
-				pool->wp, deadline_ns, ior_threads_pool_timer_fired, NULL, work);
-		if (ret < 0) {
-			err = ENOMEM;
-		}
+	pthread_mutex_lock(&pool->arm_lock);
+	int ret = ior_worker_pool_arm_timer(
+			pool->wp, deadline_ns, ior_threads_pool_timer_fired, NULL, work);
+	int claimed = atomic_load_explicit(&work->state, memory_order_acquire) == IOR_WORK_CANCELLED;
+	if (ret < 0) {
+		err = claimed ? ECANCELED : ENOMEM;
+	} else if (claimed && ior_worker_pool_cancel_timer(pool->wp, work) == 0) {
+		// Claimed between enter and arm; the timer never fires.
+		err = ECANCELED;
 	}
+	pthread_mutex_unlock(&pool->arm_lock);
 
 	if (err) {
-		ior_cqe cqe;
-		memset(&cqe, 0, sizeof(cqe));
-		cqe.threads.user_data = work->sqe.threads.user_data;
-		cqe.threads.res = -err;
-		ior_threads_pool_finish_op(pool, work, &cqe);
+		ior_threads_pool_finish_res(pool, work, -err);
 	}
+}
+
+// ===== Async cancel =====
+
+static int ior_threads_pool_op_has_fd(uint8_t opcode)
+{
+	switch (opcode) {
+		case IOR_OP_READ:
+		case IOR_OP_WRITE:
+		case IOR_OP_SEND:
+		case IOR_OP_RECV:
+		case IOR_OP_POLL:
+		case IOR_OP_SPLICE:
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+static int ior_threads_pool_cancel_match(const ior_work *w, const ior_sqe *c)
+{
+	if (c->threads.cancel_flags & IOR_CANCEL_BY_FD) {
+		return ior_threads_pool_op_has_fd(w->sqe.threads.opcode)
+				&& w->sqe.threads.fd == c->threads.fd;
+	}
+	return w->sqe.threads.user_data == c->threads.addr;
+}
+
+/*
+ * Try to cancel one in-flight op (work_lock held). Ops that this call takes
+ * away from their owner (a queued chain, an armed timer) are pushed on `done`
+ * for completion once the lock is released; ops claimed from a waiting owner
+ * complete on that owner's thread. Returns the cancel result for this op:
+ * 0, -EALREADY, or -ENOENT when it completed meanwhile.
+ */
+static int ior_threads_pool_cancel_one(ior_threads_pool *pool, ior_work *w, ior_work **done)
+{
+	for (;;) {
+		int state = atomic_load_explicit(&w->state, memory_order_acquire);
+		int expected = state;
+		switch (state) {
+			case IOR_WORK_QUEUED:
+				if (ior_worker_pool_cancel_job(pool->wp, &w->job) == 0) {
+					// The chain is ours now: no worker will touch it.
+					for (ior_work *m = w; m; m = m->chain) {
+						atomic_store_explicit(&m->state, IOR_WORK_CANCELLED, memory_order_release);
+					}
+					w->next = *done;
+					*done = w;
+					return 0;
+				}
+				// A worker popped it but has not started it: claim it so its
+				// first state transition fails and it completes as cancelled.
+				if (atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED)) {
+					return 0;
+				}
+				continue;
+
+			case IOR_WORK_DRAINING:
+				if (atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED)) {
+					pthread_mutex_lock(&pool->drain_lock);
+					pthread_cond_broadcast(&pool->drain_cond);
+					pthread_mutex_unlock(&pool->drain_lock);
+					return 0;
+				}
+				continue;
+
+			case IOR_WORK_TRYING:
+				// A non-blocking attempt in progress: like io_uring's transient
+				// poll ownership, report it as running. The claim still keeps
+				// the worker from parking it: the attempt either completes
+				// with its real result or ends as -ECANCELED.
+				if (atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED)) {
+					return -EALREADY;
+				}
+				continue;
+
+			case IOR_WORK_TIMER: {
+				// Under arm_lock the worker is either before or after its
+				// arm-and-check, never in between (see arm_timer).
+				pthread_mutex_lock(&pool->arm_lock);
+				if (ior_worker_pool_cancel_timer(pool->wp, w) == 0) {
+					atomic_store_explicit(&w->state, IOR_WORK_CANCELLED, memory_order_release);
+					pthread_mutex_unlock(&pool->arm_lock);
+					w->chain = NULL; // a linked rest was already finished by the worker
+					w->next = *done;
+					*done = w;
+					return 0;
+				}
+				// Firing, or not armed yet: whoever finishes it sees the claim.
+				int claimed
+						= atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED);
+				pthread_mutex_unlock(&pool->arm_lock);
+				if (claimed) {
+					return 0;
+				}
+				continue;
+			}
+
+			case IOR_WORK_POLLING: {
+				ior_threads_poller *poller
+						= atomic_load_explicit(&pool->poller, memory_order_acquire);
+				if (poller && ior_threads_poller_cancel(poller, w) == 0) {
+					return 0;
+				}
+				// Being dispatched, or not registered yet: same as above.
+				if (atomic_compare_exchange_strong(&w->state, &expected, IOR_WORK_CANCELLED)) {
+					return 0;
+				}
+				continue;
+			}
+
+			case IOR_WORK_RUNNING:
+				// A syscall or callback in progress cannot be interrupted; a
+				// work callback can at least observe the request.
+				if (w->cur_token) {
+					atomic_store_explicit(&w->cur_token->cancelled, 1, memory_order_release);
+				}
+				return -EALREADY;
+
+			case IOR_WORK_CANCELLED:
+				return -EALREADY;
+
+			default:
+				return -ENOENT;
+		}
+	}
+}
+
+/*
+ * Execute a cancel op: find the first in-flight match and resolve it per
+ * io_uring semantics (0 cancelled, -EALREADY running, -ENOENT none). The
+ * scan runs under work_lock, which also keeps the matched item allocated
+ * until its owner has been dealt with.
+ */
+static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self)
+{
+	const ior_sqe *c = &self->sqe;
+
+	if ((c->threads.cancel_flags & IOR_CANCEL_BY_FD) && c->threads.fd == IOR_INVALID_FD) {
+		return -EBADF;
+	}
+
+	int ret = -ENOENT;
+	ior_work *done = NULL;
+
+	pthread_mutex_lock(&pool->work_lock);
+	for (uint32_t i = 0; i < pool->work_cap; i++) {
+		ior_work *w = &pool->work_items[i];
+		if (w == self) {
+			continue;
+		}
+		int state = atomic_load_explicit(&w->state, memory_order_acquire);
+		if (state == IOR_WORK_FREE || state == IOR_WORK_LINKED || state == IOR_WORK_DONE) {
+			continue;
+		}
+		if (!ior_threads_pool_cancel_match(w, c)) {
+			continue;
+		}
+		ret = ior_threads_pool_cancel_one(pool, w, &done);
+		if (ret != -ENOENT) {
+			break;
+		}
+	}
+	pthread_mutex_unlock(&pool->work_lock);
+
+	uint64_t count = 0;
+	while (done) {
+		ior_work *d = done;
+		done = d->next;
+		count += ior_threads_pool_cancel_chain(pool, d);
+	}
+	if (count) {
+		atomic_fetch_add(&pool->tasks_completed, count);
+	}
+
+	return ret;
 }
 
 // ===== Splice Emulation =====

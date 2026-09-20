@@ -74,6 +74,12 @@ int test_fd_is_valid(ior_fd_t fd);
 int test_make_socketpair(ior_fd_t fds[2]);
 
 /*
+ * Put a socket from test_make_socketpair() into non-blocking mode (O_NONBLOCK
+ * on POSIX, FIONBIO on Windows). Returns 0 or a negative errno.
+ */
+int test_set_nonblocking(ior_fd_t fd);
+
+/*
  * Current value of the monotonic clock the backends use for absolute timeouts
  * (IOR_TIMEOUT_ABS), in nanoseconds: CLOCK_MONOTONIC on POSIX, QPC on Windows.
  * Used by tests to build an absolute deadline in the backend's own clock base.

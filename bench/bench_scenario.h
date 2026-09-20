@@ -39,6 +39,7 @@ typedef struct bench_options {
 
 	bench_timer_mode timer_mode; /* socket/work scenario timer guard */
 	uint32_t timeout_ms; /* guard timeout (generous; firing is an error) */
+	uint32_t race_pct; /* cancel scenario: % of rounds that send with the cancel */
 
 	const char *workspace; /* directory for temp files */
 
@@ -55,6 +56,7 @@ int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **b
 int bench_run_file(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_mixed(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_work(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
+int bench_run_cancel(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 
 #ifdef __cplusplus
 }

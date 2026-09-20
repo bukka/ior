@@ -27,6 +27,26 @@ typedef struct ior_ctx_threads {
 } ior_ctx_threads;
 
 /*
+ * Where a submitted op currently is, for IOR_OP_ASYNC_CANCEL. Every hand-over
+ * to a worker, the poller or the timer thread is a compare-and-swap that
+ * fails once a cancel has claimed the op (CANCELLED), and every cancel claim
+ * is a compare-and-swap from the specific waiting state, so exactly one side
+ * decides how the op completes.
+ */
+enum {
+	IOR_WORK_FREE = 0, /* on the free list */
+	IOR_WORK_QUEUED, /* chain head in the worker pool FIFO, or just popped */
+	IOR_WORK_LINKED, /* chain member behind its head; not cancellable */
+	IOR_WORK_RUNNING, /* on a worker: syscall or callback in progress */
+	IOR_WORK_TRYING, /* on a worker: non-blocking attempt that may park on the poller */
+	IOR_WORK_DRAINING, /* on a worker: waiting for IO_DRAIN */
+	IOR_WORK_TIMER, /* armed on the timer thread */
+	IOR_WORK_POLLING, /* registered with the poller */
+	IOR_WORK_CANCELLED, /* claimed by a cancel; completes with -ECANCELED */
+	IOR_WORK_DONE, /* completion posted; item about to return to the free list */
+};
+
+/*
  * A submitted operation, copied out of the SQ ring at submit time. Workers
  * consume these from the shared worker pool's dispatch queue, so a slow op
  * never pins an SQ slot. Items live in a fixed pool and move between the free
@@ -37,8 +57,17 @@ typedef struct ior_work {
 	ior_worker_pool_job job; // FIFO node while queued as a chain head
 	ior_sqe sqe; // copied submission entry
 	uint64_t seq; // submission order, for IO_DRAIN
-	struct ior_work *next; // free-list link
+	struct ior_work *next; // free-list link (scratch link while allocated)
 	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
+	/*
+	 * Fields a worker writes while it owns the op, kept together (and off the
+	 * neighbouring item's SQE) so the submitter's alloc and copy do not share
+	 * cache lines with them.
+	 */
+	_Atomic int state; // IOR_WORK_*
+	int ready; // rw op: the poller reported readiness, skip the probe
+	struct ior_work_token *cur_token; // token the running callback observes
+	uint64_t deadline_ns; // link-timeout deadline once computed (0 = none)
 	struct ior_work_token token; // IOR_OP_WORK only: cancellation handle
 } ior_work;
 
@@ -64,6 +93,12 @@ struct ior_threads_pool {
 	_Atomic uint64_t tasks_completed;
 
 	/*
+	 * Set (under work_lock) when destroy begins: the poller must then fail
+	 * ops it would otherwise hand back to the worker pool.
+	 */
+	_Atomic int shutdown;
+
+	/*
 	 * Free-at-submit dispatch. submit() copies each SQE into a work item and
 	 * enqueues it (chains as a unit) onto the worker pool FIFO, freeing the SQ
 	 * slot immediately; workers consume from the FIFO. The work pool is fixed at
@@ -71,6 +106,14 @@ struct ior_threads_pool {
 	 */
 	pthread_mutex_t work_lock;
 	ior_work *work_items; // pool array [work_cap]
+
+	/*
+	 * Serializes arming a timer op (with the worker's post-arm cancel check)
+	 * against a cancel claiming it, so neither side can miss the other; kept
+	 * off work_lock, which every completion takes. Order: work_lock, then
+	 * arm_lock, then the worker pool's timer lock.
+	 */
+	pthread_mutex_t arm_lock;
 	ior_work *work_free; // free list
 	uint32_t work_cap;
 	uint64_t next_seq; // next submission sequence to assign
