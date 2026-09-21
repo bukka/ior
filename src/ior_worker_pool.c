@@ -7,11 +7,31 @@
 #include "ior_log.h"
 #include <stdlib.h>
 #include <errno.h>
+#include <signal.h>
 #include <time.h>
 #include <sys/time.h>
 
 static void *ior_worker_pool_worker_thread_func(void *arg);
 static void *ior_worker_pool_timer_thread_func(void *arg);
+
+int ior_thread_create(
+		pthread_t *thread, const pthread_attr_t *attr, void *(*start)(void *), void *arg)
+{
+	/*
+	 * A thread inherits its creator's signal mask, so block everything for the
+	 * duration of pthread_create() rather than in the new thread, which would
+	 * leave a window in which it could take a signal.
+	 */
+	sigset_t all, saved;
+	sigfillset(&all);
+	int ret = pthread_sigmask(SIG_BLOCK, &all, &saved);
+	if (ret != 0) {
+		return ret;
+	}
+	ret = pthread_create(thread, attr, start, arg);
+	pthread_sigmask(SIG_SETMASK, &saved, NULL);
+	return ret;
+}
 
 uint64_t ior_worker_pool_monotonic_ns(void)
 {
@@ -41,7 +61,8 @@ static int ior_worker_pool_try_create_thread(ior_worker_pool *pool)
 		pthread_attr_setstacksize(&attr, pool->stack_size);
 	}
 
-	int ret = pthread_create(&worker->thread_id, &attr, ior_worker_pool_worker_thread_func, worker);
+	int ret = ior_thread_create(
+			&worker->thread_id, &attr, ior_worker_pool_worker_thread_func, worker);
 	pthread_attr_destroy(&attr);
 	if (ret != 0) {
 		free(worker);
@@ -98,7 +119,8 @@ ior_worker_pool *ior_worker_pool_create(
 	if (pthread_cond_init(&pool->timer_cond, NULL) != 0) {
 		goto err_timer_lock;
 	}
-	if (pthread_create(&pool->timer_thread, NULL, ior_worker_pool_timer_thread_func, pool) != 0) {
+	if (ior_thread_create(&pool->timer_thread, NULL, ior_worker_pool_timer_thread_func, pool)
+			!= 0) {
 		goto err_timer_cond;
 	}
 	pool->timer_thread_started = 1;

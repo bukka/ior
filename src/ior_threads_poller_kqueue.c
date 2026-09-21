@@ -406,7 +406,7 @@ int ior_threads_poller_create(
 	struct kevent kev;
 	EV_SET(&kev, ior_threads_event_get_fd(&poller->event), EVFILT_READ, EV_ADD, 0, 0, NULL);
 	if (kevent(poller->kq, &kev, 1, NULL, 0, NULL) < 0
-			|| pthread_create(&poller->thread, NULL, ior_poller_thread, poller) != 0) {
+			|| ior_thread_create(&poller->thread, NULL, ior_poller_thread, poller) != 0) {
 		pthread_mutex_destroy(&poller->lock);
 		ior_threads_event_destroy(&poller->event);
 		close(poller->kq);

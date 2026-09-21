@@ -273,7 +273,7 @@ int ior_threads_poller_create(
 		free(poller);
 		return -ENOMEM;
 	}
-	if (pthread_create(&poller->thread, NULL, ior_poller_thread, poller) != 0) {
+	if (ior_thread_create(&poller->thread, NULL, ior_poller_thread, poller) != 0) {
 		pthread_mutex_destroy(&poller->lock);
 		ior_threads_event_destroy(&poller->event);
 		free(poller);

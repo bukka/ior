@@ -56,6 +56,19 @@ foreach(test ${TESTS})
     set_tests_properties(${test} PROPERTIES TIMEOUT 30)
 endforeach()
 
+# Signal delivery (POSIX only: every ior thread must block signals)
+if(NOT WIN32)
+    add_executable(test_signals test_signals.c)
+    target_include_directories(test_signals PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_signals PRIVATE test_utils ior cmocka::cmocka)
+    apply_sanitizers(test_signals)
+    add_test(NAME test_signals COMMAND test_signals)
+    set_tests_properties(test_signals PROPERTIES TIMEOUT 30)
+endif()
+
 # Thread backend tests (only if thread backend is compiled)
 if(IOR_HAVE_THREADS)
     # Thread-specific unit tests

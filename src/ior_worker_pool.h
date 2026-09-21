@@ -147,4 +147,14 @@ void ior_worker_pool_thread_stats(ior_worker_pool *pool, uint32_t *active, uint3
 
 uint64_t ior_worker_pool_monotonic_ns(void);
 
+/*
+ * pthread_create() for every thread ior owns (workers, timer, pollers). The
+ * new thread starts with every signal blocked, so a signal sent to the
+ * process is delivered to one of the caller's threads and EINTR is only ever
+ * seen there; user work callbacks inherit that mask. The caller's own mask is
+ * untouched. Returns 0 or a positive errno like pthread_create().
+ */
+int ior_thread_create(
+		pthread_t *thread, const pthread_attr_t *attr, void *(*start)(void *), void *arg);
+
 #endif /* IOR_WORKER_POOL_H */
