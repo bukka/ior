@@ -665,10 +665,11 @@ void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data);
  *
  * Cancel before closing a descriptor. What happens to operations still in
  * flight when it is closed is not portable: io_uring keeps the file open
- * until they complete, IOCP aborts them with -ECANCELED. On IOCP the value
- * of a closed handle may be reused by the next open at once; the backend
- * tolerates that, but only operations that were submitted after the reopen
- * belong to the new object.
+ * until they complete, IOCP fails them with the error the driver reports
+ * for a closed object (-ECONNABORTED on a socket, -EPIPE on a pipe). On IOCP
+ * the value of a closed handle may be reused by the next open at once; the
+ * backend tolerates that, but only operations that were submitted after the
+ * reopen belong to the new object.
  *
  * @param ctx  I/O context.
  * @param sqe  Entry from ior_get_sqe().
