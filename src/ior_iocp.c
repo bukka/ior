@@ -400,6 +400,11 @@ static int win_error_to_errno(DWORD err)
 			return -EINVAL;
 		case WSAECONNABORTED:
 			return -ECONNABORTED;
+		case ERROR_CONNECTION_ABORTED:
+			// What AFD reports for a request still pending when the socket
+			// was closed (not ERROR_OPERATION_ABORTED, which only a cancel
+			// produces).
+			return -ECONNABORTED;
 		case WSAENOTCONN:
 			return -ENOTCONN;
 		case WSAENOTSOCK:
@@ -838,6 +843,17 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen, 
 	LeaveCriticalSection(&ctx->handles.lock);
 
 	return 0;
+}
+
+/* Current cancel generation of an associated handle (0 if never associated).
+ * A set lookup, so it can gate the kernel probe in reissue_collateral_abort(). */
+static uint32_t handle_cancel_gen(ior_ctx_iocp *ctx, HANDLE h)
+{
+	EnterCriticalSection(&ctx->handles.lock);
+	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, h);
+	uint32_t gen = entry ? entry->cancel_gen : 0;
+	LeaveCriticalSection(&ctx->handles.lock);
+	return gen;
 }
 
 /*
@@ -2158,18 +2174,33 @@ static bool reissue_collateral_abort(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD b
 
 	EnterCriticalSection(&ctx->timers.lock);
 	bool collateral = atomic_load(&op->state) == IOCP_OP_IO
-			&& (!op->link_timeout || op->link_timeout->timer_armed);
+			&& (!op->link_timeout || op->link_timeout->timer_armed)
+			// A cancel moved the generation while this request was in flight:
+			// a set lookup, so an abort that is not a replay candidate at all
+			// (one the library did not cause: the caller's own CancelIoEx, or
+			// the issuing thread exiting - a close does not produce one, AFD
+			// and the pipe driver report those as ERROR_CONNECTION_ABORTED and
+			// ERROR_BROKEN_PIPE) is decided without going to the kernel.
+			&& handle_cancel_gen(ctx, op->fd) != op->io_cancel_gen;
 	if (collateral) {
 		/*
-		 * Re-validate the handle with the kernel before replaying on it. The
-		 * caller may have closed it with this request in flight: then the
-		 * association fails (dead value) or succeeds and moves the epoch on
-		 * (the value names a new object), and either way the abort is
-		 * reported as it is rather than replayed onto something else.
+		 * Only now re-validate the handle with the kernel. The caller may
+		 * have closed it with this request in flight: then the association
+		 * fails (dead value) or succeeds and moves the epoch on (the value
+		 * names a new object), and either way the abort is reported as it is
+		 * rather than replayed onto something else.
+		 *
+		 * Succeeding here associates that new object with this context's
+		 * port, which cannot be undone - the probe is the only way to detect
+		 * a recycled value, so it is kept behind the check above and reached
+		 * only by an abort that would otherwise be replayed. Closing a
+		 * descriptor with cancels in flight is what ior_prep_cancel_fd()
+		 * warns against; an explicit registration API would remove the need
+		 * for the probe altogether.
 		 */
 		uint32_t gen, epoch;
-		collateral = ensure_handle_associated(ctx, op->fd, &gen, &epoch) == 0
-				&& epoch == op->io_epoch && gen != op->io_cancel_gen;
+		collateral
+				= ensure_handle_associated(ctx, op->fd, &gen, &epoch) == 0 && epoch == op->io_epoch;
 	}
 	if (collateral) {
 		// Return the aborted request's active_count slot; issue_* reserves a

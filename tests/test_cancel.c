@@ -459,6 +459,123 @@ static void test_cancel_then_close_and_reopen(void **state)
 	test_close_fd(fresh[1]);
 }
 
+/*
+ * An abort the library did not cause must leave no mark on whatever the
+ * process opens next under the aborted handle's value. On IOCP such an abort
+ * (ERROR_OPERATION_ABORTED with the handle's cancel generation untouched)
+ * comes from the caller's own CancelIoEx or from the issuing thread exiting;
+ * a close does not produce one, AFD and the pipe driver report those as
+ * ERROR_CONNECTION_ABORTED and ERROR_BROKEN_PIPE. The backend used to
+ * re-validate every such abort's handle with the kernel, and once the value
+ * had been closed and recycled the probe associated the caller's new socket
+ * with this queue's port for good, so no other port could ever take it. The
+ * value is caught here on a client socket this queue never sees, and a second
+ * queue must connect, send and recv on it like on any new socket.
+ *
+ * On POSIX the recv is cancelled through the queue and reaped before the
+ * close, and the second queue is checked the same way.
+ */
+static void test_foreign_abort_reopen_other_queue(void **state)
+{
+	cancel_state *s = (cancel_state *) *state;
+	char buf[64], nbuf[64];
+	int32_t res[MAX_TAG];
+	char seen[MAX_TAG];
+
+	// The listener is made first so that the socket opened right after the
+	// close is the client.
+	ior_fd_t listener;
+	struct sockaddr_storage addr;
+	socklen_t addrlen;
+	assert_return_code(test_make_listener(&listener, &addr, &addrlen), 0);
+
+	submit_recv(s, buf, sizeof(buf), TAG_OP, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	cancel_msleep(20);
+#ifdef _WIN32
+	// Abort it behind the queue's back: its completion is queued now, and is
+	// reaped only once the value belongs to the new socket.
+	assert_true(CancelIoEx((HANDLE) s->sock[1], NULL));
+#else
+	submit_cancel(s, TAG_OP);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 2, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
+#endif
+
+	test_close_fd(s->sock[1]);
+	s->sock[1] = IOR_TEST_INVALID_FD;
+	ior_fd_t client;
+	assert_return_code(test_make_tcp_socket(&client), 0);
+
+#ifdef _WIN32
+	reap_tags(s->ctx, 1, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
+#endif
+
+	// The connect goes first on its own: a socket bound to another port is
+	// refused right there (-EBADF), and an accept would then never complete.
+	ior_ctx *ctx2 = NULL;
+	assert_return_code(ior_queue_init(16, &ctx2), 0);
+	ior_sqe *c = ior_get_sqe(ctx2);
+	assert_non_null(c);
+	ior_prep_connect(ctx2, c, client, (const struct sockaddr *) &addr, addrlen);
+	ior_sqe_set_data(ctx2, c, TAG_OP);
+	assert_true(ior_submit(ctx2) >= 0);
+	reap_tags(ctx2, 1, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_OP], 0);
+	ior_sqe *a = ior_get_sqe(ctx2);
+	assert_non_null(a);
+	ior_prep_accept(ctx2, a, listener, NULL, NULL, 0);
+	ior_sqe_set_data(ctx2, a, TAG_OP2);
+	assert_true(ior_submit(ctx2) >= 0);
+	reap_tags(ctx2, 1, res, seen);
+	assert_true(res[(uintptr_t) TAG_OP2] >= 0);
+	ior_fd_t accepted = (ior_fd_t) (intptr_t) res[(uintptr_t) TAG_OP2];
+
+	ior_sqe *w = ior_get_sqe(ctx2);
+	assert_non_null(w);
+	ior_prep_send(ctx2, w, client, "x", 1, 0);
+	ior_sqe_set_data(ctx2, w, TAG_NEW_SEND);
+	ior_sqe *r = ior_get_sqe(ctx2);
+	assert_non_null(r);
+	memset(nbuf, 0, sizeof(nbuf));
+	ior_prep_recv(ctx2, r, accepted, nbuf, sizeof(nbuf), 0);
+	ior_sqe_set_data(ctx2, r, TAG_NEW_RECV);
+	assert_true(ior_submit(ctx2) >= 0);
+	reap_tags(ctx2, 2, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_NEW_SEND], 1);
+	assert_int_equal(res[(uintptr_t) TAG_NEW_RECV], 1);
+	assert_int_equal(nbuf[0], 'x');
+
+	ior_queue_exit(ctx2);
+	test_close_fd(accepted);
+	test_close_fd(client);
+	test_close_fd(listener);
+}
+
+#ifdef _WIN32
+// A socket closed with a recv still parked on it fails that recv with what
+// AFD reports for a closed object, -ECONNABORTED, not -ECANCELED: nothing
+// cancelled it (the case ior_prep_cancel_fd() documents).
+static void test_close_under_recv_reports_connaborted(void **state)
+{
+	cancel_state *s = (cancel_state *) *state;
+	char buf[64];
+	int32_t res[MAX_TAG];
+	char seen[MAX_TAG];
+
+	submit_recv(s, buf, sizeof(buf), TAG_OP, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	cancel_msleep(20);
+	test_close_fd(s->sock[1]);
+	s->sock[1] = IOR_TEST_INVALID_FD;
+	reap_tags(s->ctx, 1, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_OP], -ECONNABORTED);
+}
+#endif
+
 // A cancelled recv on a socket that becomes readable later must not consume
 // the data: the next recv gets it.
 static void test_cancel_recv_data_intact(void **state)
@@ -843,6 +960,12 @@ int main(void)
 				test_cancel_two_same_socket_batch, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(
 				test_cancel_then_close_and_reopen, setup_cancel, teardown_cancel),
+		cmocka_unit_test_setup_teardown(
+				test_foreign_abort_reopen_other_queue, setup_cancel, teardown_cancel),
+#ifdef _WIN32
+		cmocka_unit_test_setup_teardown(
+				test_close_under_recv_reports_connaborted, setup_cancel, teardown_cancel),
+#endif
 		cmocka_unit_test_setup_teardown(
 				test_cancel_recv_data_intact, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_work_running, setup_cancel, teardown_cancel),
