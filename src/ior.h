@@ -630,8 +630,14 @@ void ior_prep_connect(
  * request (-1 for any child, a process group, WUNTRACED or WCONTINUED, or a
  * platform without a process watch) blocks a worker thread in waitpid(2)
  * until it returns: a cancel then reports -EALREADY and ior_queue_exit()
- * waits for it. Windows accepts only @p pid > 0 (-ENOTSUP otherwise),
- * ignores @p options and stores the exit code in @p status.
+ * waits for it.
+ *
+ * Windows accepts only @p pid > 0 (-ENOTSUP otherwise), ignores @p options
+ * and stores the exit code in @p status. Any process can be waited for
+ * there, not only a child; -ECHILD means no such process. The op opens the
+ * process by id when submitted, so keep a handle to it open until the
+ * completion arrives: once a process has exited and its last handle is
+ * closed, its id may be given to another process.
  *
  * @param ctx      I/O context.
  * @param sqe      Entry from ior_get_sqe().

@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <sys/wait.h>
+#include <signal.h>
 #ifdef IOR_HAVE_PIDFD_OPEN
 #include <sys/syscall.h>
 #endif
@@ -117,13 +118,10 @@ struct ior_uring_job {
 	uint64_t lt_user_data;
 	_Atomic int lt_fired;
 
-	// IOR_OP_WAITPID run as a job: a worker's waitpid(2), or an answer
-	// already collected at prep (wait_resolved).
+	// IOR_OP_WAITPID run as a job: a worker's waitpid(2).
 	pid_t wait_pid;
 	int *wait_status;
 	int wait_options;
-	int wait_resolved;
-	int32_t wait_res;
 
 	struct ior_work_token token;
 	_Atomic int state;
@@ -1044,9 +1042,6 @@ static int32_t ior_uring_waitpid_job(ior_work_token *token, void *arg)
 {
 	(void) token;
 	ior_uring_job *job = arg;
-	if (job->wait_resolved) {
-		return job->wait_res;
-	}
 	pid_t r;
 	do {
 		r = waitpid(job->wait_pid, job->wait_status, job->wait_options);
@@ -1055,10 +1050,11 @@ static int32_t ior_uring_waitpid_job(ior_work_token *token, void *arg)
 }
 
 /*
- * A state change already there (or WNOHANG) is collected right here and the
- * answer carried by a job; a running single child gets a pidfd poll, which
- * ties up no thread and cancels natively; anything else is a worker's
- * blocking waitpid.
+ * One child with nothing else asked gets a pidfd poll, which ties up no
+ * thread and cancels natively; anything else (any child, a group, WNOHANG,
+ * job control, no pidfd) is a worker's waitpid. Nothing is consumed here:
+ * prep has no completion to carry an answer, and an op that is never
+ * submitted, or fails to prep, must leave the child as it found it.
  */
 static int ior_uring_backend_prep_waitpid(
 		void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
@@ -1066,13 +1062,19 @@ static int ior_uring_backend_prep_waitpid(
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_sqe *s = &sqe->uring.sqe;
 
-	pid_t r = waitpid(pid, status, options | WNOHANG);
-	int err = errno;
-	int resolved = r != 0 || (options & WNOHANG);
-
 #ifdef IOR_HAVE_PIDFD_OPEN
-	if (!resolved && pid > 0 && options == 0) {
-		int pidfd = (int) syscall(SYS_pidfd_open, pid, 0);
+	if (pid > 0 && options == 0) {
+		/*
+		 * Is it a child at all? pidfd_open watches any process, and a poll
+		 * on one that is nobody's child would never answer -ECHILD; asked
+		 * with WNOWAIT the question reaps nothing, so an exited child stays
+		 * collectable (its pidfd is readable at once).
+		 */
+		siginfo_t info;
+		memset(&info, 0, sizeof(info));
+		int pidfd = waitid(P_PID, (id_t) pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0
+				? (int) syscall(SYS_pidfd_open, pid, 0)
+				: -1;
 		if (pidfd >= 0) {
 			ior_uring_wait *wait = calloc(1, sizeof(*wait));
 			if (!wait) {
@@ -1100,8 +1102,6 @@ static int ior_uring_backend_prep_waitpid(
 	job->wait_pid = pid;
 	job->wait_status = status;
 	job->wait_options = options;
-	job->wait_resolved = resolved;
-	job->wait_res = r < 0 ? -err : r;
 	return 0;
 }
 

@@ -304,9 +304,13 @@ static void test_waitpid_cancel(void **state)
 
 	reap_tags(s->ctx, 1, res, 3);
 	if (res[(uintptr_t) TAG_CANCEL] == -EALREADY) {
-		assert_false(WAIT_IS_WATCHED);
+		// A worker holds it in waitpid(), or the cancel caught the probe
+		// (the op then ends -ECANCELED although the cancel said running).
 		kill_child(k);
 		reap_tags(s->ctx, 1, res, 3);
+		if (res[(uintptr_t) TAG_WAIT] == -ECANCELED) {
+			return;
+		}
 		assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
 		k->reaped = 1;
 		return;

@@ -1376,6 +1376,16 @@ static int issue_waitpid(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	atomic_store(&op->state, IOCP_OP_WAIT);
 
 	SetThreadpoolWait(op->tp_wait, h, NULL);
+
+	// The state was claimable for a moment before the wait was armed. Today
+	// nothing claims it in that window (cancels run on this thread, a link
+	// timeout is armed only after this returns), but should something ever
+	// abort the op there, its completion is posted: withdraw the wait again
+	// rather than leave one armed on a finished op.
+	if (atomic_load(&op->state) != IOCP_OP_WAIT) {
+		SetThreadpoolWait(op->tp_wait, NULL, NULL);
+		WaitForThreadpoolWaitCallbacks(op->tp_wait, TRUE);
+	}
 	return 0;
 }
 
