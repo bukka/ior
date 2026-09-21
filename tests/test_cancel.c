@@ -390,7 +390,11 @@ static void test_cancel_two_same_socket_batch(void **state)
  * value back). The second recv, which the cancel of the first took down with
  * it on IOCP, must be reported as cancelled - never replayed onto whatever now
  * carries that descriptor value - and the new socket's own recv must get its
- * data.
+ * data. The POSIX backends do not complete an op on a closed descriptor
+ * (io_uring keeps the file alive, the poller loses its registration), and
+ * closing one with cancels still in flight is the misuse ior_prep_cancel_fd()
+ * warns about, so there both recvs are cancelled and reaped before the close;
+ * the reopen and the new socket's I/O are checked the same way.
  */
 static void test_cancel_then_close_and_reopen(void **state)
 {
@@ -404,9 +408,25 @@ static void test_cancel_then_close_and_reopen(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 	cancel_msleep(20);
 	submit_cancel(s, TAG_OP);
+#ifndef _WIN32
+	// No abort-on-close here: cancel the neighbour too, and let both cancels
+	// take effect before the descriptor goes away, as callers must.
+	ior_sqe *c2 = ior_get_sqe(s->ctx);
+	assert_non_null(c2);
+	ior_prep_cancel(s->ctx, c2, TAG_OP2);
+	ior_sqe_set_data(s->ctx, c2, TAG_CANCEL2);
 	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 4, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL2], 0);
+	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
+	assert_int_equal(res[(uintptr_t) TAG_OP2], -ECANCELED);
+#else
+	assert_true(ior_submit(s->ctx) >= 0);
+#endif
 
-	// Nothing reaped yet: close the socket and open new ones.
+	// Close the socket and open new ones (with a cancel's side effects still
+	// queued on IOCP).
 	test_close_fd(s->sock[1]);
 	s->sock[1] = IOR_TEST_INVALID_FD;
 	ior_fd_t fresh[2];
@@ -423,10 +443,14 @@ static void test_cancel_then_close_and_reopen(void **state)
 	ior_sqe_set_data(s->ctx, r, TAG_NEW_RECV);
 	assert_true(ior_submit(s->ctx) >= 0);
 
+#ifndef _WIN32
+	reap_tags(s->ctx, 2, res, seen);
+#else
 	reap_tags(s->ctx, 5, res, seen);
 	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
 	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
 	assert_int_equal(res[(uintptr_t) TAG_OP2], -ECANCELED);
+#endif
 	assert_int_equal(res[(uintptr_t) TAG_NEW_SEND], 1);
 	assert_int_equal(res[(uintptr_t) TAG_NEW_RECV], 1);
 	assert_int_equal(nbuf[0], 'x');
