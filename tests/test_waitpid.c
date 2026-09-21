@@ -302,6 +302,10 @@ static void test_waitpid_cancel(void **state)
 	ior_sqe_set_data(s->ctx, c, TAG_CANCEL);
 	assert_true(ior_submit(s->ctx) >= 0);
 
+	// Either CQE may land first: IOCP posts the wait's abort before the
+	// cancel's own result. Only a cancel that reports -EALREADY is known
+	// to arrive alone.
+	res[(uintptr_t) TAG_CANCEL] = INT32_MIN;
 	reap_tags(s->ctx, 1, res, 3);
 	if (res[(uintptr_t) TAG_CANCEL] == -EALREADY) {
 		// A worker holds it in waitpid(), or the cancel caught the probe
@@ -315,8 +319,8 @@ static void test_waitpid_cancel(void **state)
 		k->reaped = 1;
 		return;
 	}
-	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
 	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
 	assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECANCELED);
 	assert_int_equal(status, -1);
 }
