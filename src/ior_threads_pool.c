@@ -15,10 +15,14 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <time.h>
 #include <poll.h>
 #include <limits.h>
+#ifdef IOR_HAVE_PIDFD_OPEN
+#include <sys/syscall.h>
+#endif
 
 #ifndef __linux__
 typedef off_t loff_t;
@@ -205,6 +209,12 @@ static void ior_threads_pool_poll_done(void *owner, void *req, int res)
 		res = -ECANCELED;
 	}
 
+	// The poller has dropped its registration: the pidfd has served.
+	if (w->pidfd >= 0) {
+		close(w->pidfd);
+		w->pidfd = -1;
+	}
+
 	ior_work *lt = NULL;
 	if ((w->sqe.threads.flags & IOR_SQE_IO_LINK) && w->chain
 			&& w->chain->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT) {
@@ -212,7 +222,14 @@ static void ior_threads_pool_poll_done(void *owner, void *req, int res)
 	}
 	ior_work *rest = lt ? lt->chain : w->chain;
 
-	if (res > 0 && w->sqe.threads.opcode != IOR_OP_POLL) {
+	/*
+	 * Ready ops resume on a worker. So does a process wait whose watch
+	 * failed (ESRCH for a child that exited meanwhile, say): the worker
+	 * collects the state, or waits for it itself.
+	 */
+	int resume = res > 0
+			|| (w->sqe.threads.opcode == IOR_OP_WAITPID && res != -ECANCELED && res != -ETIME);
+	if (resume && w->sqe.threads.opcode != IOR_OP_POLL) {
 		pthread_mutex_lock(&pool->work_lock);
 		w->ready = 1;
 		int ret = ior_threads_pool_dispatch_locked(pool, w);
@@ -411,6 +428,7 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		w->deadline_ns = 0;
 		w->ready = 0;
 		w->connecting = 0;
+		w->pidfd = -1;
 		if (w->sqe.threads.opcode == IOR_OP_WORK) {
 			atomic_init(&w->token.cancelled, 0);
 			w->token.shutdown = &pool->wp->shutdown;
@@ -654,7 +672,7 @@ static uint64_t ior_threads_pool_lt_deadline(const ior_work *lt)
  * caller still owns it.
  */
 static int ior_threads_pool_hand_to_poller(
-		ior_threads_pool *pool, ior_work *w, ior_work *lt, uint32_t mask)
+		ior_threads_pool *pool, ior_work *w, ior_work *lt, int fd, uint32_t mask)
 {
 	if (lt && !w->deadline_ns) {
 		w->deadline_ns = ior_threads_pool_lt_deadline(lt);
@@ -668,7 +686,7 @@ static int ior_threads_pool_hand_to_poller(
 	int ret = ior_threads_pool_enter(w, IOR_WORK_POLLING);
 	if (ret == 0) {
 		w->ready = 0;
-		ret = ior_threads_poller_add(poller, w->sqe.threads.fd, mask, w->deadline_ns, w);
+		ret = ior_threads_poller_add(poller, fd, mask, w->deadline_ns, w);
 		if (ret < 0) {
 			// Still ours, and about to fail: not claimable any more.
 			atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
@@ -755,6 +773,81 @@ static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *po
 		return NULL;
 	}
 	return arb;
+}
+
+/*
+ * Park a WAITPID op until pid exits, where the platform can watch a process
+ * without a thread: a pidfd on Linux, EVFILT_PROC on kqueue. Returns 0 once
+ * the poller owns the op, -ENOTSUP when there is nothing to watch with (no
+ * such facility, or pidfd_open failed: an old kernel, or the process is
+ * gone, which waitpid will say), else the hand-over's error, the op still
+ * being the caller's.
+ */
+static int ior_threads_pool_watch_proc(ior_threads_pool *pool, ior_work *w, ior_work *lt, pid_t pid)
+{
+#if defined(IOR_HAVE_KQUEUE)
+	return ior_threads_pool_hand_to_poller(pool, w, lt, (int) pid, IOR_THREADS_POLLER_PROC);
+#elif defined(IOR_HAVE_PIDFD_OPEN) && defined(IOR_HAVE_EPOLL)
+	int pidfd = (int) syscall(SYS_pidfd_open, pid, 0);
+	if (pidfd < 0) {
+		return -ENOTSUP;
+	}
+	w->pidfd = pidfd;
+	int ret = ior_threads_pool_hand_to_poller(pool, w, lt, pidfd, IOR_POLL_IN);
+	if (ret < 0) {
+		close(pidfd);
+		w->pidfd = -1;
+	}
+	return ret;
+#else
+	(void) pool;
+	(void) w;
+	(void) lt;
+	(void) pid;
+	return -ENOTSUP;
+#endif
+}
+
+/*
+ * One pass of a WAITPID op on a worker, entered as TRYING. It first asks
+ * waitpid(2) without waiting, which also answers WNOHANG. If nothing has
+ * changed yet, a single child is watched without a thread and the op parks
+ * on the poller (*parked), coming back here with w->ready once the child
+ * exited so the state can be collected. What the platform cannot watch (any
+ * child, a process group, stop and continue reports, no pidfd) or a watch
+ * that failed to deliver blocks this worker in waitpid(2) instead, as
+ * RUNNING: a cancel then reports -EALREADY.
+ */
+static int32_t ior_threads_pool_waitpid(
+		ior_threads_pool *pool, ior_work *w, ior_work *lt, int *parked)
+{
+	pid_t pid = (pid_t) (int64_t) w->sqe.threads.off;
+	int *status = (int *) (uintptr_t) w->sqe.threads.addr;
+	int options = (int) w->sqe.threads.len;
+
+	pid_t r = waitpid(pid, status, options | WNOHANG);
+	if (r != 0 || (options & WNOHANG)) {
+		return r < 0 ? -errno : r;
+	}
+	if (!w->ready && pid > 0 && options == 0) {
+		int ret = ior_threads_pool_watch_proc(pool, w, lt, pid);
+		if (ret == 0) {
+			*parked = 1;
+			return 0;
+		}
+		if (ret != -ENOTSUP) {
+			return ret;
+		}
+	}
+	w->ready = 0;
+
+	if (ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0) {
+		return -ECANCELED;
+	}
+	do {
+		r = waitpid(pid, status, options);
+	} while (r < 0 && errno == EINTR);
+	return r < 0 ? -errno : r;
 }
 
 /*
@@ -878,6 +971,32 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		// work items and may hand them to another thread).
 		ior_work *after = lt ? lt->chain : next;
 
+		// A process wait: probe, park on the poller, or hold this worker.
+		if (opcode == IOR_OP_WAITPID) {
+			int32_t res;
+			int parked = 0;
+			if (ior_threads_pool_enter(w, IOR_WORK_TRYING) < 0) {
+				res = -ECANCELED;
+			} else {
+				res = ior_threads_pool_waitpid(pool, w, lt, &parked);
+				if (parked) {
+					atomic_fetch_add(&pool->tasks_completed, count);
+					return;
+				}
+			}
+			ior_threads_pool_finish_res(pool, w, res);
+			count++;
+			if (lt) {
+				ior_threads_pool_finish_res(pool, lt, -ECANCELED);
+				count++;
+			}
+			if (has_link && res < 0) {
+				cancel = 1;
+			}
+			w = after;
+			continue;
+		}
+
 		/*
 		 * Readiness gate: poll ops always wait on the poller. An rw op runs
 		 * at once and parks below if it would block, which needs a descriptor
@@ -897,7 +1016,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		if (gate) {
 			uint32_t mask = opcode == IOR_OP_POLL ? w->sqe.threads.poll_events
 												  : (events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT);
-			int ret = ior_threads_pool_hand_to_poller(pool, w, lt, mask);
+			int ret = ior_threads_pool_hand_to_poller(pool, w, lt, w->sqe.threads.fd, mask);
 			if (ret == 0) {
 				// Ownership of w and its whole chain moved to the poller.
 				atomic_fetch_add(&pool->tasks_completed, count);
@@ -1011,7 +1130,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 			if (events && ior_threads_pool_res_would_block(opcode, cqe.threads.res)
 					&& !ior_threads_pool_rw_nowait(&w->sqe)) {
 				uint32_t mask = events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT;
-				int ret = ior_threads_pool_hand_to_poller(pool, w, lt, mask);
+				int ret = ior_threads_pool_hand_to_poller(pool, w, lt, w->sqe.threads.fd, mask);
 				if (ret == 0) {
 					atomic_fetch_add(&pool->tasks_completed, count);
 					return;

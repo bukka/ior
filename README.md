@@ -20,6 +20,9 @@ The goal is to provide maximum performance on platforms with native async I/O su
   `ior_prep_connect`), readiness-driven on the thread pool and through
   AcceptEx/ConnectEx on Windows
 - Timer/timeout operations
+- Process waits (`ior_prep_waitpid`): a pidfd poll on io_uring, a parked
+  op on the thread pool's poller (pidfd or `EVFILT_PROC`), a threadpool
+  wait on the process handle on Windows
 - Async cancellation of submitted operations (`ior_prep_cancel`,
   `ior_prep_cancel_fd`), with io_uring semantics on every backend
 - A completion notification descriptor (`ior_notify_fd`) for embedding a
@@ -258,6 +261,14 @@ void ior_prep_connect(ior_ctx *ctx, ior_sqe *sqe, int fd,
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
                       unsigned count, unsigned flags);
 
+// Wait for a process like waitpid(2): completes with its pid, the wait
+// status in *status (the exit code on Windows), or -ECHILD. A wait for one
+// child with no options occupies no thread and is cancellable; -1, a
+// process group, WUNTRACED/WCONTINUED block a worker until waitpid returns
+// (a cancel then reports -EALREADY). Windows takes only pid > 0.
+int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status,
+                     int options);
+
 // Splice operation (Linux only)
 void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in,
                      int fd_out, uint64_t off_out, unsigned nbytes, unsigned flags);
@@ -347,7 +358,8 @@ The thread pool backend uses:
   read/write/send/recv on pollable descriptors, so workers never block on a
   socket, non-blocking descriptors never spin on `EAGAIN`, and pending
   operations stay cancellable. Descriptors it cannot ask for a non-blocking
-  attempt per call are put in non-blocking mode (see below)
+  attempt per call are put in non-blocking mode (see below). It also parks
+  a wait for one child there (a pidfd on Linux, `EVFILT_PROC` on kqueue)
 - Operation chaining with `IOR_SQE_IO_LINK` flag
 - Ordering guarantees with `IOR_SQE_IO_DRAIN` flag
 - eventfd (Linux/FreeBSD 13+) or pipe-based notification

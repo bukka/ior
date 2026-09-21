@@ -67,6 +67,7 @@ typedef struct ior_work {
 	_Atomic int state; // IOR_WORK_*
 	int ready; // rw op: the poller reported readiness, skip the probe
 	int connecting; // connect op: started, the next pass reads SO_ERROR
+	int pidfd; // waitpid op: the pidfd parked on the poller, -1 if none
 	struct ior_work_token *cur_token; // token the running callback observes
 	uint64_t deadline_ns; // link-timeout deadline once computed (0 = none)
 	struct ior_work_token token; // IOR_OP_WORK only: cancellation handle

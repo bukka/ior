@@ -36,6 +36,7 @@ enum {
 	OP_SEND_RESP = 2,
 	OP_RECV_RESP = 3,
 	OP_LINK_TIMEOUT = 4,
+	OP_WAIT = 5, /* --waits: a process wait pending for the whole run (conn = sleeper) */
 	OP_NONE = 7, /* sentinel: no pending action (fits OP_KIND_MASK, never tagged) */
 	OP_KIND_BITS = 3,
 	OP_KIND_MASK = (1u << OP_KIND_BITS) - 1,
@@ -77,6 +78,9 @@ typedef struct sock_ctx {
 	uint32_t *ready; /* queue of connection indices with a pending action */
 	uint32_t ready_count;
 	int draining;
+	bench_sleeper *sleepers; /* --waits children, one pending WAITPID each */
+	uint32_t nsleepers;
+	uint32_t waits_pending; /* their ops not yet reaped (outside inflight) */
 } sock_ctx;
 
 /* Queue a connection's next action to be issued during the refill phase. */
@@ -173,6 +177,15 @@ static void harvest_one(sock_ctx *s, ior_cqe *cqe)
 	int32_t res = ior_cqe_get_res(s->ior, cqe);
 	uint32_t ci = tag_conn(data);
 	unsigned kind = tag_kind(data);
+
+	if (kind == OP_WAIT) {
+		/* Only once its child was killed at the end: the pid, or an error. */
+		if (res != (int32_t) s->sleepers[ci].pid) {
+			bench_metrics_error(s->m);
+		}
+		s->waits_pending--;
+		return;
+	}
 	conn *c = &s->conns[ci];
 
 	s->inflight--;
@@ -283,6 +296,66 @@ static int run_loop(sock_ctx *s)
 	return 0;
 }
 
+/*
+ * --waits: start the sleeping children and leave a process wait pending on
+ * each for the whole run. They are not part of inflight, so the run's drain
+ * ignores them.
+ */
+static int start_waits(sock_ctx *s)
+{
+	uint32_t n = s->opts->waits;
+	if (n == 0) {
+		return 0;
+	}
+	s->sleepers = calloc(n, sizeof(*s->sleepers));
+	if (!s->sleepers) {
+		return -ENOMEM;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (bench_spawn_sleeper(&s->sleepers[i]) < 0) {
+			return -EIO;
+		}
+		s->nsleepers++;
+		ior_sqe *sqe = ior_get_sqe(s->ior);
+		if (!sqe) {
+			ior_submit(s->ior);
+			sqe = ior_get_sqe(s->ior);
+		}
+		if (!sqe || ior_prep_waitpid(s->ior, sqe, s->sleepers[i].pid, NULL, 0) < 0) {
+			return -EIO;
+		}
+		ior_sqe_set_data(s->ior, sqe, make_tag(i, OP_WAIT));
+		s->waits_pending++;
+	}
+	return ior_submit(s->ior) < 0 ? -EIO : 0;
+}
+
+/* Kill the children and reap their waits, checking each reports its pid. */
+static void stop_waits(sock_ctx *s)
+{
+	for (uint32_t i = 0; i < s->nsleepers; i++) {
+		bench_kill_sleeper(&s->sleepers[i]);
+	}
+	while (s->waits_pending > 0) {
+		ior_cqe *cqe = NULL;
+		int ret = ior_wait_cqe(s->ior, &cqe);
+		if (ret == -EAGAIN || ret == -EINTR) {
+			continue;
+		}
+		if (ret < 0) {
+			break;
+		}
+		harvest_one(s, cqe);
+		ior_cqe_seen(s->ior, cqe);
+	}
+	for (uint32_t i = 0; i < s->nsleepers; i++) {
+		bench_close_sleeper(&s->sleepers[i]);
+	}
+	free(s->sleepers);
+	s->sleepers = NULL;
+	s->nsleepers = 0;
+}
+
 int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **backend_name_out)
 {
 	int ret = 0;
@@ -350,6 +423,11 @@ int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **b
 		goto out;
 	}
 
+	ret = start_waits(&s);
+	if (ret < 0) {
+		goto out;
+	}
+
 	bench_metrics_start(m);
 	/* Each connection starts a round trip; run_loop's refill issues them. */
 	for (uint32_t i = 0; i < s.nconns; i++) {
@@ -361,6 +439,9 @@ int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **b
 	}
 
 out:
+	if (s.sleepers) {
+		stop_waits(&s);
+	}
 	if (s.conns) {
 		for (uint32_t i = 0; i < s.nconns; i++) {
 			bench_close_fd(s.conns[i].server);

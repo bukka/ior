@@ -77,6 +77,7 @@ enum {
 	IOCP_OP_WORK, /* work object queued on the threadpool, callback not started */
 	IOCP_OP_WORK_RUNNING, /* callback executing */
 	IOCP_OP_POLL, /* registered with the poller */
+	IOCP_OP_WAIT, /* threadpool wait registered on a process handle */
 	IOCP_OP_DONE,
 };
 
@@ -158,6 +159,14 @@ typedef struct ior_iocp_op {
 	// IOR_OP_ASYNC_CANCEL: what to match (user data, or fd with IOR_CANCEL_BY_FD).
 	uint64_t cancel_key;
 	uint32_t cancel_flags;
+
+	// IOR_OP_WAITPID: the process handle opened for the pid, the threadpool
+	// wait registered on it (closed by the consumer once the op completes),
+	// and where the exit code goes.
+	DWORD wait_pid;
+	int *wait_status;
+	HANDLE proc_handle;
+	PTP_WAIT tp_wait;
 
 	// Overlapped I/O: the handle's cancel_gen and epoch when this request was
 	// issued.
@@ -639,6 +648,10 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->tp_work = NULL;
 	op->cancel_key = 0;
 	op->cancel_flags = 0;
+	op->wait_pid = 0;
+	op->wait_status = NULL;
+	op->proc_handle = NULL;
+	op->tp_wait = NULL;
 	op->io_cancel_gen = 0;
 	op->io_epoch = 0;
 	op->accept_sock = INVALID_SOCKET;
@@ -662,6 +675,13 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	if (op->accept_sock != INVALID_SOCKET) {
 		closesocket(op->accept_sock);
 		op->accept_sock = INVALID_SOCKET;
+	}
+	// A process wait's handle outlives its completion only until here. The
+	// wait object is the consumer's to close (or the cleanup group's at
+	// teardown), like tp_work.
+	if (op->proc_handle) {
+		CloseHandle(op->proc_handle);
+		op->proc_handle = NULL;
 	}
 
 	atomic_store(&op->state, IOCP_OP_FREE);
@@ -1288,6 +1308,103 @@ static int issue_work(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	return 0;
 }
 
+/*
+ * ================= IOR_OP_WAITPID support =================
+ *
+ * A threadpool wait on the process handle (the same private pool as work
+ * ops) fires once the process exits; the callback collects the exit code
+ * and posts the completion. The state arbitrates between the callback and
+ * a cancel (an async cancel, a fired link timeout, or teardown): whichever
+ * moves IOCP_OP_WAIT on owns the completion.
+ */
+
+static VOID CALLBACK ior_iocp_wait_callback(
+		PTP_CALLBACK_INSTANCE instance, PVOID param, PTP_WAIT wait, TP_WAIT_RESULT result)
+{
+	(void) instance;
+	(void) wait;
+	(void) result; // an INFINITE wait only ever reports WAIT_OBJECT_0
+	ior_iocp_op *op = param;
+
+	int expected = IOCP_OP_WAIT;
+	if (!atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_DONE)) {
+		return; // cancelled: whoever claimed it completes it
+	}
+
+	DWORD err = ERROR_SUCCESS;
+	DWORD code = 0;
+	if (!GetExitCodeProcess(op->proc_handle, &code)) {
+		err = GetLastError();
+	} else if (op->wait_status) {
+		*op->wait_status = (int) code;
+	}
+	op->work_res = (int32_t) op->wait_pid;
+	post_armed_op(op->work_owner, op, err);
+}
+
+static int issue_waitpid(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	// Only one process can be named: there is no "any child" here.
+	if ((int32_t) op->wait_pid <= 0) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+	}
+	if (iocp_work_ensure(ctx) < 0) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
+	}
+
+	HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, op->wait_pid);
+	if (!h) {
+		DWORD err = GetLastError();
+		if (err == ERROR_INVALID_PARAMETER) {
+			// No such process: what waitpid says of a pid that is no child.
+			op->work_res = -ECHILD;
+			return post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+		}
+		return post_synthetic_completion(ctx, op, err, 0);
+	}
+	op->proc_handle = h;
+	op->work_owner = ctx;
+
+	op->tp_wait = CreateThreadpoolWait(ior_iocp_wait_callback, op, &ctx->work_env);
+	if (!op->tp_wait) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
+	}
+
+	// Reserve the active_count slot up front, like issue_work: the callback
+	// completes the op from another thread.
+	atomic_fetch_add(&ctx->active_count, 1);
+	atomic_store(&op->state, IOCP_OP_WAIT);
+
+	// The state is claimable for a moment before the wait is armed, and
+	// nothing claims it there: cancels run on the submitting thread, a link
+	// timeout is armed only after this returns, teardown runs on the caller's
+	// thread. Once armed the op is no longer ours to look at - a process
+	// that has already exited fires the callback at once, which completes
+	// the op, and a reaper may then close the wait object and recycle the
+	// op before a check here could read it.
+	SetThreadpoolWait(op->tp_wait, h, NULL);
+	return 0;
+}
+
+/*
+ * Take a registered process wait away from the threadpool: claim it (a
+ * callback being dispatched right now then returns without touching the
+ * op), withdraw the wait and let a running callback finish, and complete
+ * the op as aborted. Returns false when the callback claimed it first: it
+ * is completing with its real result.
+ */
+static bool iocp_waitpid_abort(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	int expected = IOCP_OP_WAIT;
+	if (!atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_DONE)) {
+		return false;
+	}
+	SetThreadpoolWait(op->tp_wait, NULL, NULL);
+	WaitForThreadpoolWaitCallbacks(op->tp_wait, TRUE);
+	post_armed_op(ctx, op, ERROR_OPERATION_ABORTED);
+	return true;
+}
+
 /* ================= IOR_OP_POLL support ================= */
 
 static SHORT ior_poll_mask_to_wsa(uint32_t ior_mask)
@@ -1569,9 +1686,9 @@ static void op_to_cqe(ior_iocp_op *op)
 	if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
 	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL
-			|| op->opcode == IOR_OP_ASYNC_CANCEL) {
-		// The callback's return value (ready poll mask, cancel result), not
-		// a byte count.
+			|| op->opcode == IOR_OP_ASYNC_CANCEL || op->opcode == IOR_OP_WAITPID) {
+		// The callback's return value (ready poll mask, cancel result, the
+		// waited pid), not a byte count.
 		op->cqe.iocp.res = op->work_res;
 	} else if (op->opcode == IOR_OP_ACCEPT) {
 		// The accepted socket, now the caller's (handles fit in 32 bits).
@@ -1804,12 +1921,15 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			 */
 			ior_iocp_op *guarded = op->guarded;
 			// Work and poll ops have no OVERLAPPED I/O to cancel: flag their
-			// token instead (the poller drops a flagged op once woken).
+			// token instead (the poller drops a flagged op once woken). A
+			// process wait is withdrawn from the threadpool below, outside
+			// the lock: its abort posts the guarded op's own completion.
 			bool token_cancel = guarded->opcode == IOR_OP_WORK || guarded->opcode == IOR_OP_POLL;
 			bool is_poll = guarded->opcode == IOR_OP_POLL;
+			bool is_wait = guarded->opcode == IOR_OP_WAITPID;
 			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
-			} else {
+			} else if (!is_wait) {
 				// Still under timers.lock: the consumer resolves the pair
 				// under it before the guarded op can be reaped and recycled,
 				// and it judges a collateral abort under it too (see
@@ -1821,6 +1941,9 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			LeaveCriticalSection(&tm->lock);
 			if (is_poll) {
 				iocp_poller_wake(&ctx->poller);
+			}
+			if (is_wait) {
+				(void) iocp_waitpid_abort(ctx, guarded);
 			}
 			post_armed_op(ctx, op, ERROR_TIMEOUT);
 			EnterCriticalSection(&tm->lock);
@@ -2079,6 +2202,9 @@ static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			atomic_store_explicit(&op->token.cancelled, 1, memory_order_release);
 			iocp_poller_wake(&ctx->poller);
 			return 0;
+
+		case IOCP_OP_WAIT:
+			return iocp_waitpid_abort(ctx, op) ? 0 : -ENOENT;
 
 		default:
 			return -ENOENT;
@@ -2344,6 +2470,11 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			ret = issue_poll(ctx, op);
 			break;
 
+		case IOR_OP_WAITPID:
+			// The timer thread withdraws a guarded wait at its deadline.
+			ret = issue_waitpid(ctx, op);
+			break;
+
 		case IOR_OP_TIMER:
 			return arm_timer(ctx, op);
 
@@ -2526,15 +2657,9 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	 * the IOCP and are reclaimed by the drain loop below.
 	 */
 	atomic_store(&ctx->shutdown, 1);
-	if (ctx->work_pool) {
-		CloseThreadpoolCleanupGroupMembers(ctx->work_cleanup, FALSE, NULL);
-		CloseThreadpoolCleanupGroup(ctx->work_cleanup);
-		DestroyThreadpoolEnvironment(&ctx->work_env);
-		CloseThreadpool(ctx->work_pool);
-		ctx->work_pool = NULL;
-	}
 
-	// Stop timer thread
+	// Stop the timer thread first: it withdraws process waits at their
+	// deadlines, which must not race the teardown of the wait objects below.
 	atomic_store(&ctx->timers.stop, 1);
 	EnterCriticalSection(&ctx->timers.lock);
 	WakeConditionVariable(&ctx->timers.cv);
@@ -2542,6 +2667,26 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 
 	WaitForSingleObject(ctx->timers.thread, INFINITE);
 	CloseHandle(ctx->timers.thread);
+
+	if (ctx->work_pool) {
+		/*
+		 * Process waits next, while their wait objects still exist: a
+		 * process that never exits would otherwise keep its slot counted
+		 * and the drain below waiting. Each abort posts -ECANCELED (a
+		 * callback that wins the race posts the real result instead).
+		 */
+		for (uint32_t i = 0; i < ctx->pool_size; i++) {
+			ior_iocp_op *op = &ctx->op_pool[i];
+			if (atomic_load(&op->state) == IOCP_OP_WAIT) {
+				(void) iocp_waitpid_abort(ctx, op);
+			}
+		}
+		CloseThreadpoolCleanupGroupMembers(ctx->work_cleanup, FALSE, NULL);
+		CloseThreadpoolCleanupGroup(ctx->work_cleanup);
+		DestroyThreadpoolEnvironment(&ctx->work_env);
+		CloseThreadpool(ctx->work_pool);
+		ctx->work_pool = NULL;
+	}
 
 	/*
 	 * Stop the poller thread (after the timer thread, which may still wake it
@@ -3071,6 +3216,11 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		CloseThreadpoolWork(op->tp_work);
 		op->tp_work = NULL;
 	}
+	if (op->tp_wait) {
+		// Likewise for a process wait; the process handle goes with the op.
+		CloseThreadpoolWait(op->tp_wait);
+		op->tp_wait = NULL;
+	}
 
 #ifndef NDEBUG
 	uint32_t prev_active = atomic_fetch_sub(&ctx->active_count, 1);
@@ -3532,6 +3682,20 @@ static void ior_iocp_backend_prep_connect(
 	op->sa_len_val = addrlen;
 }
 
+static int ior_iocp_backend_prep_waitpid(
+		void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
+{
+	(void) backend_ctx;
+	(void) options; // no WNOHANG or job control here
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_WAITPID;
+	op->fd = NULL;
+	op->wait_pid = pid;
+	op->wait_status = status;
+	return 0;
+}
+
 static void ior_iocp_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
 {
 	ior_iocp_op *op = (ior_iocp_op *) sqe;
@@ -3669,6 +3833,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_connect = ior_iocp_backend_prep_connect,
 	.prep_cancel = ior_iocp_backend_prep_cancel,
 	.prep_cancel_fd = ior_iocp_backend_prep_cancel_fd,
+	.prep_waitpid = ior_iocp_backend_prep_waitpid,
 	.prep_work = ior_iocp_backend_prep_work,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,
 	.sqe_set_flags = ior_iocp_backend_sqe_set_flags,

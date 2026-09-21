@@ -109,6 +109,25 @@ void bench_close_fd(ior_fd_t fd);
 int bench_fd_is_valid(ior_fd_t fd);
 
 /*
+ * A child process that sleeps until killed, for --waits: a forked child in
+ * pause() on POSIX, this program re-run with --sleeper on Windows (where the
+ * process handle also keeps the pid from being recycled). The kill leaves
+ * reaping to the IOR_OP_WAITPID op waiting on it; close releases the handle
+ * once that completed.
+ */
+typedef struct bench_sleeper {
+	ior_pid_t pid;
+	uintptr_t handle;
+} bench_sleeper;
+
+int bench_spawn_sleeper(bench_sleeper *sl);
+void bench_kill_sleeper(const bench_sleeper *sl);
+void bench_close_sleeper(bench_sleeper *sl);
+
+/* The --sleeper side: never returns. */
+void bench_sleep_forever(void);
+
+/*
  * Wait up to timeout_ms for a descriptor from ior_notify_fd() to become
  * readable (poll() on POSIX, WSAPoll() on Windows). Returns 1 if readable, 0
  * on timeout, negative errno on error.

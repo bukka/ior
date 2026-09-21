@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,37 @@ uint64_t bench_now_ns(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+int bench_spawn_sleeper(bench_sleeper *sl)
+{
+	pid_t pid = fork();
+	if (pid < 0) {
+		return -errno;
+	}
+	if (pid == 0) {
+		bench_sleep_forever();
+	}
+	sl->pid = pid;
+	sl->handle = 0;
+	return 0;
+}
+
+void bench_kill_sleeper(const bench_sleeper *sl)
+{
+	kill(sl->pid, SIGKILL);
+}
+
+void bench_close_sleeper(bench_sleeper *sl)
+{
+	(void) sl;
+}
+
+void bench_sleep_forever(void)
+{
+	for (;;) {
+		pause();
+	}
 }
 
 int bench_fd_is_valid(ior_fd_t fd)

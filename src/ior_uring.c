@@ -14,9 +14,15 @@
 #include <poll.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#ifdef IOR_HAVE_PIDFD_OPEN
+#include <sys/syscall.h>
+#endif
 #include <liburing.h>
 
 typedef struct ior_uring_job ior_uring_job;
+typedef struct ior_uring_wait ior_uring_wait;
 
 /* Backend context */
 typedef struct ior_ctx_uring {
@@ -34,6 +40,13 @@ typedef struct ior_ctx_uring {
 	_Atomic int shutdown; // lets running callbacks observe teardown via token
 	pthread_mutex_t poster_lock; // serializes msg_ring posters
 	struct io_uring poster; // side ring, valid when wp != NULL
+	/*
+	 * Released by every msg_ring post and acquired by every reap: what a
+	 * worker wrote before posting (a callback's output, a wait status) is
+	 * ordered before the caller's reading of the CQE. The kernel path gives
+	 * that in practice; this states it in C, where sanitizers can see it.
+	 */
+	_Atomic uint64_t posted;
 	ior_uring_job *pending_head; // prepped-not-dispatched jobs (submitter thread only)
 	ior_uring_job *pending_tail;
 
@@ -45,8 +58,32 @@ typedef struct ior_ctx_uring {
 	pthread_mutex_t jobs_lock;
 	ior_uring_job *jobs_head; // doubly linked via live_next/live_prev
 
+	/*
+	 * IOR_OP_WAITPID on one running child: a POLL_ADD on its pidfd whose
+	 * kernel user_data is the wait record, so its CQE can be told apart on
+	 * the way out and rewritten into the waitpid result (see
+	 * ior_uring_resolve_waits). Records are prepped on waits_pending and
+	 * moved into waits_live at submit: lists hashed by the record's address,
+	 * since every reaped CQE is looked up there while any wait is live.
+	 * Shared with the reaping thread and with cancel interception, under
+	 * jobs_lock; the count lets a reap skip the lock when nothing is live.
+	 */
+	ior_uring_wait *waits_pending;
+	ior_uring_wait *waits_live[64];
+	_Atomic uint32_t waits_live_count;
+
 	int notify_fd; // eventfd registered with the ring; -1 until requested
 } ior_ctx_uring;
+
+struct ior_uring_wait {
+	ior_uring_wait *next;
+	ior_uring_wait *prev; // live lists only
+	int pidfd;
+	pid_t pid;
+	int *status;
+	uint64_t user_data; // the caller's, harvested at submit
+	struct io_uring_sqe *ksqe; // the POLL_ADD; valid only until submit
+};
 
 /*
  * Lifecycle/arbitration state of one work op. QUEUED -> RUNNING -> DONE is the
@@ -81,10 +118,22 @@ struct ior_uring_job {
 	uint64_t lt_user_data;
 	_Atomic int lt_fired;
 
+	// IOR_OP_WAITPID run as a job: a worker's waitpid(2).
+	pid_t wait_pid;
+	int *wait_status;
+	int wait_options;
+
 	struct ior_work_token token;
 	_Atomic int state;
 	_Atomic int refs;
 };
+
+// The live list a wait record keyed by `key` (its address) belongs to.
+static ior_uring_wait **ior_uring_wait_bucket(ior_ctx_uring *ctx, uint64_t key)
+{
+	size_t n = sizeof(ctx->waits_live) / sizeof(ctx->waits_live[0]);
+	return &ctx->waits_live[((key >> 6) ^ (key >> 14)) & (n - 1)];
+}
 
 // jobs_lock held.
 static void ior_uring_job_unlink_locked(ior_ctx_uring *ctx, ior_uring_job *job)
@@ -135,6 +184,7 @@ static void ior_uring_post_cqe(ior_ctx_uring *ctx, uint64_t user_data, int32_t r
 	io_uring_prep_msg_ring(s, ctx->ring.ring_fd, (unsigned int) res, user_data, 0);
 	s->flags |= IOSQE_CQE_SKIP_SUCCESS;
 
+	atomic_fetch_add_explicit(&ctx->posted, 1, memory_order_release);
 	int ret = io_uring_submit(&ctx->poster);
 	if (ret < 0) {
 		IOR_LOG_ERROR("msg_ring submit failed: %d", -errno);
@@ -231,6 +281,101 @@ static int ior_uring_work_ensure(ior_ctx_uring *ctx)
 }
 
 /*
+ * Publish prepped pidfd waits: harvest the user data the caller attached and
+ * key the kernel op by the record instead, so its completion is recognised
+ * whatever user data the caller uses elsewhere.
+ */
+static void ior_uring_dispatch_waits(ior_ctx_uring *ctx)
+{
+	ior_uring_wait *wait = ctx->waits_pending;
+	if (!wait) {
+		return;
+	}
+	ctx->waits_pending = NULL;
+
+	pthread_mutex_lock(&ctx->jobs_lock);
+	while (wait) {
+		ior_uring_wait *next = wait->next;
+		wait->user_data = wait->ksqe->user_data;
+		wait->ksqe->user_data = (uint64_t) (uintptr_t) wait;
+		wait->ksqe = NULL;
+
+		ior_uring_wait **head = ior_uring_wait_bucket(ctx, (uint64_t) (uintptr_t) wait);
+		wait->prev = NULL;
+		wait->next = *head;
+		if (*head) {
+			(*head)->prev = wait;
+		}
+		*head = wait;
+		atomic_fetch_add(&ctx->waits_live_count, 1);
+		wait = next;
+	}
+	pthread_mutex_unlock(&ctx->jobs_lock);
+}
+
+// jobs_lock held.
+static void ior_uring_wait_unlink_locked(ior_ctx_uring *ctx, ior_uring_wait *wait)
+{
+	if (wait->prev) {
+		wait->prev->next = wait->next;
+	} else {
+		*ior_uring_wait_bucket(ctx, (uint64_t) (uintptr_t) wait) = wait->next;
+	}
+	if (wait->next) {
+		wait->next->prev = wait->prev;
+	}
+	atomic_fetch_sub(&ctx->waits_live_count, 1);
+}
+
+/*
+ * Turn the completions of pidfd polls among cqes[] into waitpid results, in
+ * place (the CQ ring is mapped writable and the kernel never reads a CQE
+ * back): a readable pidfd means the child exited, so waitpid(2) collects
+ * its state now, on the reaping thread; a failed or cancelled poll keeps
+ * its error. The caller's user data is restored either way and the record
+ * retired, so seeing the same CQE again finds nothing to do.
+ */
+static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, unsigned n)
+{
+	pthread_mutex_lock(&ctx->jobs_lock);
+	for (unsigned i = 0;
+			i < n && atomic_load_explicit(&ctx->waits_live_count, memory_order_relaxed); i++) {
+		struct io_uring_cqe *cqe = cqes[i];
+		ior_uring_wait *wait = *ior_uring_wait_bucket(ctx, cqe->user_data);
+		while (wait && (uint64_t) (uintptr_t) wait != cqe->user_data) {
+			wait = wait->next;
+		}
+		if (!wait) {
+			continue;
+		}
+		int32_t res = cqe->res;
+		if (res >= 0) {
+			pid_t r = waitpid(wait->pid, wait->status, WNOHANG);
+			res = r < 0 ? -errno : r;
+		}
+		close(wait->pidfd);
+		cqe->user_data = wait->user_data;
+		cqe->res = res;
+		ior_uring_wait_unlink_locked(ctx, wait);
+		free(wait);
+	}
+	pthread_mutex_unlock(&ctx->jobs_lock);
+}
+
+/*
+ * Post-process CQEs about to be handed to the caller: pair with the
+ * posters' release (see `posted`) and turn pidfd poll completions into
+ * waitpid results.
+ */
+static void ior_uring_reaped(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, unsigned n)
+{
+	(void) atomic_load_explicit(&ctx->posted, memory_order_acquire);
+	if (atomic_load_explicit(&ctx->waits_live_count, memory_order_relaxed)) {
+		ior_uring_resolve_waits(ctx, cqes, n);
+	}
+}
+
+/*
  * Hand all prepped work jobs to the pool. Called from submit paths before
  * io_uring_submit() flushes the SQ, while each job's placeholder NOP is still
  * staged: the user may have attached user_data or flags after prep_work, so
@@ -241,6 +386,8 @@ static int ior_uring_work_ensure(ior_ctx_uring *ctx)
  */
 static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 {
+	ior_uring_dispatch_waits(ctx);
+
 	ior_uring_job *job = ctx->pending_head;
 	if (!job) {
 		return;
@@ -408,6 +555,23 @@ static void ior_uring_intercept_cancels(ior_ctx_uring *ctx)
 				break;
 			}
 		}
+		if (ret == -ENOENT) {
+			// A pidfd wait is a kernel op under its record's key: retarget
+			// the cancel and let the kernel resolve it.
+			size_t nb = sizeof(ctx->waits_live) / sizeof(ctx->waits_live[0]);
+			ior_uring_wait *found = NULL;
+			for (size_t b = 0; b < nb && !found; b++) {
+				for (ior_uring_wait *wait = ctx->waits_live[b]; wait; wait = wait->next) {
+					if (wait->user_data == key) {
+						found = wait;
+						break;
+					}
+				}
+			}
+			if (found) {
+				s->addr = (uint64_t) (uintptr_t) found;
+			}
+		}
 		pthread_mutex_unlock(&ctx->jobs_lock);
 
 		// Drop the refs of jobs that will never be run or timed now.
@@ -448,6 +612,8 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	ctx->flags = params->flags;
 	ctx->notify_fd = -1;
 	atomic_init(&ctx->shutdown, 0);
+	atomic_init(&ctx->posted, 0);
+	atomic_init(&ctx->waits_live_count, 0);
 
 	if (pthread_mutex_init(&ctx->poster_lock, NULL) != 0) {
 		free(ctx);
@@ -531,6 +697,24 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 		job = next;
 	}
 
+	// Pidfd waits, submitted or not: their completions are never reaped.
+	ior_uring_wait *wait = ctx->waits_pending;
+	while (wait) {
+		ior_uring_wait *next = wait->next;
+		close(wait->pidfd);
+		free(wait);
+		wait = next;
+	}
+	for (size_t b = 0; b < sizeof(ctx->waits_live) / sizeof(ctx->waits_live[0]); b++) {
+		wait = ctx->waits_live[b];
+		while (wait) {
+			ior_uring_wait *next = wait->next;
+			close(wait->pidfd);
+			free(wait);
+			wait = next;
+		}
+	}
+
 	if (ctx->notify_fd >= 0) {
 		io_uring_unregister_eventfd(&ctx->ring);
 		close(ctx->notify_fd);
@@ -562,10 +746,11 @@ static int ior_uring_backend_submit(void *backend_ctx)
 	}
 
 	ior_ctx_uring *ctx = backend_ctx;
-	// Work jobs must be harvested while their placeholder SQEs are still
-	// staged; cancels then see the jobs submitted just before them.
+	// Work jobs and pidfd waits must be harvested while their placeholder
+	// SQEs are still staged; cancels then see the ops submitted just before
+	// them.
 	ior_uring_dispatch_pending(ctx);
-	if (ctx->wp) {
+	if (ctx->wp || atomic_load(&ctx->waits_live_count)) {
 		ior_uring_intercept_cancels(ctx);
 	}
 	int ret = io_uring_submit(&ctx->ring);
@@ -581,7 +766,7 @@ static int ior_uring_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr
 	ior_ctx_uring *ctx = backend_ctx;
 	// See ior_uring_backend_submit.
 	ior_uring_dispatch_pending(ctx);
-	if (ctx->wp) {
+	if (ctx->wp || atomic_load(&ctx->waits_live_count)) {
 		ior_uring_intercept_cancels(ctx);
 	}
 	int ret = io_uring_submit_and_wait(&ctx->ring, wait_nr);
@@ -602,6 +787,7 @@ static int ior_uring_backend_peek_cqe(void *backend_ctx, ior_cqe **cqe_out)
 		return ret;
 	}
 
+	ior_uring_reaped(ctx, &cqe, 1);
 	*cqe_out = (ior_cqe *) cqe;
 	return 0;
 }
@@ -620,6 +806,7 @@ static int ior_uring_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 		return ret;
 	}
 
+	ior_uring_reaped(ctx, &cqe, 1);
 	*cqe_out = (ior_cqe *) cqe;
 	return 0;
 }
@@ -640,6 +827,7 @@ static int ior_uring_backend_wait_cqe_timeout(
 		return ret;
 	}
 
+	ior_uring_reaped(ctx, &cqe, 1);
 	*cqe_out = (ior_cqe *) cqe;
 	return 0;
 }
@@ -662,7 +850,11 @@ static unsigned ior_uring_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cq
 
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe **uring_cqes = (struct io_uring_cqe **) cqes;
-	return io_uring_peek_batch_cqe(&ctx->ring, uring_cqes, max);
+	unsigned n = io_uring_peek_batch_cqe(&ctx->ring, uring_cqes, max);
+	if (n) {
+		ior_uring_reaped(ctx, uring_cqes, n);
+	}
+	return n;
 }
 
 static void ior_uring_backend_cq_advance(void *backend_ctx, unsigned nr)
@@ -794,10 +986,16 @@ static void ior_uring_backend_prep_cancel_fd(ior_sqe *sqe, ior_fd_t fd)
 	io_uring_prep_cancel_fd(s, (int) fd, 0);
 }
 
-static int ior_uring_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
+/*
+ * Prep a job that runs fn(arg) on the worker pool. The kernel never
+ * executes the callback; its SQE becomes a placeholder NOP whose successful
+ * completion is skipped, keeping SQ accounting (and the submit() return
+ * count) consistent. The job itself is dispatched to the worker pool when
+ * submit() flushes the queue.
+ */
+static int ior_uring_job_new(
+		ior_ctx_uring *ctx, struct io_uring_sqe *s, ior_work_fn fn, void *arg, ior_uring_job **out)
 {
-	ior_ctx_uring *ctx = backend_ctx;
-
 	int ret = ior_uring_work_ensure(ctx);
 	if (ret < 0) {
 		return ret;
@@ -808,13 +1006,6 @@ static int ior_uring_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work
 		return -ENOMEM;
 	}
 
-	/*
-	 * The kernel never executes the callback; its SQE becomes a placeholder
-	 * NOP whose successful completion is skipped, keeping SQ accounting (and
-	 * the submit() return count) consistent. The job itself is dispatched to
-	 * the worker pool when submit() flushes the queue.
-	 */
-	struct io_uring_sqe *s = &sqe->uring.sqe;
 	io_uring_prep_nop(s);
 	s->flags |= IOSQE_CQE_SKIP_SUCCESS;
 
@@ -836,6 +1027,81 @@ static int ior_uring_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work
 	}
 	ctx->pending_tail = job;
 
+	*out = job;
+	return 0;
+}
+
+static int ior_uring_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg)
+{
+	ior_uring_job *job;
+	return ior_uring_job_new(backend_ctx, &sqe->uring.sqe, fn, arg, &job);
+}
+
+// A worker's waitpid(2), for what a pidfd poll cannot express.
+static int32_t ior_uring_waitpid_job(ior_work_token *token, void *arg)
+{
+	(void) token;
+	ior_uring_job *job = arg;
+	pid_t r;
+	do {
+		r = waitpid(job->wait_pid, job->wait_status, job->wait_options);
+	} while (r < 0 && errno == EINTR);
+	return r < 0 ? -errno : r;
+}
+
+/*
+ * One child with nothing else asked gets a pidfd poll, which ties up no
+ * thread and cancels natively; anything else (any child, a group, WNOHANG,
+ * job control, no pidfd) is a worker's waitpid. Nothing is consumed here:
+ * prep has no completion to carry an answer, and an op that is never
+ * submitted, or fails to prep, must leave the child as it found it.
+ */
+static int ior_uring_backend_prep_waitpid(
+		void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
+{
+	ior_ctx_uring *ctx = backend_ctx;
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+
+#ifdef IOR_HAVE_PIDFD_OPEN
+	if (pid > 0 && options == 0) {
+		/*
+		 * Is it a child at all? pidfd_open watches any process, and a poll
+		 * on one that is nobody's child would never answer -ECHILD; asked
+		 * with WNOWAIT the question reaps nothing, so an exited child stays
+		 * collectable (its pidfd is readable at once).
+		 */
+		siginfo_t info;
+		memset(&info, 0, sizeof(info));
+		int pidfd = waitid(P_PID, (id_t) pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0
+				? (int) syscall(SYS_pidfd_open, pid, 0)
+				: -1;
+		if (pidfd >= 0) {
+			ior_uring_wait *wait = calloc(1, sizeof(*wait));
+			if (!wait) {
+				close(pidfd);
+				return -ENOMEM;
+			}
+			wait->pidfd = pidfd;
+			wait->pid = pid;
+			wait->status = status;
+			wait->ksqe = s;
+			io_uring_prep_poll_add(s, pidfd, POLLIN);
+			wait->next = ctx->waits_pending;
+			ctx->waits_pending = wait;
+			return 0;
+		}
+	}
+#endif
+
+	ior_uring_job *job;
+	int ret = ior_uring_job_new(ctx, s, ior_uring_waitpid_job, NULL, &job);
+	if (ret < 0) {
+		return ret;
+	}
+	job->arg = job;
+	job->wait_pid = pid;
+	job->wait_status = status;
+	job->wait_options = options;
 	return 0;
 }
 
@@ -980,6 +1246,7 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_connect = ior_uring_backend_prep_connect,
 	.prep_cancel = ior_uring_backend_prep_cancel,
 	.prep_cancel_fd = ior_uring_backend_prep_cancel_fd,
+	.prep_waitpid = ior_uring_backend_prep_waitpid,
 	.prep_work = ior_uring_backend_prep_work,
 	.sqe_set_data = ior_uring_backend_sqe_set_data,
 	.sqe_set_flags = ior_uring_backend_sqe_set_flags,

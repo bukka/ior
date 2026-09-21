@@ -56,7 +56,9 @@ static void usage(const char *prog)
 	printf("  --workspace DIR    directory for temp files (default platform tmp/ior)\n");
 	printf("  --sq-entries N     submission queue size hint\n");
 	printf("  --notify           block on ior_notify_fd() readability instead of\n");
-	printf("                     ior_wait_cqe(), reaping with peeks (embedded-loop style)\n\n");
+	printf("                     ior_wait_cqe(), reaping with peeks (embedded-loop style)\n");
+	printf("  --waits N          socket: keep N process waits (ior_prep_waitpid on sleeping\n");
+	printf("                     children) pending for the whole run (default 0)\n\n");
 	printf("Output:\n");
 	printf("  --csv              print machine-readable CSV instead of a table\n");
 	printf("  --help             show this help\n");
@@ -84,6 +86,7 @@ static void defaults(bench_options *o)
 	o->workspace = NULL;
 	o->sq_entries = 0;
 	o->notify = 0;
+	o->waits = 0;
 }
 
 /* Run one scenario, print results, and return the number of correctness errors
@@ -185,6 +188,11 @@ static int run_smoke(void)
 
 int main(int argc, char **argv)
 {
+	/* The child side of --waits (see bench_spawn_sleeper). */
+	if (argc == 2 && strcmp(argv[1], "--sleeper") == 0) {
+		bench_sleep_forever();
+	}
+
 	if (bench_platform_init() < 0) {
 		fprintf(stderr, "platform init failed\n");
 		return 2;
@@ -234,6 +242,8 @@ int main(int argc, char **argv)
 			o.timeout_ms = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--race-pct") == 0) {
 			o.race_pct = (uint32_t) parse_u64(NEXT());
+		} else if (strcmp(a, "--waits") == 0) {
+			o.waits = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--sq-entries") == 0) {
 			o.sq_entries = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--workspace") == 0) {
@@ -284,7 +294,9 @@ int main(int argc, char **argv)
 
 	uint64_t errors = 0;
 	if (strcmp(scenario, "socket") == 0) {
-		const char *label = o.timer_mode == BENCH_TIMER_LINKED ? "timer=linked" : "timer=none";
+		char label[48];
+		snprintf(label, sizeof(label), "timer=%s waits=%u",
+				o.timer_mode == BENCH_TIMER_LINKED ? "linked" : "none", o.waits);
 		errors = run_one(bench_run_socket, "socket", label, &o, csv);
 	} else if (strcmp(scenario, "file") == 0) {
 		errors = run_one(bench_run_file, "file", NULL, &o, csv);

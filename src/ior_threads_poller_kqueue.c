@@ -33,11 +33,13 @@ typedef struct ior_poller_req {
 /*
  * kqueue registers per (fd, filter) pair, so requests are grouped in per-fd
  * nodes and the node tracks which filters are currently registered (`reg`,
- * as IOR_POLL_IN/OUT bits). Plain linked lists: the expected request count
- * is modest.
+ * as IOR_POLL_IN/OUT bits, or IOR_THREADS_POLLER_PROC for a process watch,
+ * whose node is keyed by pid). Plain linked lists: the expected request
+ * count is modest.
  */
 typedef struct ior_poller_fd_node {
 	int fd;
+	int proc; /* fd is a pid watched with EVFILT_PROC */
 	uint32_t reg;
 	ior_poller_req *reqs;
 	struct ior_poller_fd_node *next;
@@ -95,6 +97,41 @@ static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req 
 static void ior_poller_node_sync(
 		ior_threads_poller *poller, ior_poller_fd_node *node, ior_poller_req **done)
 {
+	if (node->proc) {
+		/* One NOTE_EXIT registration serves every request on the pid. A
+		 * process that is already gone (ESRCH) fails them all; the owner
+		 * collects its state with waitpid. */
+		struct kevent kev;
+		if (node->reqs && !(node->reg & IOR_THREADS_POLLER_PROC)) {
+			EV_SET(&kev, node->fd, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, node);
+			if (kevent(poller->kq, &kev, 1, NULL, 0, NULL) == 0) {
+				node->reg |= IOR_THREADS_POLLER_PROC;
+			} else {
+				int err = errno;
+				ior_poller_req *r = node->reqs;
+				node->reqs = NULL;
+				while (r) {
+					ior_poller_req *next = r->next;
+					ior_poller_done_push(done, r, -err);
+					r = next;
+				}
+			}
+		}
+		if (!node->reqs) {
+			if (node->reg & IOR_THREADS_POLLER_PROC) {
+				EV_SET(&kev, node->fd, EVFILT_PROC, EV_DELETE, 0, 0, NULL);
+				(void) kevent(poller->kq, &kev, 1, NULL, 0, NULL);
+			}
+			ior_poller_fd_node **pp = &poller->fds;
+			while (*pp != node) {
+				pp = &(*pp)->next;
+			}
+			*pp = node->next;
+			free(node);
+		}
+		return;
+	}
+
 	for (int pass = 0; pass < 2; pass++) {
 		uint32_t bit = pass == 0 ? IOR_POLL_IN : IOR_POLL_OUT;
 		int16_t filter = pass == 0 ? EVFILT_READ : EVFILT_WRITE;
@@ -159,8 +196,9 @@ static void ior_poller_ingest_one(
 		return;
 	}
 
+	int proc = (r->mask & IOR_THREADS_POLLER_PROC) != 0;
 	ior_poller_fd_node *node = poller->fds;
-	while (node && node->fd != r->fd) {
+	while (node && (node->fd != r->fd || node->proc != proc)) {
 		node = node->next;
 	}
 
@@ -171,6 +209,7 @@ static void ior_poller_ingest_one(
 			return;
 		}
 		node->fd = r->fd;
+		node->proc = proc;
 		node->next = poller->fds;
 		poller->fds = node;
 	}
@@ -256,7 +295,9 @@ static void ior_poller_dispatch(
 	ior_poller_req **pp = &node->reqs;
 	while (*pp) {
 		ior_poller_req *r = *pp;
-		uint32_t res = ready & (r->mask | IOR_POLL_ERR | IOR_POLL_HUP);
+		/* A process watch has one event, exit, which every request on the
+		 * pid is waiting for. */
+		uint32_t res = node->proc ? ready : ready & (r->mask | IOR_POLL_ERR | IOR_POLL_HUP);
 		if (r->cancelled) {
 			*pp = r->next;
 			ior_poller_done_push(done, r, -ECANCELED);
@@ -330,6 +371,8 @@ static void *ior_poller_thread(void *arg)
 			uint32_t ready;
 			if (events[i].flags & EV_ERROR) {
 				ready = IOR_POLL_ERR;
+			} else if (events[i].filter == EVFILT_PROC) {
+				ready = IOR_POLL_IN; /* NOTE_EXIT */
 			} else {
 				ready = events[i].filter == EVFILT_READ ? IOR_POLL_IN : IOR_POLL_OUT;
 				if (events[i].flags & EV_EOF) {

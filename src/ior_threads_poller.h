@@ -19,6 +19,14 @@
 typedef struct ior_threads_poller ior_threads_poller;
 
 /*
+ * Mask bit of a process watch: fd is a pid and the request completes with
+ * IOR_POLL_IN once that process exits. Only the kqueue poller (EVFILT_PROC)
+ * takes it; on Linux a pidfd is polled instead and elsewhere the thread
+ * backend never asks.
+ */
+#define IOR_THREADS_POLLER_PROC (1U << 31)
+
+/*
  * Completion callback, invoked on the poller thread with no poller lock held.
  * res is the ready IOR_POLL_* mask (> 0), -ETIME (deadline reached),
  * -ECANCELED (cancelled or poller shutdown), or another negative errno (e.g.

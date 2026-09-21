@@ -234,6 +234,14 @@ void ior_prep_connect(
 	}
 }
 
+int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
+{
+	if (!ctx || !sqe) {
+		return -EINVAL;
+	}
+	return ctx->ops->prep_waitpid(ctx->backend_ctx, sqe, pid, status, options);
+}
+
 void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data)
 {
 	if (ctx && sqe) {
