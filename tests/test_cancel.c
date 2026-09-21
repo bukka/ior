@@ -18,6 +18,8 @@
 #define TAG_CANCEL2 ((void *) 0x11) // a second cancel in the same batch
 #define TAG_OP2 ((void *) 0x4) // a second target
 #define TAG_TIMER ((void *) 0x5)
+#define TAG_NEW_SEND ((void *) 0x6) // I/O on a socket opened after a close
+#define TAG_NEW_RECV ((void *) 0x7)
 
 typedef struct cancel_state {
 	ior_ctx *ctx;
@@ -380,6 +382,57 @@ static void test_cancel_two_same_socket_batch(void **state)
 	assert_true(res[(uintptr_t) TAG_CANCEL2] == 0 || res[(uintptr_t) TAG_CANCEL2] == -ENOENT);
 	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
 	assert_int_equal(res[(uintptr_t) TAG_OP2], -ECANCELED);
+}
+
+/*
+ * The socket is closed while a cancel's side effects are still queued, and
+ * new sockets are opened at once (on Windows they get the closed handle's
+ * value back). The second recv, which the cancel of the first took down with
+ * it on IOCP, must be reported as cancelled - never replayed onto whatever now
+ * carries that descriptor value - and the new socket's own recv must get its
+ * data.
+ */
+static void test_cancel_then_close_and_reopen(void **state)
+{
+	cancel_state *s = (cancel_state *) *state;
+	char buf[64], buf2[64], nbuf[64];
+	int32_t res[MAX_TAG];
+	char seen[MAX_TAG];
+
+	submit_recv(s, buf, sizeof(buf), TAG_OP, 0);
+	submit_recv(s, buf2, sizeof(buf2), TAG_OP2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	cancel_msleep(20);
+	submit_cancel(s, TAG_OP);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	// Nothing reaped yet: close the socket and open new ones.
+	test_close_fd(s->sock[1]);
+	s->sock[1] = IOR_TEST_INVALID_FD;
+	ior_fd_t fresh[2];
+	assert_return_code(test_make_socketpair(fresh), 0);
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	ior_prep_send(s->ctx, w, fresh[0], "x", 1, 0);
+	ior_sqe_set_data(s->ctx, w, TAG_NEW_SEND);
+	ior_sqe *r = ior_get_sqe(s->ctx);
+	assert_non_null(r);
+	memset(nbuf, 0, sizeof(nbuf));
+	ior_prep_recv(s->ctx, r, fresh[1], nbuf, sizeof(nbuf), 0);
+	ior_sqe_set_data(s->ctx, r, TAG_NEW_RECV);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	reap_tags(s->ctx, 5, res, seen);
+	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	assert_int_equal(res[(uintptr_t) TAG_OP], -ECANCELED);
+	assert_int_equal(res[(uintptr_t) TAG_OP2], -ECANCELED);
+	assert_int_equal(res[(uintptr_t) TAG_NEW_SEND], 1);
+	assert_int_equal(res[(uintptr_t) TAG_NEW_RECV], 1);
+	assert_int_equal(nbuf[0], 'x');
+
+	test_close_fd(fresh[0]);
+	test_close_fd(fresh[1]);
 }
 
 // A cancelled recv on a socket that becomes readable later must not consume
@@ -764,6 +817,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_cancel_fd, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(
 				test_cancel_two_same_socket_batch, setup_cancel, teardown_cancel),
+		cmocka_unit_test_setup_teardown(
+				test_cancel_then_close_and_reopen, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(
 				test_cancel_recv_data_intact, setup_cancel, teardown_cancel),
 		cmocka_unit_test_setup_teardown(test_cancel_work_running, setup_cancel, teardown_cancel),

@@ -47,6 +47,11 @@ typedef struct handle_set_entry {
 	// Bumped before every CancelIoEx() on the handle; see
 	// reissue_collateral_abort() for what it is compared against.
 	uint32_t cancel_gen;
+	// Bumped when the kernel accepts an association for a value already in
+	// the set: proof the caller closed the old object and this value now
+	// names a new one. Ops record it, so an abort of the old object's request
+	// is never replayed onto the new object.
+	uint32_t epoch;
 	struct handle_set_entry *next;
 } handle_set_entry;
 
@@ -154,8 +159,10 @@ typedef struct ior_iocp_op {
 	uint64_t cancel_key;
 	uint32_t cancel_flags;
 
-	// Overlapped I/O: the handle's cancel_gen when this request was issued.
+	// Overlapped I/O: the handle's cancel_gen and epoch when this request was
+	// issued.
 	uint32_t io_cancel_gen;
+	uint32_t io_epoch;
 
 	// IOR_OP_ACCEPT / IOR_OP_CONNECT. AcceptEx needs the accepted socket
 	// created up front and a buffer for both addresses; the user's address
@@ -540,19 +547,10 @@ static handle_set_entry *handle_set_insert_locked(handle_set *set, HANDLE h)
 	}
 	entry->handle = h;
 	entry->cancel_gen = 0;
+	entry->epoch = 0;
 	entry->next = set->buckets[bucket];
 	set->buckets[bucket] = entry;
 	return entry;
-}
-
-/* Current cancel generation of an associated handle (0 if never associated). */
-static uint32_t handle_cancel_gen(ior_ctx_iocp *ctx, HANDLE h)
-{
-	EnterCriticalSection(&ctx->handles.lock);
-	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, h);
-	uint32_t gen = entry ? entry->cancel_gen : 0;
-	LeaveCriticalSection(&ctx->handles.lock);
-	return gen;
 }
 
 /* ================= Op pool ================= */
@@ -637,6 +635,7 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->cancel_key = 0;
 	op->cancel_flags = 0;
 	op->io_cancel_gen = 0;
+	op->io_epoch = 0;
 	op->accept_sock = INVALID_SOCKET;
 	op->sa = NULL;
 	op->sa_len = NULL;
@@ -804,8 +803,12 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
  * CreateIoCompletionPort on a handle that is already associated fails with
  * ERROR_INVALID_PARAMETER; the set of handles this context associated turns
  * that into "still ours, fine" against "bound to some other port, refuse".
+ * When it succeeds for a value already in the set, the value names a new
+ * object and the entry's epoch moves on. The set only grows: entries are
+ * reused across such recycling and freed at destroy, bounded by the process's
+ * peak number of distinct handle values.
  */
-static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen)
+static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen, uint32_t *epoch)
 {
 	if (h == NULL || h == INVALID_HANDLE_VALUE) {
 		return -EBADF;
@@ -823,12 +826,15 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen)
 			return win_error_to_errno(err);
 		}
 		// Already associated, and by this context: the same object is still open.
+	} else if (entry) {
+		entry->epoch++;
 	}
 
 	if (!entry) {
 		entry = handle_set_insert_locked(&ctx->handles, h);
 	}
 	*gen = entry ? entry->cancel_gen : 0;
+	*epoch = entry ? entry->epoch : 0;
 	LeaveCriticalSection(&ctx->handles.lock);
 
 	return 0;
@@ -878,7 +884,7 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	HANDLE h = op->fd;
 
-	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen);
+	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -909,7 +915,7 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	HANDLE h = op->fd;
 
-	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen);
+	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -949,7 +955,7 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
  */
 static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
-	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -976,7 +982,7 @@ static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
-	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -1027,7 +1033,7 @@ static int issue_accept(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	SOCKET ls = (SOCKET) op->fd;
 
-	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -1095,7 +1101,7 @@ static int issue_connect(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	SOCKET s = (SOCKET) op->fd;
 
-	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen);
+	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
@@ -2152,8 +2158,19 @@ static bool reissue_collateral_abort(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD b
 
 	EnterCriticalSection(&ctx->timers.lock);
 	bool collateral = atomic_load(&op->state) == IOCP_OP_IO
-			&& (!op->link_timeout || op->link_timeout->timer_armed)
-			&& handle_cancel_gen(ctx, op->fd) != op->io_cancel_gen;
+			&& (!op->link_timeout || op->link_timeout->timer_armed);
+	if (collateral) {
+		/*
+		 * Re-validate the handle with the kernel before replaying on it. The
+		 * caller may have closed it with this request in flight: then the
+		 * association fails (dead value) or succeeds and moves the epoch on
+		 * (the value names a new object), and either way the abort is
+		 * reported as it is rather than replayed onto something else.
+		 */
+		uint32_t gen, epoch;
+		collateral = ensure_handle_associated(ctx, op->fd, &gen, &epoch) == 0
+				&& epoch == op->io_epoch && gen != op->io_cancel_gen;
+	}
 	if (collateral) {
 		// Return the aborted request's active_count slot; issue_* reserves a
 		// new one (or posts a synthetic failure if the handle is gone).
@@ -2558,6 +2575,14 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	 * handle the caller closed long ago and the kernel has since reused for
 	 * something else cannot be hit (CancelIoEx on it just fails). Every
 	 * producer thread is stopped by now, so nothing is issued after this pass.
+	 *
+	 * The drain below has no time limit, so it rests on this invariant: every
+	 * completion still counted in active_count is now forced to arrive. Armed
+	 * timers were popped with the count given back, deferred ops were freed
+	 * unposted, the poller posted its ops as -ECANCELED before it stopped,
+	 * work callbacks were waited out by the cleanup group, and this pass
+	 * cancels the overlapped requests. A new kind of op that is counted but
+	 * not forced here would hang teardown instead of spinning out.
 	 */
 	for (uint32_t i = 0; i < ctx->pool_size; i++) {
 		ior_iocp_op *op = &ctx->op_pool[i];
