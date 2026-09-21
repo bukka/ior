@@ -390,7 +390,7 @@ int ior_threads_poller_create(
 	/* Wakeup fd is marked by a NULL data pointer. */
 	struct epoll_event ev = { .events = EPOLLIN, .data.ptr = NULL };
 	if (epoll_ctl(poller->epfd, EPOLL_CTL_ADD, ior_threads_event_get_fd(&poller->event), &ev) < 0
-			|| pthread_create(&poller->thread, NULL, ior_poller_thread, poller) != 0) {
+			|| ior_thread_create(&poller->thread, NULL, ior_poller_thread, poller) != 0) {
 		pthread_mutex_destroy(&poller->lock);
 		ior_threads_event_destroy(&poller->event);
 		close(poller->epfd);

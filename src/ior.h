@@ -9,6 +9,12 @@
  * portable thread pool elsewhere, and I/O completion ports on Windows. The API
  * and its semantics are identical across all backends.
  *
+ * Signals: every thread ior creates on POSIX (the thread backend's workers,
+ * poller and timer, the worker pool behind ior_prep_work() on io_uring) runs
+ * with all signals blocked, so a signal sent to the process is delivered to
+ * one of the caller's threads and EINTR is only ever seen there; work
+ * callbacks inherit that mask. The caller's own signal mask is never changed.
+ *
  * Typical flow:
  *   1. ior_queue_init() / ior_queue_init_params() to create a context.
  *   2. ior_get_sqe(), then an ior_prep_*() helper to describe an operation.
