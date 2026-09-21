@@ -55,12 +55,17 @@ extern "C" {
 typedef HANDLE ior_fd_t;
 /** Invalid-descriptor sentinel for ::ior_fd_t. */
 #define IOR_INVALID_FD INVALID_HANDLE_VALUE
+/** Process identifier for ior_prep_waitpid() (a process id on Windows). */
+typedef DWORD ior_pid_t;
 #else
+#include <sys/types.h>
 #include <sys/socket.h>
 /** Platform descriptor type used by all operations (int on POSIX). */
 typedef int ior_fd_t;
 /** Invalid-descriptor sentinel for ::ior_fd_t. */
 #define IOR_INVALID_FD (-1)
+/** Process identifier for ior_prep_waitpid() (pid_t on POSIX). */
+typedef pid_t ior_pid_t;
 #endif
 
 /**
@@ -114,6 +119,9 @@ typedef struct ior_timespec {
 #define IOR_OP_POLL 13
 /** Cancel a submitted operation (ior_prep_cancel, ior_prep_cancel_fd). */
 #define IOR_OP_ASYNC_CANCEL 14
+/** Wait for a process state change (ior_prep_waitpid); completes with its
+ *  pid. */
+#define IOR_OP_WAITPID 15
 /** @} */
 
 /**
@@ -602,6 +610,37 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
  */
 void ior_prep_connect(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen);
+
+/**
+ * Prepare a wait for a process state change (like waitpid(2)).
+ *
+ * Completes with the pid of the process whose state changed as res (> 0),
+ * its wait status stored in @p status (if non-NULL) as waitpid(2) stores it,
+ * or a negative errno: -ECHILD when @p pid is not a child of the caller (or
+ * was reaped already), -ECANCELED when cancelled. With WNOHANG in
+ * @p options the op never waits and completes with 0 when nothing has
+ * changed. The process is reaped by ior, so it competes with any waitpid(2)
+ * the caller runs and with WAITPID ops on -1, as waitpid calls do among
+ * themselves.
+ *
+ * A wait for one child (@p pid > 0, no options) occupies no thread: io_uring
+ * polls a pidfd, the thread backend parks the op on its poller (a pidfd on
+ * Linux, EVFILT_PROC on kqueue) and IOCP registers a wait on the process
+ * handle, so the op is cancellable and a link timeout bounds it. Every other
+ * request (-1 for any child, a process group, WUNTRACED or WCONTINUED, or a
+ * platform without a process watch) blocks a worker thread in waitpid(2)
+ * until it returns: a cancel then reports -EALREADY and ior_queue_exit()
+ * waits for it. Windows accepts only @p pid > 0 (-ENOTSUP otherwise),
+ * ignores @p options and stores the exit code in @p status.
+ *
+ * @param ctx      I/O context.
+ * @param sqe      Entry from ior_get_sqe().
+ * @param pid      Process to wait for, with waitpid(2) meaning on POSIX.
+ * @param status   Where to store the wait status, or NULL.
+ * @param options  waitpid(2) options (WNOHANG, WUNTRACED, ...); 0 on Windows.
+ * @return 0 on success, -EINVAL for bad arguments, or -ENOMEM.
+ */
+int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options);
 
 /**
  * Prepare a one-shot wait for fd readiness (like io_uring's POLL_ADD).

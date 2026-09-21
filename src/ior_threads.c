@@ -468,6 +468,19 @@ static void ior_threads_backend_prep_connect(
 	sqe->threads.off = addrlen;
 }
 
+static int ior_threads_backend_prep_waitpid(
+		void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
+{
+	(void) backend_ctx;
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->threads.opcode = IOR_OP_WAITPID;
+	sqe->threads.fd = IOR_INVALID_FD;
+	sqe->threads.addr = (uint64_t) (uintptr_t) status;
+	sqe->threads.off = (uint64_t) (int64_t) pid;
+	sqe->threads.len = (uint32_t) options;
+	return 0;
+}
+
 static void ior_threads_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
 {
 	memset(sqe, 0, sizeof(*sqe));
@@ -586,6 +599,7 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_connect = ior_threads_backend_prep_connect,
 	.prep_cancel = ior_threads_backend_prep_cancel,
 	.prep_cancel_fd = ior_threads_backend_prep_cancel_fd,
+	.prep_waitpid = ior_threads_backend_prep_waitpid,
 	.prep_work = ior_threads_backend_prep_work,
 	.sqe_set_data = ior_threads_backend_sqe_set_data,
 	.sqe_set_flags = ior_threads_backend_sqe_set_flags,

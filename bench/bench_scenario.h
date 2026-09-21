@@ -49,6 +49,11 @@ typedef struct bench_options {
 	/* Block on ior_notify_fd() readability instead of ior_wait_cqe(), the way
 	 * an embedding event loop would; completions are then reaped by peeks. */
 	int notify;
+
+	/* socket: keep this many IOR_OP_WAITPID ops pending on sleeping child
+	 * processes for the whole run, to price pending process waits into the
+	 * socket path (a process manager's children behind a busy loop). */
+	uint32_t waits;
 } bench_options;
 
 /*

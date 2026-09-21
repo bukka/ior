@@ -45,6 +45,45 @@ uint64_t bench_now_ns(void)
 	return (c / f) * 1000000000ULL + ((c % f) * 1000000000ULL) / f;
 }
 
+int bench_spawn_sleeper(bench_sleeper *sl)
+{
+	char path[MAX_PATH];
+	if (GetModuleFileNameA(NULL, path, sizeof(path)) == 0) {
+		return -EIO;
+	}
+	char cmd[MAX_PATH + 32];
+	snprintf(cmd, sizeof(cmd), "\"%s\" --sleeper", path);
+	STARTUPINFOA si;
+	PROCESS_INFORMATION pi;
+	memset(&si, 0, sizeof(si));
+	si.cb = sizeof(si);
+	if (!CreateProcessA(path, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+		return -EIO;
+	}
+	CloseHandle(pi.hThread);
+	sl->pid = pi.dwProcessId;
+	sl->handle = (uintptr_t) pi.hProcess;
+	return 0;
+}
+
+void bench_kill_sleeper(const bench_sleeper *sl)
+{
+	TerminateProcess((HANDLE) sl->handle, 9);
+}
+
+void bench_close_sleeper(bench_sleeper *sl)
+{
+	CloseHandle((HANDLE) sl->handle);
+	sl->handle = 0;
+}
+
+void bench_sleep_forever(void)
+{
+	for (;;) {
+		Sleep(INFINITE);
+	}
+}
+
 int bench_fd_is_valid(ior_fd_t fd)
 {
 	return fd != NULL && fd != INVALID_HANDLE_VALUE;

@@ -433,8 +433,8 @@ int bench_run_connect(const bench_options *opts, bench_metrics *m, const char **
 		bench_metrics_stop(m);
 	}
 
-	fprintf(stderr, "connect outcomes: rounds=%llu port_stalls=%llu\n", (unsigned long long) s.rounds,
-			(unsigned long long) s.port_stalls);
+	fprintf(stderr, "connect outcomes: rounds=%llu port_stalls=%llu\n",
+			(unsigned long long) s.rounds, (unsigned long long) s.port_stalls);
 
 out:
 	if (s.clients) {

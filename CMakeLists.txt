@@ -228,6 +228,24 @@ if(NOT IOR_PLATFORM_WINDOWS)
     endif()
 endif()
 
+# Check for pidfd_open (Linux 5.3+): lets a wait for one child park on the
+# poller instead of a worker; without it (or on an older kernel) the worker
+# blocks in waitpid()
+set(IOR_HAVE_PIDFD_OPEN FALSE)
+if(IOR_PLATFORM_LINUX)
+    check_c_source_compiles("
+        #include <unistd.h>
+        #include <sys/syscall.h>
+        int main(void) {
+            return (int) syscall(SYS_pidfd_open, 1, 0) < 0;
+        }
+    " HAVE_PIDFD_OPEN)
+    if(HAVE_PIDFD_OPEN)
+        set(IOR_HAVE_PIDFD_OPEN TRUE)
+        message(STATUS "pidfd_open() available")
+    endif()
+endif()
+
 # Check for liburing on Linux
 set(IOR_HAVE_URING FALSE)
 set(IOR_URING_VERSION "unknown")
