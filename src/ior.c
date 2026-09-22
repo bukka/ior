@@ -242,6 +242,11 @@ int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int
 	return ctx->ops->prep_waitpid(ctx->backend_ctx, sqe, pid, status, options);
 }
 
+#if !defined(_WIN32) && !defined(NSIG)
+/* Strict-standard headers hide NSIG; sigismember rejects what is past it. */
+#define NSIG 65
+#endif
+
 int ior_sigemptyset(ior_sigset_t *set)
 {
 	if (!set) {
@@ -267,6 +272,12 @@ int ior_sigaddset(ior_sigset_t *set, int signo)
 	set->bits |= 1U << signo;
 	return 0;
 #else
+	/* BSD-derived libcs define sigaddset as a macro that range-checks
+	 * nothing and always reports success, so check here: signo - 1 would
+	 * otherwise be shifted by a negative count. */
+	if (signo <= 0 || signo >= NSIG) {
+		return -EINVAL;
+	}
 	return sigaddset(set, signo) == 0 ? 0 : -EINVAL;
 #endif
 }
@@ -282,15 +293,14 @@ int ior_sigismember(const ior_sigset_t *set, int signo)
 	}
 	return (set->bits >> signo) & 1U;
 #else
+	/* Same as ior_sigaddset(): sigismember validates nothing on BSD. */
+	if (signo <= 0 || signo >= NSIG) {
+		return -EINVAL;
+	}
 	int ret = sigismember(set, signo);
 	return ret < 0 ? -EINVAL : ret;
 #endif
 }
-
-#if !defined(_WIN32) && !defined(NSIG)
-/* Strict-standard headers hide NSIG; sigismember rejects what is past it. */
-#define NSIG 65
-#endif
 
 /* Does the set name at least one signal? A wait on none would never end. */
 static int ior_sigset_has_any(const ior_sigset_t *set)
