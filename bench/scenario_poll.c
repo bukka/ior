@@ -18,9 +18,13 @@
  * IOR_CQE_F_MORE and IOR_POLL_IN, and no poll may end on its own.
  *
  * With --timer linked each poll is guarded by a link timeout, which must stay
- * armed across the edges (firing is an error). Draining stops new sends, lets
- * the rounds finish, then cancels every poll: each must end with -ECANCELED
- * and no IOR_CQE_F_MORE, its cancel with 0, its link timeout with -ECANCELED.
+ * armed across the edges (firing is an error, and retires the connection: an
+ * unwatched socket reports no readiness, so its round could never finish).
+ * The guard is stretched past the run length when --timeout-ms is shorter,
+ * since the poll it bounds lives for the whole run. Draining stops new sends,
+ * lets the rounds finish, then cancels every poll: each must end with
+ * -ECANCELED and no IOR_CQE_F_MORE, its cancel with 0, its link timeout with
+ * -ECANCELED.
  */
 #include "bench_platform.h"
 #include "bench_scenario.h"
@@ -72,6 +76,7 @@ typedef struct conn {
 	uint32_t remaining; /* bytes of the current message still to read (0 = idle) */
 	int recv_inflight;
 	int polling; /* the multishot poll is armed */
+	int dead; /* its poll ended early: nothing will report readiness again */
 	uint64_t rt_start_ns;
 	unsigned pending;
 } conn;
@@ -210,6 +215,12 @@ static void harvest_one(poll_ctx *s, ior_cqe *cqe)
 			c->polling = 0;
 			if (res != -ECANCELED || s->draining != 2) {
 				bench_metrics_error(s->m);
+				/* Nothing will report this socket readable again, so the
+				 * round in flight can never finish: retire the connection
+				 * rather than hold the drain on it forever. */
+				c->dead = 1;
+				c->remaining = 0;
+				c->pending = ACT_NONE;
 			}
 			break;
 
@@ -225,7 +236,7 @@ static void harvest_one(poll_ctx *s, ior_cqe *cqe)
 			if (res != (int32_t) s->msg_size) {
 				bench_metrics_error(s->m);
 				c->remaining = 0;
-				if (!s->draining) {
+				if (!s->draining && !c->dead) {
 					set_pending(s, ci, ACT_SEND);
 				}
 			}
@@ -238,7 +249,7 @@ static void harvest_one(poll_ctx *s, ior_cqe *cqe)
 			if (res <= 0 || (uint32_t) res > c->remaining) {
 				bench_metrics_error(s->m);
 				c->remaining = 0;
-				if (!s->draining) {
+				if (!s->draining && !c->dead) {
 					set_pending(s, ci, ACT_SEND);
 				}
 				break;
@@ -255,7 +266,7 @@ static void harvest_one(poll_ctx *s, ior_cqe *cqe)
 				bench_metrics_record(s->m, bench_now_ns() - c->rt_start_ns, s->msg_size);
 				s->rounds++;
 			}
-			if (!s->draining) {
+			if (!s->draining && !c->dead) {
 				set_pending(s, ci, ACT_SEND);
 			}
 			break;
@@ -278,6 +289,9 @@ static int rounds_idle(const poll_ctx *s)
 {
 	for (uint32_t i = 0; i < s->nconns; i++) {
 		const conn *c = &s->conns[i];
+		if (c->dead) {
+			continue; /* its outstanding ops still hold up the final break */
+		}
 		if (c->remaining > 0 || c->recv_inflight || c->pending != ACT_NONE) {
 			return 0;
 		}
@@ -306,6 +320,12 @@ static int run_loop(poll_ctx *s)
 				s->draining = 1;
 				bench_metrics_stop(s->m);
 			}
+		}
+		/* With nothing armed and nothing queued no completion can arrive:
+		 * every poll has ended early, so the run is over. */
+		if (!s->draining && s->inflight == 0 && s->ready_count == 0) {
+			s->draining = 1;
+			bench_metrics_stop(s->m);
 		}
 		if (s->draining == 1 && rounds_idle(s)) {
 			s->draining = 2;
@@ -358,8 +378,19 @@ int bench_run_poll(const bench_options *opts, bench_metrics *m, const char **bac
 	s.nconns = opts->conns ? opts->conns : 1;
 	s.msg_size = opts->msg_size ? opts->msg_size : 256;
 	s.linked = opts->timer_mode == BENCH_TIMER_LINKED;
-	s.timeout.tv_sec = opts->timeout_ms / 1000;
-	s.timeout.tv_nsec = (long long) (opts->timeout_ms % 1000) * 1000000LL;
+
+	/* The guard bounds the whole poll, and the poll lives for the whole run:
+	 * unlike the short-lived ops the other scenarios guard, it needs a
+	 * timeout longer than the run itself, or it trips its own guard. */
+	uint64_t guard_ms = opts->timeout_ms;
+	if (!opts->ops) {
+		uint64_t run_ms = (uint64_t) (opts->duration_s * 1000.0) + 1000;
+		if (guard_ms < run_ms) {
+			guard_ms = run_ms;
+		}
+	}
+	s.timeout.tv_sec = (int64_t) (guard_ms / 1000);
+	s.timeout.tv_nsec = (long long) (guard_ms % 1000) * 1000000LL;
 
 	/* Every connection holds its poll (and guard) plus a send or recv in
 	 * flight, and the drain adds a cancel each. */
