@@ -37,6 +37,7 @@ enum {
 	OP_RECV_RESP = 3,
 	OP_LINK_TIMEOUT = 4,
 	OP_WAIT = 5, /* --waits: a process wait pending for the whole run (conn = sleeper) */
+	OP_SIGWAIT = 6, /* --sigwaits: a signal wait pending for the whole run (conn = index) */
 	OP_NONE = 7, /* sentinel: no pending action (fits OP_KIND_MASK, never tagged) */
 	OP_KIND_BITS = 3,
 	OP_KIND_MASK = (1u << OP_KIND_BITS) - 1,
@@ -81,6 +82,10 @@ typedef struct sock_ctx {
 	bench_sleeper *sleepers; /* --waits children, one pending WAITPID each */
 	uint32_t nsleepers;
 	uint32_t waits_pending; /* their ops not yet reaped (outside inflight) */
+	int signo; /* --sigwaits: the queued signal the waits are on */
+	ior_sigset_t sigset;
+	uint32_t nsigwaits;
+	uint32_t sigwaits_pending; /* their ops not yet reaped (outside inflight) */
 } sock_ctx;
 
 /* Queue a connection's next action to be issued during the refill phase. */
@@ -184,6 +189,14 @@ static void harvest_one(sock_ctx *s, ior_cqe *cqe)
 			bench_metrics_error(s->m);
 		}
 		s->waits_pending--;
+		return;
+	}
+	if (kind == OP_SIGWAIT) {
+		/* Only once its signal was sent at the end: the signal, or an error. */
+		if (res != s->signo) {
+			bench_metrics_error(s->m);
+		}
+		s->sigwaits_pending--;
 		return;
 	}
 	conn *c = &s->conns[ci];
@@ -356,6 +369,71 @@ static void stop_waits(sock_ctx *s)
 	s->nsleepers = 0;
 }
 
+/*
+ * --sigwaits: leave a signal wait pending on a queued signal for the whole
+ * run, outside inflight like --waits. On the thread backend each one pins a
+ * worker for the duration, so at the pool's size (32) nothing else runs.
+ */
+static int start_sigwaits(sock_ctx *s)
+{
+	uint32_t n = s->opts->sigwaits;
+	if (n == 0) {
+		return 0;
+	}
+	s->signo = bench_sig_number(1);
+	if (s->signo < 0) {
+		return -ENOTSUP;
+	}
+	if (ior_sigemptyset(&s->sigset) < 0 || ior_sigaddset(&s->sigset, s->signo) < 0) {
+		return -EINVAL;
+	}
+	int ret = bench_sig_block(s->signo);
+	if (ret < 0) {
+		return ret;
+	}
+	if (n >= 32 && ior_get_backend_type(s->ior) == IOR_BACKEND_THREADS) {
+		fprintf(stderr,
+				"warning: %u pending signal waits pin every worker of the thread "
+				"backend's pool; the socket path will starve\n",
+				n);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		ior_sqe *sqe = ior_get_sqe(s->ior);
+		if (!sqe) {
+			ior_submit(s->ior);
+			sqe = ior_get_sqe(s->ior);
+		}
+		if (!sqe || ior_prep_sigwait(s->ior, sqe, &s->sigset, NULL) < 0) {
+			return -EIO;
+		}
+		ior_sqe_set_data(s->ior, sqe, make_tag(i, OP_SIGWAIT));
+		s->nsigwaits++;
+		s->sigwaits_pending++;
+	}
+	return ior_submit(s->ior) < 0 ? -EIO : 0;
+}
+
+/* Send one signal per wait and reap them, checking each reports the signal. */
+static void stop_sigwaits(sock_ctx *s)
+{
+	for (uint32_t i = 0; i < s->nsigwaits; i++) {
+		while (bench_sig_queue(s->signo, (int) i) == -EAGAIN) { }
+	}
+	while (s->sigwaits_pending > 0) {
+		ior_cqe *cqe = NULL;
+		int ret = ior_wait_cqe(s->ior, &cqe);
+		if (ret == -EAGAIN || ret == -EINTR) {
+			continue;
+		}
+		if (ret < 0) {
+			break;
+		}
+		harvest_one(s, cqe);
+		ior_cqe_seen(s->ior, cqe);
+	}
+	(void) bench_sig_drain(s->signo);
+}
+
 int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **backend_name_out)
 {
 	int ret = 0;
@@ -427,6 +505,10 @@ int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **b
 	if (ret < 0) {
 		goto out;
 	}
+	ret = start_sigwaits(&s);
+	if (ret < 0) {
+		goto out;
+	}
 
 	bench_metrics_start(m);
 	/* Each connection starts a round trip; run_loop's refill issues them. */
@@ -439,6 +521,9 @@ int bench_run_socket(const bench_options *opts, bench_metrics *m, const char **b
 	}
 
 out:
+	if (s.nsigwaits) {
+		stop_sigwaits(&s);
+	}
 	if (s.sleepers) {
 		stop_waits(&s);
 	}

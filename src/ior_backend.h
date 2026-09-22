@@ -159,6 +159,10 @@ typedef struct ior_backend_ops {
 	void (*prep_cancel_fd)(ior_sqe *sqe, ior_fd_t fd);
 	/* Takes backend_ctx: io_uring keeps a record per pidfd poll. */
 	int (*prep_waitpid)(void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options);
+	/* Takes backend_ctx: io_uring keeps a record per signalfd poll. The set
+	 * has been validated as non-empty. */
+	int (*prep_sigwait)(
+			void *backend_ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_siginfo_t *info);
 	/* Optional (NULL = work ops unsupported). Takes backend_ctx because some
 	 * backends record per-op state beyond the SQE (e.g. io_uring's job list). */
 	int (*prep_work)(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg);

@@ -246,6 +246,28 @@ if(IOR_PLATFORM_LINUX)
     endif()
 endif()
 
+# Check for sigtimedwait (POSIX.1b; macOS lacks it): lets a worker waiting for
+# a signal notice a cancel or teardown between slices; without it the worker
+# blocks in sigwait() until a signal of the set arrives
+set(IOR_HAVE_SIGTIMEDWAIT FALSE)
+if(NOT IOR_PLATFORM_WINDOWS)
+    check_c_source_compiles("
+        #include <signal.h>
+        #include <time.h>
+        int main(void) {
+            sigset_t set;
+            siginfo_t info;
+            struct timespec ts = { 0, 0 };
+            sigemptyset(&set);
+            return sigtimedwait(&set, &info, &ts) < 0;
+        }
+    " HAVE_SIGTIMEDWAIT)
+    if(HAVE_SIGTIMEDWAIT)
+        set(IOR_HAVE_SIGTIMEDWAIT TRUE)
+        message(STATUS "sigtimedwait() available")
+    endif()
+endif()
+
 # Check for liburing on Linux
 set(IOR_HAVE_URING FALSE)
 set(IOR_URING_VERSION "unknown")

@@ -14,6 +14,7 @@
 #include <poll.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
+#include <sys/signalfd.h>
 #include <sys/wait.h>
 #include <signal.h>
 #ifdef IOR_HAVE_PIDFD_OPEN
@@ -59,14 +60,15 @@ typedef struct ior_ctx_uring {
 	ior_uring_job *jobs_head; // doubly linked via live_next/live_prev
 
 	/*
-	 * IOR_OP_WAITPID on one running child: a POLL_ADD on its pidfd whose
-	 * kernel user_data is the wait record, so its CQE can be told apart on
-	 * the way out and rewritten into the waitpid result (see
-	 * ior_uring_resolve_waits). Records are prepped on waits_pending and
-	 * moved into waits_live at submit: lists hashed by the record's address,
-	 * since every reaped CQE is looked up there while any wait is live.
-	 * Shared with the reaping thread and with cancel interception, under
-	 * jobs_lock; the count lets a reap skip the lock when nothing is live.
+	 * IOR_OP_WAITPID on one running child and IOR_OP_SIGWAIT: a POLL_ADD on
+	 * a pidfd or a signalfd whose kernel user_data is the wait record, so
+	 * its CQE can be told apart on the way out and rewritten into the
+	 * waitpid or sigwait result (see ior_uring_resolve_waits). Records are
+	 * prepped on waits_pending and moved into waits_live at submit: lists
+	 * hashed by the record's address, since every reaped CQE is looked up
+	 * there while any wait is live. Shared with the reaping thread and with
+	 * cancel interception, under jobs_lock; the count lets a reap skip the
+	 * lock when nothing is live.
 	 */
 	ior_uring_wait *waits_pending;
 	ior_uring_wait *waits_live[64];
@@ -78,9 +80,11 @@ typedef struct ior_ctx_uring {
 struct ior_uring_wait {
 	ior_uring_wait *next;
 	ior_uring_wait *prev; // live lists only
-	int pidfd;
+	int fd; // the pidfd or signalfd polled
+	int is_sig; // a sigwait: fd is a signalfd, info gets the signal
 	pid_t pid;
 	int *status;
+	ior_siginfo_t *info;
 	uint64_t user_data; // the caller's, harvested at submit
 	struct io_uring_sqe *ksqe; // the POLL_ADD; valid only until submit
 };
@@ -281,9 +285,9 @@ static int ior_uring_work_ensure(ior_ctx_uring *ctx)
 }
 
 /*
- * Publish prepped pidfd waits: harvest the user data the caller attached and
- * key the kernel op by the record instead, so its completion is recognised
- * whatever user data the caller uses elsewhere.
+ * Publish prepped pidfd and signalfd waits: harvest the user data the caller
+ * attached and key the kernel op by the record instead, so its completion is
+ * recognised whatever user data the caller uses elsewhere.
  */
 static void ior_uring_dispatch_waits(ior_ctx_uring *ctx)
 {
@@ -328,12 +332,87 @@ static void ior_uring_wait_unlink_locked(ior_ctx_uring *ctx, ior_uring_wait *wai
 }
 
 /*
- * Turn the completions of pidfd polls among cqes[] into waitpid results, in
- * place (the CQ ring is mapped writable and the kernel never reads a CQE
- * back): a readable pidfd means the child exited, so waitpid(2) collects
- * its state now, on the reaping thread; a failed or cancelled poll keeps
- * its error. The caller's user data is restored either way and the record
- * retired, so seeing the same CQE again finds nothing to do.
+ * What signalfd(2) reports, as sigwaitinfo(2) would report it. The fields
+ * of a siginfo_t overlay one another, so which are set follows the kernel's
+ * own layout choice for the code and signal.
+ */
+static void ior_uring_siginfo_from_signalfd(siginfo_t *info, const struct signalfd_siginfo *ssi)
+{
+	memset(info, 0, sizeof(*info));
+	info->si_signo = (int) ssi->ssi_signo;
+	info->si_errno = ssi->ssi_errno;
+	info->si_code = ssi->ssi_code;
+	if (ssi->ssi_code == SI_TIMER) {
+		info->si_timerid = (int) ssi->ssi_tid;
+		info->si_overrun = (int) ssi->ssi_overrun;
+		info->si_value.sival_ptr = (void *) (uintptr_t) ssi->ssi_ptr;
+		info->si_value.sival_int = ssi->ssi_int;
+		return;
+	}
+	if (ssi->ssi_code <= 0 && ssi->ssi_code != SI_USER && ssi->ssi_code != SI_TKILL) {
+		// sigqueue(3), a message queue, asynchronous I/O: a value came along.
+		info->si_pid = (pid_t) ssi->ssi_pid;
+		info->si_uid = (uid_t) ssi->ssi_uid;
+		info->si_value.sival_ptr = (void *) (uintptr_t) ssi->ssi_ptr;
+		info->si_value.sival_int = ssi->ssi_int;
+		return;
+	}
+	if (ssi->ssi_code > 0) {
+		switch (ssi->ssi_signo) {
+			case SIGCHLD:
+				info->si_pid = (pid_t) ssi->ssi_pid;
+				info->si_uid = (uid_t) ssi->ssi_uid;
+				info->si_status = ssi->ssi_status;
+				info->si_utime = (clock_t) ssi->ssi_utime;
+				info->si_stime = (clock_t) ssi->ssi_stime;
+				return;
+			case SIGILL:
+			case SIGFPE:
+			case SIGSEGV:
+			case SIGBUS:
+			case SIGTRAP:
+				info->si_addr = (void *) (uintptr_t) ssi->ssi_addr;
+				return;
+			case SIGPOLL:
+				info->si_band = (long) ssi->ssi_band;
+				info->si_fd = ssi->ssi_fd;
+				return;
+			default:
+				break;
+		}
+	}
+	info->si_pid = (pid_t) ssi->ssi_pid;
+	info->si_uid = (uid_t) ssi->ssi_uid;
+}
+
+/*
+ * A readable signalfd: one signal of the set is pending, so take it now
+ * (nothing else ior does consumes it). It may be gone if another wait took
+ * it first: a second op on the same signal in this context, whose poll the
+ * same arrival woke, or a sigwaitinfo(2) of the caller's own. The op then
+ * reports -EAGAIN, since its CQE is already out and cannot be re-armed here.
+ */
+static int32_t ior_uring_collect_signal(const ior_uring_wait *wait)
+{
+	struct signalfd_siginfo ssi;
+	ssize_t n = read(wait->fd, &ssi, sizeof(ssi));
+	if (n != (ssize_t) sizeof(ssi)) {
+		return n < 0 ? -errno : -EIO;
+	}
+	if (wait->info) {
+		ior_uring_siginfo_from_signalfd(wait->info, &ssi);
+	}
+	return (int32_t) ssi.ssi_signo;
+}
+
+/*
+ * Turn the completions of pidfd and signalfd polls among cqes[] into
+ * waitpid and sigwait results, in place (the CQ ring is mapped writable and
+ * the kernel never reads a CQE back): a readable pidfd means the child
+ * exited, so waitpid(2) collects its state now, on the reaping thread, and
+ * a readable signalfd is read for its signal; a failed or cancelled poll
+ * keeps its error. The caller's user data is restored either way and the
+ * record retired, so seeing the same CQE again finds nothing to do.
  */
 static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, unsigned n)
 {
@@ -349,11 +428,13 @@ static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cq
 			continue;
 		}
 		int32_t res = cqe->res;
-		if (res >= 0) {
+		if (res >= 0 && wait->is_sig) {
+			res = ior_uring_collect_signal(wait);
+		} else if (res >= 0) {
 			pid_t r = waitpid(wait->pid, wait->status, WNOHANG);
 			res = r < 0 ? -errno : r;
 		}
-		close(wait->pidfd);
+		close(wait->fd);
 		cqe->user_data = wait->user_data;
 		cqe->res = res;
 		ior_uring_wait_unlink_locked(ctx, wait);
@@ -364,8 +445,8 @@ static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cq
 
 /*
  * Post-process CQEs about to be handed to the caller: pair with the
- * posters' release (see `posted`) and turn pidfd poll completions into
- * waitpid results.
+ * posters' release (see `posted`) and turn pidfd and signalfd poll
+ * completions into waitpid and sigwait results.
  */
 static void ior_uring_reaped(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, unsigned n)
 {
@@ -556,8 +637,8 @@ static void ior_uring_intercept_cancels(ior_ctx_uring *ctx)
 			}
 		}
 		if (ret == -ENOENT) {
-			// A pidfd wait is a kernel op under its record's key: retarget
-			// the cancel and let the kernel resolve it.
+			// A pidfd or signalfd wait is a kernel op under its record's
+			// key: retarget the cancel and let the kernel resolve it.
 			size_t nb = sizeof(ctx->waits_live) / sizeof(ctx->waits_live[0]);
 			ior_uring_wait *found = NULL;
 			for (size_t b = 0; b < nb && !found; b++) {
@@ -697,11 +778,12 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 		job = next;
 	}
 
-	// Pidfd waits, submitted or not: their completions are never reaped.
+	// Pidfd and signalfd waits, submitted or not: their completions are
+	// never reaped.
 	ior_uring_wait *wait = ctx->waits_pending;
 	while (wait) {
 		ior_uring_wait *next = wait->next;
-		close(wait->pidfd);
+		close(wait->fd);
 		free(wait);
 		wait = next;
 	}
@@ -709,7 +791,7 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 		wait = ctx->waits_live[b];
 		while (wait) {
 			ior_uring_wait *next = wait->next;
-			close(wait->pidfd);
+			close(wait->fd);
 			free(wait);
 			wait = next;
 		}
@@ -746,9 +828,9 @@ static int ior_uring_backend_submit(void *backend_ctx)
 	}
 
 	ior_ctx_uring *ctx = backend_ctx;
-	// Work jobs and pidfd waits must be harvested while their placeholder
-	// SQEs are still staged; cancels then see the ops submitted just before
-	// them.
+	// Work jobs and pidfd/signalfd waits must be harvested while their
+	// placeholder SQEs are still staged; cancels then see the ops submitted
+	// just before them.
 	ior_uring_dispatch_pending(ctx);
 	if (ctx->wp || atomic_load(&ctx->waits_live_count)) {
 		ior_uring_intercept_cancels(ctx);
@@ -1037,6 +1119,51 @@ static int ior_uring_backend_prep_work(void *backend_ctx, ior_sqe *sqe, ior_work
 	return ior_uring_job_new(backend_ctx, &sqe->uring.sqe, fn, arg, &job);
 }
 
+/*
+ * Prep a POLL_ADD for readability of fd (a pidfd or signalfd) keyed, from
+ * submit on, by a wait record that turns its completion into the op's
+ * result. The record owns fd.
+ */
+static ior_uring_wait *ior_uring_wait_new(ior_ctx_uring *ctx, struct io_uring_sqe *s, int fd)
+{
+	ior_uring_wait *wait = calloc(1, sizeof(*wait));
+	if (!wait) {
+		return NULL;
+	}
+	wait->fd = fd;
+	wait->ksqe = s;
+	io_uring_prep_poll_add(s, fd, POLLIN);
+	wait->next = ctx->waits_pending;
+	ctx->waits_pending = wait;
+	return wait;
+}
+
+/*
+ * A signalfd for the set, polled for readability: the kernel wakes the poll
+ * when a signal of the set is queued for the process (or for the polling
+ * thread), and a signal pending already reads as ready at once. The signal
+ * itself is read on the reaping thread, see ior_uring_collect_signal.
+ */
+static int ior_uring_backend_prep_sigwait(
+		void *backend_ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_siginfo_t *info)
+{
+	ior_ctx_uring *ctx = backend_ctx;
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+
+	int sfd = signalfd(-1, set, SFD_NONBLOCK | SFD_CLOEXEC);
+	if (sfd < 0) {
+		return -errno;
+	}
+	ior_uring_wait *wait = ior_uring_wait_new(ctx, s, sfd);
+	if (!wait) {
+		close(sfd);
+		return -ENOMEM;
+	}
+	wait->is_sig = 1;
+	wait->info = info;
+	return 0;
+}
+
 // A worker's waitpid(2), for what a pidfd poll cannot express.
 static int32_t ior_uring_waitpid_job(ior_work_token *token, void *arg)
 {
@@ -1076,18 +1203,13 @@ static int ior_uring_backend_prep_waitpid(
 				? (int) syscall(SYS_pidfd_open, pid, 0)
 				: -1;
 		if (pidfd >= 0) {
-			ior_uring_wait *wait = calloc(1, sizeof(*wait));
+			ior_uring_wait *wait = ior_uring_wait_new(ctx, s, pidfd);
 			if (!wait) {
 				close(pidfd);
 				return -ENOMEM;
 			}
-			wait->pidfd = pidfd;
 			wait->pid = pid;
 			wait->status = status;
-			wait->ksqe = s;
-			io_uring_prep_poll_add(s, pidfd, POLLIN);
-			wait->next = ctx->waits_pending;
-			ctx->waits_pending = wait;
 			return 0;
 		}
 	}
@@ -1247,6 +1369,7 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_cancel = ior_uring_backend_prep_cancel,
 	.prep_cancel_fd = ior_uring_backend_prep_cancel_fd,
 	.prep_waitpid = ior_uring_backend_prep_waitpid,
+	.prep_sigwait = ior_uring_backend_prep_sigwait,
 	.prep_work = ior_uring_backend_prep_work,
 	.sqe_set_data = ior_uring_backend_sqe_set_data,
 	.sqe_set_flags = ior_uring_backend_sqe_set_flags,

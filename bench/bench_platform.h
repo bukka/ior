@@ -128,6 +128,51 @@ void bench_close_sleeper(bench_sleeper *sl);
 void bench_sleep_forever(void);
 
 /*
+ * Signals for the sigwait scenario and --sigwaits: a real-time signal on
+ * POSIX (SIGRTMIN + which), queued with a value so every instance is
+ * delivered and can be told apart. Windows has none of this: -1, and the
+ * scenario reports -ENOTSUP.
+ */
+int bench_sig_number(int which);
+
+/* Block signo in the calling thread (and in every thread it creates after),
+ * so it stays pending for the ops instead of running its default action. */
+int bench_sig_block(int signo);
+
+/* Queue signo to this process carrying value. Returns 0, -EAGAIN when the
+ * queue is full (retry after a moment), else a negative errno. */
+int bench_sig_queue(int signo, int value);
+
+/* The value bench_sig_queue() sent, out of what an IOR_OP_SIGWAIT stored. */
+int bench_sig_value(const ior_siginfo_t *info);
+
+/* Take every pending signo without waiting; returns how many there were. */
+int bench_sig_drain(int signo);
+
+/* A thread, for the sigwait scenario's sender. */
+typedef struct bench_thread {
+	uintptr_t handle;
+} bench_thread;
+
+int bench_thread_start(bench_thread *t, void (*fn)(void *), void *arg);
+void bench_thread_join(bench_thread *t);
+
+/*
+ * A counting gate between two threads: post() adds credits and wakes the
+ * taker, take() blocks until there are credits and takes them all, or
+ * returns 0 once the gate is closed and empty.
+ */
+typedef struct bench_gate {
+	void *impl;
+} bench_gate;
+
+int bench_gate_init(bench_gate *g);
+void bench_gate_destroy(bench_gate *g);
+void bench_gate_post(bench_gate *g, uint32_t n);
+uint32_t bench_gate_take(bench_gate *g);
+void bench_gate_close(bench_gate *g);
+
+/*
  * Wait up to timeout_ms for a descriptor from ior_notify_fd() to become
  * readable (poll() on POSIX, WSAPoll() on Windows). Returns 1 if readable, 0
  * on timeout, negative errno on error.

@@ -84,6 +84,134 @@ void bench_sleep_forever(void)
 	}
 }
 
+/* No queued signals here: the sigwait scenario and --sigwaits are POSIX. */
+int bench_sig_number(int which)
+{
+	(void) which;
+	return -1;
+}
+
+int bench_sig_block(int signo)
+{
+	(void) signo;
+	return -ENOTSUP;
+}
+
+int bench_sig_queue(int signo, int value)
+{
+	(void) signo;
+	(void) value;
+	return -ENOTSUP;
+}
+
+int bench_sig_value(const ior_siginfo_t *info)
+{
+	return info->si_code;
+}
+
+int bench_sig_drain(int signo)
+{
+	(void) signo;
+	return 0;
+}
+
+typedef struct win_thread_start {
+	void (*fn)(void *);
+	void *arg;
+} win_thread_start;
+
+static DWORD WINAPI win_thread_main(LPVOID arg)
+{
+	win_thread_start st = *(win_thread_start *) arg;
+	free(arg);
+	st.fn(st.arg);
+	return 0;
+}
+
+int bench_thread_start(bench_thread *t, void (*fn)(void *), void *arg)
+{
+	win_thread_start *st = malloc(sizeof(*st));
+	if (!st) {
+		return -ENOMEM;
+	}
+	st->fn = fn;
+	st->arg = arg;
+	HANDLE h = CreateThread(NULL, 0, win_thread_main, st, 0, NULL);
+	if (!h) {
+		free(st);
+		return -EIO;
+	}
+	t->handle = (uintptr_t) h;
+	return 0;
+}
+
+void bench_thread_join(bench_thread *t)
+{
+	WaitForSingleObject((HANDLE) t->handle, INFINITE);
+	CloseHandle((HANDLE) t->handle);
+}
+
+typedef struct win_gate {
+	CRITICAL_SECTION lock;
+	CONDITION_VARIABLE cond;
+	uint32_t credits;
+	int closed;
+} win_gate;
+
+int bench_gate_init(bench_gate *g)
+{
+	win_gate *wg = calloc(1, sizeof(*wg));
+	if (!wg) {
+		return -ENOMEM;
+	}
+	InitializeCriticalSection(&wg->lock);
+	InitializeConditionVariable(&wg->cond);
+	g->impl = wg;
+	return 0;
+}
+
+void bench_gate_destroy(bench_gate *g)
+{
+	win_gate *wg = g->impl;
+	if (!wg) {
+		return;
+	}
+	DeleteCriticalSection(&wg->lock);
+	free(wg);
+	g->impl = NULL;
+}
+
+void bench_gate_post(bench_gate *g, uint32_t n)
+{
+	win_gate *wg = g->impl;
+	EnterCriticalSection(&wg->lock);
+	wg->credits += n;
+	WakeConditionVariable(&wg->cond);
+	LeaveCriticalSection(&wg->lock);
+}
+
+uint32_t bench_gate_take(bench_gate *g)
+{
+	win_gate *wg = g->impl;
+	EnterCriticalSection(&wg->lock);
+	while (wg->credits == 0 && !wg->closed) {
+		SleepConditionVariableCS(&wg->cond, &wg->lock, INFINITE);
+	}
+	uint32_t n = wg->credits;
+	wg->credits = 0;
+	LeaveCriticalSection(&wg->lock);
+	return n;
+}
+
+void bench_gate_close(bench_gate *g)
+{
+	win_gate *wg = g->impl;
+	EnterCriticalSection(&wg->lock);
+	wg->closed = 1;
+	WakeAllConditionVariable(&wg->cond);
+	LeaveCriticalSection(&wg->lock);
+}
+
 int bench_fd_is_valid(ior_fd_t fd)
 {
 	return fd != NULL && fd != INVALID_HANDLE_VALUE;

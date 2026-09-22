@@ -20,6 +20,7 @@
 #cmakedefine IOR_HAVE_SPLICE
 #cmakedefine IOR_HAVE_ACCEPT4
 #cmakedefine IOR_HAVE_PIDFD_OPEN
+#cmakedefine IOR_HAVE_SIGTIMEDWAIT
 
 /* Build options */
 #cmakedefine IOR_FORCE_PIPE
