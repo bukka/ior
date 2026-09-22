@@ -102,6 +102,13 @@ static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req 
 	}
 }
 
+/* A regular file has no readiness edges: it is always ready, matching poll(). */
+static int ior_poller_fd_is_regular(int fd)
+{
+	struct stat st;
+	return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 /* Unlink and free an empty node; a multishot node owns its dup. Lock held. */
 static void ior_poller_node_drop(ior_threads_poller *poller, ior_poller_fd_node *node)
 {
@@ -171,8 +178,7 @@ static void ior_poller_node_sync(
 				node->reg |= bit;
 			} else {
 				int err = errno;
-				struct stat st;
-				int regular = fstat(node->fd, &st) == 0 && S_ISREG(st.st_mode);
+				int regular = ior_poller_fd_is_regular(node->fd);
 				ior_poller_req **pp = &node->reqs;
 				while (*pp) {
 					ior_poller_req *r = *pp;
@@ -215,6 +221,20 @@ static void ior_poller_ingest_one(
 	}
 
 	int proc = (r->mask & IOR_THREADS_POLLER_PROC) != 0;
+
+	/*
+	 * kqueue registers a regular file happily and reports it readable, where
+	 * epoll refuses it (EPERM). There are no edges to watch for, so a
+	 * multishot ends here with the requested mask as its last result, as it
+	 * does on epoll and io_uring. A one-shot needs no special case: its
+	 * single completion is the same either way.
+	 */
+	if (r->multi && !proc && ior_poller_fd_is_regular(r->fd)) {
+		uint32_t ready = r->mask & (IOR_POLL_IN | IOR_POLL_OUT);
+		ior_poller_stage(done, r, ready ? (int) ready : -EINVAL, 1);
+		return;
+	}
+
 	ior_poller_fd_node *node = NULL;
 	if (!r->multi) {
 		node = poller->fds;
