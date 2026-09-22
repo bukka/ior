@@ -403,6 +403,8 @@ static int win_error_to_errno(DWORD err)
 			return -ECANCELED;
 		case ERROR_INVALID_HANDLE:
 			return -EBADF;
+		case ERROR_INVALID_PARAMETER:
+			return -EINVAL;
 		case ERROR_NOT_SUPPORTED:
 			return -ENOTSUP;
 		case ERROR_ABANDONED_WAIT_0:
@@ -960,8 +962,12 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
 
-	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
-	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
+	// IOR_OFF_NONE: an overlapped handle keeps no file position, and ReadFile
+	// rejects an all-ones offset (ERROR_INVALID_PARAMETER) on a socket or pipe
+	// as much as on a file, so read from 0 - which a socket or pipe ignores.
+	uint64_t offset = op->offset == IOR_OFF_NONE ? 0 : op->offset;
+	op->overlapped.Offset = (DWORD) (offset & 0xFFFFFFFF);
+	op->overlapped.OffsetHigh = (DWORD) (offset >> 32);
 	atomic_store(&op->state, IOCP_OP_IO);
 
 	BOOL result = ReadFile(h, op->buf, op->len, NULL, &op->overlapped);
@@ -991,6 +997,9 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
 
+	// IOR_OFF_NONE passes through: WriteFile takes an all-ones offset as
+	// "append" on a file and ignores it on a socket or pipe, the nearest
+	// thing an overlapped handle has to a current position.
 	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
 	atomic_store(&op->state, IOCP_OP_IO);

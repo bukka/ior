@@ -297,7 +297,9 @@ typedef enum {
  * For read/write this selects read()/write() semantics over the positioned
  * pread()/pwrite() (required for non-seekable fds such as sockets and pipes).
  * For splice it marks an unused in/out offset. Equal to (uint64_t)-1, matching
- * io_uring's convention for an absent offset.
+ * io_uring's convention for an absent offset. An overlapped handle on IOCP
+ * keeps no current position: a socket or pipe ignores the offset either way,
+ * a file is read from 0 and written at its end.
  */
 #define IOR_OFF_NONE ((uint64_t) -1)
 
