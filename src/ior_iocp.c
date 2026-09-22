@@ -111,11 +111,19 @@ typedef struct ior_iocp_op {
 	// work_res (posted like a work-op result). A multishot poll stays with
 	// the poller and posts each readiness through a shadow op flagged
 	// cqe_more (IOR_CQE_F_MORE on its CQE); WSAPoll being level-triggered,
-	// the op is held out of the poll set until poll_rearm_ns after each.
+	// the op is held out of the poll set (poll_held, poller thread only)
+	// until the consumer marks that shadow's CQE seen, which sets
+	// poll_rearm. The shadow names its parent, with the parent's gen as it
+	// was, so a parent recycled meanwhile is left alone.
 	uint32_t poll_mask;
 	bool poll_multi;
 	bool cqe_more;
-	uint64_t poll_rearm_ns;
+	bool poll_held;
+	_Atomic uint32_t poll_rearm;
+	struct ior_iocp_op *poll_parent;
+	uint32_t poll_parent_gen;
+	// Bumped every time the op returns to the pool; never reset.
+	uint32_t gen;
 
 	// Timeout-specific fields
 	ior_timespec *timeout_ts;
@@ -241,6 +249,10 @@ typedef struct iocp_poller {
 	SOCKET wake_tx;
 	SOCKET wake_rx;
 	_Atomic uint32_t stop;
+	// Set by a consumer re-arming a multishot poll before it sends a wake
+	// byte, cleared by the poller before it reads the re-arm flags: one byte
+	// per poller round, not per edge seen.
+	_Atomic uint32_t wake_pending;
 	ior_iocp_op *incoming; // protected by lock
 	// Active ops, and the WSAPOLLFD set built from them before each wait
 	// ([0] is wake_rx, slot[i] the active index behind pfds[i]); poller
@@ -649,7 +661,10 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->poll_mask = 0;
 	op->poll_multi = false;
 	op->cqe_more = false;
-	op->poll_rearm_ns = 0;
+	op->poll_held = false;
+	atomic_store(&op->poll_rearm, 0);
+	op->poll_parent = NULL;
+	op->poll_parent_gen = 0;
 
 	op->timeout_ts = NULL;
 	op->timeout_flags = 0;
@@ -722,6 +737,7 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	}
 
 	atomic_store(&op->state, IOCP_OP_FREE);
+	op->gen++;
 
 	EnterCriticalSection(&ctx->pool_lock);
 
@@ -1649,18 +1665,48 @@ static void iocp_poller_remove(iocp_poller *p, uint32_t i)
 	p->active[i] = p->active[p->active_len];
 }
 
-static uint64_t qpc_now_ns(void);
+/*
+ * A consumer has marked a multishot poll's edge CQE seen: readiness has been
+ * consumed as far as the contract asks, so let the poller watch the parent
+ * again. The parent is named by pointer and by the gen it had when the edge
+ * was posted; a parent that has ended and returned to the pool since (its
+ * final CQE is behind the edge in the port, but a caller may mark them seen
+ * in any order) has moved on and is left alone. A flag set on an op the
+ * pool has just handed out again is harmless either way: alloc_op clears
+ * it, and the poller reads it only on an op it holds.
+ */
+static void iocp_poll_edge_seen(ior_ctx_iocp *ctx, ior_iocp_op *edge)
+{
+	ior_iocp_op *parent = edge->poll_parent;
+	if (!parent || parent->gen != edge->poll_parent_gen) {
+		return;
+	}
+	atomic_store(&parent->poll_rearm, 1);
+	iocp_poller *p = &ctx->poller;
+	if (!atomic_exchange(&p->wake_pending, 1)) {
+		iocp_poller_wake(p);
+	}
+}
 
-/* Hold a multishot op out of the poll set after a report: WSAPoll is level-
- * triggered and would report the same readiness again at once. */
-#define IOCP_POLL_MULTI_REARM_NS 1000000ULL
+/* The consumer's release of a CQE: re-arm the poll behind an edge, then free. */
+static void consumer_free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	if (op->poll_parent) {
+		iocp_poll_edge_seen(ctx, op);
+	}
+	free_op(ctx, op);
+}
 
 /*
  * Resolve readiness for the poll op at active index i, on the poller thread
  * (the op's active_count slot is held). A one-shot op completes and leaves
  * the set. A multishot op reports the readiness through a shadow op and
  * stays, unless the pool is exhausted, in which case this readiness is its
- * last result (as io_uring ends a multishot when the CQ is full).
+ * last result (as io_uring ends a multishot when the CQ is full). WSAPoll
+ * is level-triggered and would report the same readiness again at once, so
+ * the op is held out of the set until the consumer has seen the edge; a
+ * timed hold is no use here, WSAPoll rounding any timeout up to the system
+ * timer tick (15.6 ms by default).
  */
 static void iocp_poller_fire(ior_ctx_iocp *ctx, iocp_poller *p, uint32_t i, SHORT revents)
 {
@@ -1694,6 +1740,8 @@ static void iocp_poller_fire(ior_ctx_iocp *ctx, iocp_poller *p, uint32_t i, SHOR
 	more->poll_mask = op->poll_mask;
 	more->work_res = mask;
 	more->cqe_more = true;
+	more->poll_parent = op;
+	more->poll_parent_gen = op->gen;
 	if (post_synthetic_completion(ctx, more, ERROR_SUCCESS, 0) < 0) {
 		// The port refused the packet (more is freed): end the poll with
 		// this readiness rather than lose the edge.
@@ -1702,7 +1750,7 @@ static void iocp_poller_fire(ior_ctx_iocp *ctx, iocp_poller *p, uint32_t i, SHOR
 		post_armed_op(ctx, op, ERROR_SUCCESS);
 		return;
 	}
-	op->poll_rearm_ns = qpc_now_ns() + IOCP_POLL_MULTI_REARM_NS;
+	op->poll_held = true;
 }
 
 static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
@@ -1762,24 +1810,22 @@ static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
 		}
 
 		// Build the poll set: the wake socket, then every op not being held
-		// after a multishot report; the nearest hold to end bounds the wait.
+		// after a multishot report, or held and re-armed since. The wake
+		// flag is cleared before the re-arm flags are read: a consumer that
+		// sets one after this read finds the flag clear and sends a byte,
+		// which ends the wait below.
+		atomic_store(&p->wake_pending, 0);
 		p->pfds[0].fd = p->wake_rx;
 		p->pfds[0].events = POLLRDNORM;
 		p->pfds[0].revents = 0;
 		uint32_t n = 1;
-		int timeout_ms = -1;
-		uint64_t now = qpc_now_ns();
 		for (uint32_t i = 0; i < p->active_len; i++) {
 			ior_iocp_op *op = p->active[i];
-			if (op->poll_rearm_ns) {
-				if (op->poll_rearm_ns > now) {
-					uint64_t ms = (op->poll_rearm_ns - now + 999999ULL) / 1000000ULL;
-					if (timeout_ms < 0 || ms < (uint64_t) timeout_ms) {
-						timeout_ms = ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
-					}
+			if (op->poll_held) {
+				if (!atomic_exchange(&op->poll_rearm, 0)) {
 					continue;
 				}
-				op->poll_rearm_ns = 0;
+				op->poll_held = false;
 			}
 			p->pfds[n].fd = (SOCKET) op->fd;
 			p->pfds[n].events = ior_poll_mask_to_wsa(op->poll_mask);
@@ -1788,7 +1834,7 @@ static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
 			n++;
 		}
 
-		int ret = WSAPoll(p->pfds, n, timeout_ms);
+		int ret = WSAPoll(p->pfds, n, -1);
 		if (ret == SOCKET_ERROR) {
 			// No per-socket status to act on; fail everything rather than spin.
 			DWORD err = (DWORD) WSAGetLastError();
@@ -3740,7 +3786,7 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 	if (head_op == op) {
 		// Fast path: in-order consumption, matching the common io_uring usage.
 		ready_queue_pop(&ctx->ready);
-		free_op(ctx, op);
+		consumer_free_op(ctx, op);
 		return;
 	}
 
@@ -3779,7 +3825,7 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 	q->tail = (q->tail - 1) & q->mask;
 	q->count--;
 
-	free_op(ctx, op);
+	consumer_free_op(ctx, op);
 }
 
 static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqes, unsigned max)
@@ -3837,7 +3883,7 @@ static void ior_iocp_backend_cq_advance(void *backend_ctx, unsigned nr)
 		if (!op) {
 			break;
 		}
-		free_op(ctx, op);
+		consumer_free_op(ctx, op);
 	}
 }
 

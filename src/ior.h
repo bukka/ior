@@ -803,9 +803,11 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
  * io_uring uses IORING_POLL_ADD_MULTI. The thread backend watches the
  * descriptor edge-triggered on its poller (EPOLLET on epoll, EV_CLEAR on
  * kqueue). The thread backend's poll(2) poller and the IOCP backend's WSAPoll
- * poller cannot observe edges: they report readiness that persists again after
- * about a millisecond, so no edge is missed, but an undrained descriptor (or
- * one at hang-up) keeps completing until the poll is cancelled.
+ * poller cannot observe edges: they report readiness that persists again, the
+ * poll(2) poller after about a millisecond and the IOCP one once the previous
+ * completion has been marked seen (ior_cqe_seen(), ior_cq_advance()), so no
+ * edge is missed, but an undrained descriptor (or one at hang-up) keeps
+ * completing until the poll is cancelled.
  *
  * A link timeout bounds the whole operation: when it fires, the poll completes
  * with -ECANCELED and the timeout with -ETIME; when the poll ends first, the
