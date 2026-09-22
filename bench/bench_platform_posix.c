@@ -69,7 +69,14 @@ void bench_sleep_forever(void)
 
 int bench_sig_number(int which)
 {
+#ifdef SIGRTMIN
 	return SIGRTMIN + 2 + which;
+#else
+	/* No POSIX real-time signals (macOS): the scenario needs signals that
+	 * queue and carry a value, so it reports -ENOTSUP, as on Windows. */
+	(void) which;
+	return -1;
+#endif
 }
 
 int bench_sig_block(int signo)
@@ -83,9 +90,15 @@ int bench_sig_block(int signo)
 
 int bench_sig_queue(int signo, int value)
 {
+#ifdef SIGRTMIN
 	union sigval v;
 	v.sival_int = value;
 	return sigqueue(getpid(), signo, v) < 0 ? -errno : 0;
+#else
+	(void) signo;
+	(void) value;
+	return -ENOTSUP;
+#endif
 }
 
 int bench_sig_value(const ior_siginfo_t *info)
