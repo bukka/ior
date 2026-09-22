@@ -138,8 +138,8 @@ typedef struct ior_timespec {
 #define IOR_OP_LINK_TIMEOUT 11
 /** Run a user callback on the backend's thread pool (ior_prep_work). */
 #define IOR_OP_WORK 12
-/** Wait for fd readiness (ior_prep_poll_add); completes with an IOR_POLL_*
- *  mask in res. */
+/** Wait for fd readiness (ior_prep_poll_add, ior_prep_poll_multishot);
+ *  completes with an IOR_POLL_* mask in res. */
 #define IOR_OP_POLL 13
 /** Cancel a submitted operation (ior_prep_cancel, ior_prep_cancel_fd). */
 #define IOR_OP_ASYNC_CANCEL 14
@@ -243,6 +243,17 @@ typedef struct ior_timespec {
 #define IOR_POLL_NVAL 0x020
 /** @} */
 
+/**
+ * @name Completion flags
+ * Bits of ior_cqe_get_flags(). Values match io_uring's IORING_CQE_F_* bits.
+ * @{
+ */
+/** More completions follow from the same operation: a multishot poll
+ *  (ior_prep_poll_multishot) posts one per readiness edge and stays armed.
+ *  A completion without this bit is the operation's last. */
+#define IOR_CQE_F_MORE (1U << 1)
+/** @} */
+
 /** Asynchronous I/O backend implementation. */
 typedef enum {
 	/** Auto-select the best backend for the platform. */
@@ -266,7 +277,8 @@ typedef enum {
 #define IOR_FEAT_SPLICE (1U << 1)
 /** Registered/fixed files are supported. */
 #define IOR_FEAT_FIXED_FILE (1U << 2)
-/** IOR_OP_POLL readiness ops are supported (ior_prep_poll_add). */
+/** IOR_OP_POLL readiness ops are supported (ior_prep_poll_add,
+ *  ior_prep_poll_multishot). */
 #define IOR_FEAT_POLL_ADD (1U << 3)
 /** Kernel submission polling is supported. */
 #define IOR_FEAT_SQPOLL (1U << 4)
@@ -285,7 +297,9 @@ typedef enum {
  * For read/write this selects read()/write() semantics over the positioned
  * pread()/pwrite() (required for non-seekable fds such as sockets and pipes).
  * For splice it marks an unused in/out offset. Equal to (uint64_t)-1, matching
- * io_uring's convention for an absent offset.
+ * io_uring's convention for an absent offset. An overlapped handle on IOCP
+ * keeps no current position: a socket or pipe ignores the offset either way,
+ * a file is read from 0 and written at its end.
  */
 #define IOR_OFF_NONE ((uint64_t) -1)
 
@@ -760,6 +774,52 @@ int ior_sigismember(const ior_sigset_t *set, int signo);
  * @param poll_mask  Events to wait for (IOR_POLL_IN, IOR_POLL_OUT, ...).
  */
 void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
+
+/**
+ * Prepare a persistent wait for fd readiness (like io_uring's multishot
+ * POLL_ADD, IORING_POLL_ADD_MULTI).
+ *
+ * Like ior_prep_poll_add(), but the operation stays armed: it posts a
+ * completion for every readiness edge, with the ready IOR_POLL_* mask as res
+ * and IOR_CQE_F_MORE among its flags, until it is cancelled (ior_prep_cancel(),
+ * ior_prep_cancel_fd(), a fired link timeout, ior_queue_exit()) or fails; that
+ * posts its last completion, without IOR_CQE_F_MORE, carrying -ECANCELED or
+ * the error. Every completion carries the operation's user data.
+ *
+ * Readiness is reported when it appears, not while it lasts, as with EPOLLET:
+ * a descriptor that stays readable because nothing reads it produces no
+ * further completions, and one more arrives when new data comes in. Consume
+ * readiness fully after each completion (read until -EAGAIN) before waiting
+ * for the next. A peer hang-up is one edge (IOR_POLL_HUP, with
+ * IOR_CQE_F_MORE still set: the operation cannot tell it is the last event);
+ * cancel the poll once it has been seen. A regular file is always ready and
+ * completes at once with its mask as the last completion.
+ *
+ * The operation may also end on its own, with a positive res and no
+ * IOR_CQE_F_MORE, when a completion cannot be posted: io_uring does so when
+ * the completion queue is full, the IOCP backend when its operation pool is
+ * exhausted. Re-arm by submitting a new poll.
+ *
+ * io_uring uses IORING_POLL_ADD_MULTI. The thread backend watches the
+ * descriptor edge-triggered on its poller (EPOLLET on epoll, EV_CLEAR on
+ * kqueue). The thread backend's poll(2) poller and the IOCP backend's WSAPoll
+ * poller cannot observe edges: they report readiness that persists again, the
+ * poll(2) poller after about a millisecond and the IOCP one once the previous
+ * completion has been marked seen (ior_cqe_seen(), ior_cq_advance()), so no
+ * edge is missed, but an undrained descriptor (or one at hang-up) keeps
+ * completing until the poll is cancelled.
+ *
+ * A link timeout bounds the whole operation: when it fires, the poll completes
+ * with -ECANCELED and the timeout with -ETIME; when the poll ends first, the
+ * timeout completes with -ECANCELED. Do not link another entry behind a
+ * multishot poll: the chain continues only at the poll's last completion.
+ *
+ * @param ctx        I/O context.
+ * @param sqe        Entry from ior_get_sqe().
+ * @param fd         Descriptor to watch.
+ * @param poll_mask  Events to wait for (IOR_POLL_IN, IOR_POLL_OUT, ...).
+ */
+void ior_prep_poll_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 
 /**
  * Prepare a cancellation of a submitted operation, matched by user data.

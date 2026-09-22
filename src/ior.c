@@ -218,6 +218,13 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
 	}
 }
 
+void ior_prep_poll_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_poll_multishot(sqe, fd, poll_mask);
+	}
+}
+
 void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr,
 		socklen_t *addrlen, unsigned flags)
 {

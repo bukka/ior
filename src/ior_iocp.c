@@ -20,6 +20,7 @@
 #include "ior_backend.h"
 #include <stdlib.h>
 #include <stddef.h>
+#include <limits.h>
 #include <string.h>
 #include <errno.h>
 #include <windows.h>
@@ -107,8 +108,22 @@ typedef struct ior_iocp_op {
 	DWORD sock_flags;
 
 	// IOR_OP_POLL: requested IOR_POLL_* mask; the ready mask is delivered in
-	// work_res (posted like a work-op result).
+	// work_res (posted like a work-op result). A multishot poll stays with
+	// the poller and posts each readiness through a shadow op flagged
+	// cqe_more (IOR_CQE_F_MORE on its CQE); WSAPoll being level-triggered,
+	// the op is held out of the poll set (poll_held, poller thread only)
+	// until the consumer marks that shadow's CQE seen, which sets
+	// poll_rearm. The shadow names its parent, with the parent's gen as it
+	// was, so a parent recycled meanwhile is left alone.
 	uint32_t poll_mask;
+	bool poll_multi;
+	bool cqe_more;
+	bool poll_held;
+	_Atomic uint32_t poll_rearm;
+	struct ior_iocp_op *poll_parent;
+	uint32_t poll_parent_gen;
+	// Bumped every time the op returns to the pool; never reset.
+	uint32_t gen;
 
 	// Timeout-specific fields
 	ior_timespec *timeout_ts;
@@ -234,10 +249,17 @@ typedef struct iocp_poller {
 	SOCKET wake_tx;
 	SOCKET wake_rx;
 	_Atomic uint32_t stop;
+	// Set by a consumer re-arming a multishot poll before it sends a wake
+	// byte, cleared by the poller before it reads the re-arm flags: one byte
+	// per poller round, not per edge seen.
+	_Atomic uint32_t wake_pending;
 	ior_iocp_op *incoming; // protected by lock
-	// Active ops and their WSAPOLLFD slots ([0] is wake_rx); poller thread only.
+	// Active ops, and the WSAPOLLFD set built from them before each wait
+	// ([0] is wake_rx, slot[i] the active index behind pfds[i]); poller
+	// thread only.
 	ior_iocp_op **active;
 	WSAPOLLFD *pfds;
+	uint32_t *slot;
 	uint32_t active_len;
 	uint32_t active_cap;
 } iocp_poller;
@@ -393,6 +415,8 @@ static int win_error_to_errno(DWORD err)
 			return -ECANCELED;
 		case ERROR_INVALID_HANDLE:
 			return -EBADF;
+		case ERROR_INVALID_PARAMETER:
+			return -EINVAL;
 		case ERROR_NOT_SUPPORTED:
 			return -ENOTSUP;
 		case ERROR_ABANDONED_WAIT_0:
@@ -634,6 +658,14 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->wsabuf.len = 0;
 	op->sock_flags = 0;
 
+	op->poll_mask = 0;
+	op->poll_multi = false;
+	op->cqe_more = false;
+	op->poll_held = false;
+	atomic_store(&op->poll_rearm, 0);
+	op->poll_parent = NULL;
+	op->poll_parent_gen = 0;
+
 	op->timeout_ts = NULL;
 	op->timeout_flags = 0;
 
@@ -705,6 +737,7 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	}
 
 	atomic_store(&op->state, IOCP_OP_FREE);
+	op->gen++;
 
 	EnterCriticalSection(&ctx->pool_lock);
 
@@ -945,8 +978,12 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
 
-	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
-	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
+	// IOR_OFF_NONE: an overlapped handle keeps no file position, and ReadFile
+	// rejects an all-ones offset (ERROR_INVALID_PARAMETER) on a socket or pipe
+	// as much as on a file, so read from 0 - which a socket or pipe ignores.
+	uint64_t offset = op->offset == IOR_OFF_NONE ? 0 : op->offset;
+	op->overlapped.Offset = (DWORD) (offset & 0xFFFFFFFF);
+	op->overlapped.OffsetHigh = (DWORD) (offset >> 32);
 	atomic_store(&op->state, IOCP_OP_IO);
 
 	BOOL result = ReadFile(h, op->buf, op->len, NULL, &op->overlapped);
@@ -976,6 +1013,9 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
 	}
 
+	// IOR_OFF_NONE passes through: WriteFile takes an all-ones offset as
+	// "append" on a file and ignores it on a socket or pipe, the nearest
+	// thing an overlapped handle has to a current position.
 	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
 	atomic_store(&op->state, IOCP_OP_IO);
@@ -1618,24 +1658,99 @@ static void iocp_poller_drain_wake(iocp_poller *p)
 	while (recv(p->wake_rx, buf, sizeof(buf), 0) > 0) { }
 }
 
-/* Remove slot i by swapping in the last active entry. */
+/* Remove active entry i by swapping in the last one. */
 static void iocp_poller_remove(iocp_poller *p, uint32_t i)
 {
 	p->active_len--;
 	p->active[i] = p->active[p->active_len];
-	p->pfds[i + 1] = p->pfds[p->active_len + 1];
 }
 
-/* Complete a poll op from the poller thread (active_count slot already held). */
-static void iocp_poller_post(ior_ctx_iocp *ctx, ior_iocp_op *op, SHORT revents)
+/*
+ * A consumer has marked a multishot poll's edge CQE seen: readiness has been
+ * consumed as far as the contract asks, so let the poller watch the parent
+ * again. The parent is named by pointer and by the gen it had when the edge
+ * was posted; a parent that has ended and returned to the pool since (its
+ * final CQE is behind the edge in the port, but a caller may mark them seen
+ * in any order) has moved on and is left alone. A flag set on an op the
+ * pool has just handed out again is harmless either way: alloc_op clears
+ * it, and the poller reads it only on an op it holds.
+ */
+static void iocp_poll_edge_seen(ior_ctx_iocp *ctx, ior_iocp_op *edge)
 {
+	ior_iocp_op *parent = edge->poll_parent;
+	if (!parent || parent->gen != edge->poll_parent_gen) {
+		return;
+	}
+	atomic_store(&parent->poll_rearm, 1);
+	iocp_poller *p = &ctx->poller;
+	if (!atomic_exchange(&p->wake_pending, 1)) {
+		iocp_poller_wake(p);
+	}
+}
+
+/* The consumer's release of a CQE: re-arm the poll behind an edge, then free. */
+static void consumer_free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	if (op->poll_parent) {
+		iocp_poll_edge_seen(ctx, op);
+	}
+	free_op(ctx, op);
+}
+
+/*
+ * Resolve readiness for the poll op at active index i, on the poller thread
+ * (the op's active_count slot is held). A one-shot op completes and leaves
+ * the set. A multishot op reports the readiness through a shadow op and
+ * stays, unless the pool is exhausted, in which case this readiness is its
+ * last result (as io_uring ends a multishot when the CQ is full). WSAPoll
+ * is level-triggered and would report the same readiness again at once, so
+ * the op is held out of the set until the consumer has seen the edge; a
+ * timed hold is no use here, WSAPoll rounding any timeout up to the system
+ * timer tick (15.6 ms by default).
+ */
+static void iocp_poller_fire(ior_ctx_iocp *ctx, iocp_poller *p, uint32_t i, SHORT revents)
+{
+	ior_iocp_op *op = p->active[i];
+
 	if (revents & POLLNVAL) {
 		// Not a socket (or a closed one) - poll works on sockets only.
+		iocp_poller_remove(p, i);
 		post_armed_op(ctx, op, WSAENOTSOCK);
 		return;
 	}
-	op->work_res = (int32_t) wsa_to_ior_poll_mask(revents);
-	post_armed_op(ctx, op, ERROR_SUCCESS);
+
+	int32_t mask = (int32_t) wsa_to_ior_poll_mask(revents);
+	if (!op->poll_multi) {
+		iocp_poller_remove(p, i);
+		op->work_res = mask;
+		post_armed_op(ctx, op, ERROR_SUCCESS);
+		return;
+	}
+
+	ior_iocp_op *more = alloc_op(ctx);
+	if (!more) {
+		iocp_poller_remove(p, i);
+		op->work_res = mask;
+		post_armed_op(ctx, op, ERROR_SUCCESS);
+		return;
+	}
+	more->opcode = IOR_OP_POLL;
+	more->fd = op->fd;
+	more->user_data = op->user_data;
+	more->poll_mask = op->poll_mask;
+	more->work_res = mask;
+	more->cqe_more = true;
+	more->poll_parent = op;
+	more->poll_parent_gen = op->gen;
+	if (post_synthetic_completion(ctx, more, ERROR_SUCCESS, 0) < 0) {
+		// The port refused the packet (more is freed): end the poll with
+		// this readiness rather than lose the edge.
+		iocp_poller_remove(p, i);
+		op->work_res = mask;
+		post_armed_op(ctx, op, ERROR_SUCCESS);
+		return;
+	}
+	op->poll_held = true;
 }
 
 static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
@@ -1657,13 +1772,17 @@ static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
 				uint32_t cap = p->active_cap ? p->active_cap * 2 : 16;
 				ior_iocp_op **active = realloc(p->active, cap * sizeof(*active));
 				WSAPOLLFD *pfds = realloc(p->pfds, (cap + 1) * sizeof(*pfds));
+				uint32_t *slot = realloc(p->slot, (cap + 1) * sizeof(*slot));
 				if (active) {
 					p->active = active;
 				}
 				if (pfds) {
 					p->pfds = pfds;
 				}
-				if (!active || !pfds) {
+				if (slot) {
+					p->slot = slot;
+				}
+				if (!active || !pfds || !slot) {
 					post_armed_op(ctx, in, ERROR_NOT_ENOUGH_MEMORY);
 					in = next;
 					continue;
@@ -1671,8 +1790,6 @@ static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
 				p->active_cap = cap;
 			}
 			p->active[p->active_len] = in;
-			p->pfds[p->active_len + 1].fd = (SOCKET) in->fd;
-			p->pfds[p->active_len + 1].events = ior_poll_mask_to_wsa(in->poll_mask);
 			p->active_len++;
 			in = next;
 		}
@@ -1692,14 +1809,33 @@ static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
 			}
 		}
 
+		// Build the poll set: the wake socket, then every op not being held
+		// after a multishot report, or held and re-armed since. The wake
+		// flag is cleared before the re-arm flags are read: a consumer that
+		// sets one after this read finds the flag clear and sends a byte,
+		// which ends the wait below.
+		atomic_store(&p->wake_pending, 0);
 		p->pfds[0].fd = p->wake_rx;
 		p->pfds[0].events = POLLRDNORM;
-		for (uint32_t i = 0; i <= p->active_len; i++) {
-			p->pfds[i].revents = 0;
+		p->pfds[0].revents = 0;
+		uint32_t n = 1;
+		for (uint32_t i = 0; i < p->active_len; i++) {
+			ior_iocp_op *op = p->active[i];
+			if (op->poll_held) {
+				if (!atomic_exchange(&op->poll_rearm, 0)) {
+					continue;
+				}
+				op->poll_held = false;
+			}
+			p->pfds[n].fd = (SOCKET) op->fd;
+			p->pfds[n].events = ior_poll_mask_to_wsa(op->poll_mask);
+			p->pfds[n].revents = 0;
+			p->slot[n] = i;
+			n++;
 		}
 
-		int n = WSAPoll(p->pfds, p->active_len + 1, -1);
-		if (n == SOCKET_ERROR) {
+		int ret = WSAPoll(p->pfds, n, -1);
+		if (ret == SOCKET_ERROR) {
 			// No per-socket status to act on; fail everything rather than spin.
 			DWORD err = (DWORD) WSAGetLastError();
 			while (p->active_len > 0) {
@@ -1713,14 +1849,12 @@ static DWORD WINAPI iocp_poller_thread_main(LPVOID arg)
 		if (p->pfds[0].revents) {
 			iocp_poller_drain_wake(p);
 		}
-		for (uint32_t i = 0; i < p->active_len;) {
-			SHORT revents = p->pfds[i + 1].revents;
-			if (revents) {
-				ior_iocp_op *op = p->active[i];
-				iocp_poller_remove(p, i);
-				iocp_poller_post(ctx, op, revents);
-			} else {
-				i++;
+		// Highest active index first: removing one swaps the last active op
+		// into its place, which is an index already handled or one that was
+		// not polled, so the indices still to handle stay put.
+		for (uint32_t k = n; k-- > 1;) {
+			if (p->pfds[k].revents) {
+				iocp_poller_fire(ctx, p, p->slot[k], p->pfds[k].revents);
 			}
 		}
 	}
@@ -1787,7 +1921,8 @@ static int iocp_poller_ensure(ior_ctx_iocp *ctx)
 	p->active_cap = 16;
 	p->active = malloc(p->active_cap * sizeof(*p->active));
 	p->pfds = malloc((p->active_cap + 1) * sizeof(*p->pfds));
-	if (!p->active || !p->pfds) {
+	p->slot = malloc((p->active_cap + 1) * sizeof(*p->slot));
+	if (!p->active || !p->pfds || !p->slot) {
 		goto fail;
 	}
 
@@ -1806,8 +1941,10 @@ static int iocp_poller_ensure(ior_ctx_iocp *ctx)
 fail:
 	free(p->active);
 	free(p->pfds);
+	free(p->slot);
 	p->active = NULL;
 	p->pfds = NULL;
+	p->slot = NULL;
 	p->active_cap = 0;
 	if (rx != INVALID_SOCKET) {
 		closesocket(rx);
@@ -1846,7 +1983,7 @@ static int issue_poll(ior_ctx_iocp *ctx, ior_iocp_op *op)
 static void op_to_cqe(ior_iocp_op *op)
 {
 	op->cqe.iocp.user_data = op->user_data;
-	op->cqe.iocp.flags = 0;
+	op->cqe.iocp.flags = op->cqe_more ? IOR_CQE_F_MORE : 0;
 
 	if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
@@ -2892,6 +3029,7 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		closesocket(ctx->poller.wake_rx);
 		free(ctx->poller.active);
 		free(ctx->poller.pfds);
+		free(ctx->poller.slot);
 	}
 	DeleteCriticalSection(&ctx->poller.lock);
 
@@ -3420,8 +3558,11 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	atomic_fetch_sub(&ctx->active_count, 1);
 #endif
 
-	// Mark completion (for DRAIN barriers)
-	atomic_fetch_add(&ctx->completed_cnt, 1);
+	// Mark completion (for DRAIN barriers). A multishot poll's edge is not
+	// the completion of a submitted op: the poll itself is still in flight.
+	if (!op->cqe_more) {
+		atomic_fetch_add(&ctx->completed_cnt, 1);
+	}
 
 	if (op->opcode == IOR_OP_ACCEPT || op->opcode == IOR_OP_CONNECT) {
 		finish_socket_op(ctx, op);
@@ -3645,7 +3786,7 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 	if (head_op == op) {
 		// Fast path: in-order consumption, matching the common io_uring usage.
 		ready_queue_pop(&ctx->ready);
-		free_op(ctx, op);
+		consumer_free_op(ctx, op);
 		return;
 	}
 
@@ -3684,7 +3825,7 @@ static void ior_iocp_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 	q->tail = (q->tail - 1) & q->mask;
 	q->count--;
 
-	free_op(ctx, op);
+	consumer_free_op(ctx, op);
 }
 
 static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqes, unsigned max)
@@ -3742,7 +3883,7 @@ static void ior_iocp_backend_cq_advance(void *backend_ctx, unsigned nr)
 		if (!op) {
 			break;
 		}
-		free_op(ctx, op);
+		consumer_free_op(ctx, op);
 	}
 }
 
@@ -3848,6 +3989,12 @@ static void ior_iocp_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t p
 	op->opcode = IOR_OP_POLL;
 	op->fd = fd;
 	op->poll_mask = poll_mask;
+}
+
+static void ior_iocp_backend_prep_poll_multishot(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)
+{
+	ior_iocp_backend_prep_poll_add(sqe, fd, poll_mask);
+	((ior_iocp_op *) sqe)->poll_multi = true;
 }
 
 static void ior_iocp_backend_prep_accept(
@@ -4040,6 +4187,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_send = ior_iocp_backend_prep_send,
 	.prep_recv = ior_iocp_backend_prep_recv,
 	.prep_poll_add = ior_iocp_backend_prep_poll_add,
+	.prep_poll_multishot = ior_iocp_backend_prep_poll_multishot,
 	.prep_accept = ior_iocp_backend_prep_accept,
 	.prep_connect = ior_iocp_backend_prep_connect,
 	.prep_cancel = ior_iocp_backend_prep_cancel,

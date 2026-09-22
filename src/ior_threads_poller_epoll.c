@@ -8,6 +8,7 @@
 #include "ior_threads_event.h"
 #include "ior_worker_pool.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -23,18 +24,25 @@ typedef struct ior_poller_req {
 	uint32_t mask;
 	uint64_t deadline_ns; /* absolute monotonic, 0 = none */
 	void *req;
+	int multi; /* persistent: completes at every edge until dropped */
 	int cancelled; /* set by cancel(); completes with -ECANCELED */
 	int res; /* staged result while the fd bookkeeping completes */
-	struct ior_poller_req *next;
+	int retired; /* staged with its last result: unlinked, freed after the callback */
+	struct ior_poller_req *next; /* incoming queue, then the node's list */
+	struct ior_poller_req *done_next; /* staged completions */
 } ior_poller_req;
 
 /*
- * epoll allows one registration per fd, so requests are grouped in per-fd
- * nodes registered with the union of their masks. Plain linked lists: the
- * expected request count is modest.
+ * epoll allows one registration per fd, so one-shot requests are grouped in
+ * per-fd nodes registered level-triggered with the union of their masks. The
+ * trigger mode is per registration, so a multishot request, which needs
+ * EPOLLET, watches a dup(2) of its descriptor in a node of its own (`multi`,
+ * with `fd` the dup). Plain linked lists: the expected request count is
+ * modest.
  */
 typedef struct ior_poller_fd_node {
 	int fd;
+	int multi;
 	ior_poller_req *reqs;
 	struct ior_poller_fd_node *next;
 } ior_poller_fd_node;
@@ -89,25 +97,30 @@ static uint32_t ior_poller_from_epoll(uint32_t ep_events)
 	return mask;
 }
 
-static uint32_t ior_poller_node_union(const ior_poller_fd_node *node)
+static uint32_t ior_poller_node_events(const ior_poller_fd_node *node)
 {
 	uint32_t mask = 0;
 	for (const ior_poller_req *r = node->reqs; r; r = r->next) {
 		mask |= r->mask;
 	}
-	return mask;
+	return ior_poller_to_epoll(mask) | (node->multi ? EPOLLET : 0);
 }
 
-/* Stage r for completion with res on the done list (lock held). */
-static void ior_poller_done_push(ior_poller_req **done, ior_poller_req *r, int res)
+/*
+ * Stage r for completion with res on the done list (lock held). A retired
+ * request has been unlinked and is freed after its callback; a multishot
+ * request reporting an edge stays in its node.
+ */
+static void ior_poller_stage(ior_poller_req **done, ior_poller_req *r, int res, int retired)
 {
 	r->res = res;
-	r->next = *done;
+	r->retired = retired;
+	r->done_next = *done;
 	*done = r;
 }
 
 /*
- * Complete a batch of unlinked requests. Must run with the lock released and
+ * Complete a batch of staged requests. Must run with the lock released and
  * only after the fd's epoll registration has been updated: once the callback
  * fires, the owner may close the fd, so the poller must no longer reference
  * it.
@@ -115,9 +128,11 @@ static void ior_poller_done_push(ior_poller_req **done, ior_poller_req *r, int r
 static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req *done)
 {
 	while (done) {
-		ior_poller_req *next = done->next;
-		poller->cb(poller->owner, done->req, done->res);
-		free(done);
+		ior_poller_req *next = done->done_next;
+		poller->cb(poller->owner, done->req, done->res, !done->retired);
+		if (done->retired) {
+			free(done);
+		}
 		done = next;
 	}
 }
@@ -127,7 +142,7 @@ static void ior_poller_node_update(ior_threads_poller *poller, ior_poller_fd_nod
 {
 	if (node->reqs) {
 		struct epoll_event ev = {
-			.events = ior_poller_to_epoll(ior_poller_node_union(node)),
+			.events = ior_poller_node_events(node),
 			.data.ptr = node,
 		};
 		epoll_ctl(poller->epfd, EPOLL_CTL_MOD, node->fd, &ev);
@@ -135,6 +150,9 @@ static void ior_poller_node_update(ior_threads_poller *poller, ior_poller_fd_nod
 	}
 
 	epoll_ctl(poller->epfd, EPOLL_CTL_DEL, node->fd, NULL);
+	if (node->multi) {
+		close(node->fd);
+	}
 	ior_poller_fd_node **pp = &poller->fds;
 	while (*pp != node) {
 		pp = &(*pp)->next;
@@ -147,48 +165,66 @@ static void ior_poller_ingest_one(
 		ior_threads_poller *poller, ior_poller_req *r, ior_poller_req **done)
 {
 	if (r->cancelled) {
-		ior_poller_done_push(done, r, -ECANCELED);
+		ior_poller_stage(done, r, -ECANCELED, 1);
 		return;
 	}
 
-	ior_poller_fd_node *node = poller->fds;
-	while (node && node->fd != r->fd) {
-		node = node->next;
+	if (!r->multi) {
+		ior_poller_fd_node *node = poller->fds;
+		while (node && (node->multi || node->fd != r->fd)) {
+			node = node->next;
+		}
+		if (node) {
+			r->next = node->reqs;
+			node->reqs = r;
+			struct epoll_event ev = {
+				.events = ior_poller_node_events(node),
+				.data.ptr = node,
+			};
+			epoll_ctl(poller->epfd, EPOLL_CTL_MOD, node->fd, &ev);
+			return;
+		}
 	}
 
-	if (node) {
-		r->next = node->reqs;
-		node->reqs = r;
-		struct epoll_event ev = {
-			.events = ior_poller_to_epoll(ior_poller_node_union(node)),
-			.data.ptr = node,
-		};
-		epoll_ctl(poller->epfd, EPOLL_CTL_MOD, node->fd, &ev);
-		return;
+	int fd = r->fd;
+	if (r->multi) {
+		fd = fcntl(r->fd, F_DUPFD_CLOEXEC, 0);
+		if (fd < 0) {
+			ior_poller_stage(done, r, -errno, 1);
+			return;
+		}
 	}
 
-	node = calloc(1, sizeof(*node));
+	ior_poller_fd_node *node = calloc(1, sizeof(*node));
 	if (!node) {
-		ior_poller_done_push(done, r, -ENOMEM);
+		if (r->multi) {
+			close(fd);
+		}
+		ior_poller_stage(done, r, -ENOMEM, 1);
 		return;
 	}
-	node->fd = r->fd;
+	node->fd = fd;
+	node->multi = r->multi;
 	node->reqs = r;
 	r->next = NULL;
 
 	struct epoll_event ev = {
-		.events = ior_poller_to_epoll(r->mask),
+		.events = ior_poller_node_events(node),
 		.data.ptr = node,
 	};
-	if (epoll_ctl(poller->epfd, EPOLL_CTL_ADD, r->fd, &ev) < 0) {
+	if (epoll_ctl(poller->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
 		int err = errno;
+		if (r->multi) {
+			close(fd);
+		}
 		free(node);
 		if (err == EPERM) {
-			/* Regular file: always ready, matching poll()/io_uring. */
+			/* Regular file: always ready, matching poll()/io_uring. Nothing
+			 * to watch for edges either, so a multishot ends here. */
 			uint32_t ready = r->mask & (IOR_POLL_IN | IOR_POLL_OUT);
-			ior_poller_done_push(done, r, ready ? (int) ready : -EINVAL);
+			ior_poller_stage(done, r, ready ? (int) ready : -EINVAL, 1);
 		} else {
-			ior_poller_done_push(done, r, -err);
+			ior_poller_stage(done, r, -err, 1);
 		}
 		return;
 	}
@@ -226,11 +262,11 @@ static void ior_poller_sweep(ior_threads_poller *poller, ior_poller_req **done)
 			ior_poller_req *r = *pp;
 			if (r->cancelled) {
 				*pp = r->next;
-				ior_poller_done_push(done, r, -ECANCELED);
+				ior_poller_stage(done, r, -ECANCELED, 1);
 				changed = 1;
 			} else if (r->deadline_ns && r->deadline_ns <= now) {
 				*pp = r->next;
-				ior_poller_done_push(done, r, -ETIME);
+				ior_poller_stage(done, r, -ETIME, 1);
 				changed = 1;
 			} else {
 				pp = &r->next;
@@ -265,27 +301,39 @@ static int ior_poller_timeout_ms(ior_threads_poller *poller)
 	return ms > (uint64_t) INT_MAX ? INT_MAX : (int) ms;
 }
 
-/* Lock held. A request cancelled while epoll_wait() ran still reports
- * -ECANCELED: cancel() has already promised that result. */
+/*
+ * Lock held. A request cancelled while epoll_wait() ran still reports
+ * -ECANCELED: cancel() has already promised that result. A multishot request
+ * reports the edge and stays registered; a cancel that lands meanwhile is
+ * delivered by the next sweep, after the edge.
+ */
 static void ior_poller_dispatch(ior_threads_poller *poller, ior_poller_fd_node *node,
 		uint32_t ep_events, ior_poller_req **done)
 {
 	uint32_t ready = ior_poller_from_epoll(ep_events);
+	int changed = 0;
 	ior_poller_req **pp = &node->reqs;
 	while (*pp) {
 		ior_poller_req *r = *pp;
 		uint32_t res = ready & (r->mask | IOR_POLL_ERR | IOR_POLL_HUP);
 		if (r->cancelled) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, -ECANCELED);
+			ior_poller_stage(done, r, -ECANCELED, 1);
+			changed = 1;
+		} else if (res && r->multi) {
+			ior_poller_stage(done, r, (int) res, 0);
+			pp = &r->next;
 		} else if (res) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, (int) res);
+			ior_poller_stage(done, r, (int) res, 1);
+			changed = 1;
 		} else {
 			pp = &r->next;
 		}
 	}
-	ior_poller_node_update(poller, node);
+	if (changed) {
+		ior_poller_node_update(poller, node);
+	}
 }
 
 /* Lock held. */
@@ -296,10 +344,13 @@ static void ior_poller_cancel_all(ior_threads_poller *poller, ior_poller_req **d
 	while (node) {
 		ior_poller_fd_node *next_node = node->next;
 		epoll_ctl(poller->epfd, EPOLL_CTL_DEL, node->fd, NULL);
+		if (node->multi) {
+			close(node->fd);
+		}
 		ior_poller_req *r = node->reqs;
 		while (r) {
 			ior_poller_req *next = r->next;
-			ior_poller_done_push(done, r, -ECANCELED);
+			ior_poller_stage(done, r, -ECANCELED, 1);
 			r = next;
 		}
 		free(node);
@@ -414,7 +465,8 @@ int ior_threads_poller_add(
 		return -ENOMEM;
 	}
 	r->fd = fd;
-	r->mask = ior_mask;
+	r->mask = ior_mask & ~IOR_THREADS_POLLER_MULTI;
+	r->multi = (ior_mask & IOR_THREADS_POLLER_MULTI) != 0;
 	r->deadline_ns = deadline_ns;
 	r->req = req;
 

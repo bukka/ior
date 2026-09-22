@@ -196,11 +196,30 @@ static uint64_t ior_threads_pool_cancel_chain(ior_threads_pool *pool, ior_work *
  * worker pool on success or is cancelled on failure. A ready rw op resumes on
  * a worker as a whole (its syscall runs there); a ready poll op completes here.
  */
-static void ior_threads_pool_poll_done(void *owner, void *req, int res)
+static void ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 {
 	ior_threads_pool *pool = owner;
 	ior_work *w = req;
 	uint64_t count = 1;
+
+	/*
+	 * A multishot poll reports each edge and stays on the poller, so the op
+	 * is not claimed back: a cancel racing this is found there and delivers
+	 * the final -ECANCELED after the edge. One that claimed the op already
+	 * (possible only once the poller has unlinked it) gets no edge; its
+	 * cancellation follows.
+	 */
+	if (more) {
+		if (atomic_load_explicit(&w->state, memory_order_acquire) == IOR_WORK_POLLING) {
+			ior_cqe cqe;
+			memset(&cqe, 0, sizeof(cqe));
+			cqe.threads.user_data = w->sqe.threads.user_data;
+			cqe.threads.res = res;
+			cqe.threads.flags = IOR_CQE_F_MORE;
+			ior_threads_pool_post_completion(pool, &cqe);
+		}
+		return;
+	}
 
 	// Claim the op back from the poller. A cancel that raced the poller's
 	// dispatch has promised -ECANCELED; honour it whatever the poller saw,
@@ -1017,6 +1036,9 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		if (gate) {
 			uint32_t mask = opcode == IOR_OP_POLL ? w->sqe.threads.poll_events
 												  : (events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT);
+			if (opcode == IOR_OP_POLL && (w->sqe.threads.len & IOR_POLL_ADD_MULTI)) {
+				mask |= IOR_THREADS_POLLER_MULTI;
+			}
 			int ret = ior_threads_pool_hand_to_poller(pool, w, lt, w->sqe.threads.fd, mask);
 			if (ret == 0) {
 				// Ownership of w and its whole chain moved to the poller.

@@ -447,6 +447,12 @@ static void ior_threads_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_
 	sqe->threads.poll_events = poll_mask;
 }
 
+static void ior_threads_backend_prep_poll_multishot(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)
+{
+	ior_threads_backend_prep_poll_add(sqe, fd, poll_mask);
+	sqe->threads.len = IOR_POLL_ADD_MULTI;
+}
+
 static void ior_threads_backend_prep_accept(
 		ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags)
 {
@@ -607,6 +613,7 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_send = ior_threads_backend_prep_send,
 	.prep_recv = ior_threads_backend_prep_recv,
 	.prep_poll_add = ior_threads_backend_prep_poll_add,
+	.prep_poll_multishot = ior_threads_backend_prep_poll_multishot,
 	.prep_accept = ior_threads_backend_prep_accept,
 	.prep_connect = ior_threads_backend_prep_connect,
 	.prep_cancel = ior_threads_backend_prep_cancel,

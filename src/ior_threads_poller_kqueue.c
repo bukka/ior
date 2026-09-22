@@ -8,6 +8,7 @@
 #include "ior_threads_event.h"
 #include "ior_worker_pool.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -25,21 +26,27 @@ typedef struct ior_poller_req {
 	uint32_t mask;
 	uint64_t deadline_ns; /* absolute monotonic, 0 = none */
 	void *req;
+	int multi; /* persistent: completes at every edge until dropped */
 	int cancelled; /* set by cancel(); completes with -ECANCELED */
 	int res; /* staged result while the fd bookkeeping completes */
-	struct ior_poller_req *next;
+	int retired; /* staged with its last result: unlinked, freed after the callback */
+	struct ior_poller_req *next; /* incoming queue, then the node's list */
+	struct ior_poller_req *done_next; /* staged completions */
 } ior_poller_req;
 
 /*
  * kqueue registers per (fd, filter) pair, so requests are grouped in per-fd
  * nodes and the node tracks which filters are currently registered (`reg`,
  * as IOR_POLL_IN/OUT bits, or IOR_THREADS_POLLER_PROC for a process watch,
- * whose node is keyed by pid). Plain linked lists: the expected request
- * count is modest.
+ * whose node is keyed by pid). A multishot request needs EV_CLEAR on its
+ * filters, which is per registration, so it watches a dup(2) of its
+ * descriptor in a node of its own (`multi`, with `fd` the dup). Plain linked
+ * lists: the expected request count is modest.
  */
 typedef struct ior_poller_fd_node {
 	int fd;
 	int proc; /* fd is a pid watched with EVFILT_PROC */
+	int multi;
 	uint32_t reg;
 	ior_poller_req *reqs;
 	struct ior_poller_fd_node *next;
@@ -64,28 +71,56 @@ struct ior_threads_poller {
 	ior_poller_fd_node *fds;
 };
 
-/* Stage r for completion with res on the done list (lock held). */
-static void ior_poller_done_push(ior_poller_req **done, ior_poller_req *r, int res)
+/*
+ * Stage r for completion with res on the done list (lock held). A retired
+ * request has been unlinked and is freed after its callback; a multishot
+ * request reporting an edge stays in its node.
+ */
+static void ior_poller_stage(ior_poller_req **done, ior_poller_req *r, int res, int retired)
 {
 	r->res = res;
-	r->next = *done;
+	r->retired = retired;
+	r->done_next = *done;
 	*done = r;
 }
 
 /*
- * Complete a batch of unlinked requests with their staged res. Must run with
- * the lock released and only after the fd's kevent registrations have been
- * updated: once the callback fires, the owner may close the fd, so the poller
- * must no longer reference it.
+ * Complete a batch of staged requests. Must run with the lock released and
+ * only after the fd's kevent registrations have been updated: once the
+ * callback fires, the owner may close the fd, so the poller must no longer
+ * reference it.
  */
 static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req *done)
 {
 	while (done) {
-		ior_poller_req *next = done->next;
-		poller->cb(poller->owner, done->req, done->res);
-		free(done);
+		ior_poller_req *next = done->done_next;
+		poller->cb(poller->owner, done->req, done->res, !done->retired);
+		if (done->retired) {
+			free(done);
+		}
 		done = next;
 	}
+}
+
+/* A regular file has no readiness edges: it is always ready, matching poll(). */
+static int ior_poller_fd_is_regular(int fd)
+{
+	struct stat st;
+	return fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* Unlink and free an empty node; a multishot node owns its dup. Lock held. */
+static void ior_poller_node_drop(ior_threads_poller *poller, ior_poller_fd_node *node)
+{
+	if (node->multi) {
+		close(node->fd);
+	}
+	ior_poller_fd_node **pp = &poller->fds;
+	while (*pp != node) {
+		pp = &(*pp)->next;
+	}
+	*pp = node->next;
+	free(node);
 }
 
 /*
@@ -112,7 +147,7 @@ static void ior_poller_node_sync(
 				node->reqs = NULL;
 				while (r) {
 					ior_poller_req *next = r->next;
-					ior_poller_done_push(done, r, -err);
+					ior_poller_stage(done, r, -err, 1);
 					r = next;
 				}
 			}
@@ -122,12 +157,7 @@ static void ior_poller_node_sync(
 				EV_SET(&kev, node->fd, EVFILT_PROC, EV_DELETE, 0, 0, NULL);
 				(void) kevent(poller->kq, &kev, 1, NULL, 0, NULL);
 			}
-			ior_poller_fd_node **pp = &poller->fds;
-			while (*pp != node) {
-				pp = &(*pp)->next;
-			}
-			*pp = node->next;
-			free(node);
+			ior_poller_node_drop(poller, node);
 		}
 		return;
 	}
@@ -143,20 +173,19 @@ static void ior_poller_node_sync(
 
 		struct kevent kev;
 		if ((want & bit) && !(node->reg & bit)) {
-			EV_SET(&kev, node->fd, filter, EV_ADD, 0, 0, node);
+			EV_SET(&kev, node->fd, filter, EV_ADD | (node->multi ? EV_CLEAR : 0), 0, 0, node);
 			if (kevent(poller->kq, &kev, 1, NULL, 0, NULL) == 0) {
 				node->reg |= bit;
 			} else {
 				int err = errno;
-				struct stat st;
-				int regular = fstat(node->fd, &st) == 0 && S_ISREG(st.st_mode);
+				int regular = ior_poller_fd_is_regular(node->fd);
 				ior_poller_req **pp = &node->reqs;
 				while (*pp) {
 					ior_poller_req *r = *pp;
 					if (r->mask & bit) {
 						*pp = r->next;
 						uint32_t ready = r->mask & (IOR_POLL_IN | IOR_POLL_OUT);
-						ior_poller_done_push(done, r, regular ? (int) ready : -err);
+						ior_poller_stage(done, r, regular ? (int) ready : -err, 1);
 					} else {
 						pp = &r->next;
 					}
@@ -179,12 +208,7 @@ static void ior_poller_node_sync(
 				(void) kevent(poller->kq, &kev, 1, NULL, 0, NULL);
 			}
 		}
-		ior_poller_fd_node **pp = &poller->fds;
-		while (*pp != node) {
-			pp = &(*pp)->next;
-		}
-		*pp = node->next;
-		free(node);
+		ior_poller_node_drop(poller, node);
 	}
 }
 
@@ -192,24 +216,53 @@ static void ior_poller_ingest_one(
 		ior_threads_poller *poller, ior_poller_req *r, ior_poller_req **done)
 {
 	if (r->cancelled) {
-		ior_poller_done_push(done, r, -ECANCELED);
+		ior_poller_stage(done, r, -ECANCELED, 1);
 		return;
 	}
 
 	int proc = (r->mask & IOR_THREADS_POLLER_PROC) != 0;
-	ior_poller_fd_node *node = poller->fds;
-	while (node && (node->fd != r->fd || node->proc != proc)) {
-		node = node->next;
+
+	/*
+	 * kqueue registers a regular file happily and reports it readable, where
+	 * epoll refuses it (EPERM). There are no edges to watch for, so a
+	 * multishot ends here with the requested mask as its last result, as it
+	 * does on epoll and io_uring. A one-shot needs no special case: its
+	 * single completion is the same either way.
+	 */
+	if (r->multi && !proc && ior_poller_fd_is_regular(r->fd)) {
+		uint32_t ready = r->mask & (IOR_POLL_IN | IOR_POLL_OUT);
+		ior_poller_stage(done, r, ready ? (int) ready : -EINVAL, 1);
+		return;
+	}
+
+	ior_poller_fd_node *node = NULL;
+	if (!r->multi) {
+		node = poller->fds;
+		while (node && (node->multi || node->fd != r->fd || node->proc != proc)) {
+			node = node->next;
+		}
 	}
 
 	if (!node) {
+		int fd = r->fd;
+		if (r->multi) {
+			fd = fcntl(r->fd, F_DUPFD_CLOEXEC, 0);
+			if (fd < 0) {
+				ior_poller_stage(done, r, -errno, 1);
+				return;
+			}
+		}
 		node = calloc(1, sizeof(*node));
 		if (!node) {
-			ior_poller_done_push(done, r, -ENOMEM);
+			if (r->multi) {
+				close(fd);
+			}
+			ior_poller_stage(done, r, -ENOMEM, 1);
 			return;
 		}
-		node->fd = r->fd;
+		node->fd = fd;
 		node->proc = proc;
+		node->multi = r->multi;
 		node->next = poller->fds;
 		poller->fds = node;
 	}
@@ -270,11 +323,11 @@ static void ior_poller_sweep(ior_threads_poller *poller, ior_poller_req **done)
 			ior_poller_req *r = *pp;
 			if (r->cancelled) {
 				*pp = r->next;
-				ior_poller_done_push(done, r, -ECANCELED);
+				ior_poller_stage(done, r, -ECANCELED, 1);
 				changed = 1;
 			} else if (r->deadline_ns && r->deadline_ns <= now) {
 				*pp = r->next;
-				ior_poller_done_push(done, r, -ETIME);
+				ior_poller_stage(done, r, -ETIME, 1);
 				changed = 1;
 			} else {
 				pp = &r->next;
@@ -287,11 +340,16 @@ static void ior_poller_sweep(ior_threads_poller *poller, ior_poller_req **done)
 	}
 }
 
-/* Lock held. A request cancelled while kevent() ran still reports
- * -ECANCELED: cancel() has already promised that result. */
+/*
+ * Lock held. A request cancelled while kevent() ran still reports
+ * -ECANCELED: cancel() has already promised that result. A multishot request
+ * reports the edge and stays registered; a cancel that lands meanwhile is
+ * delivered by the next sweep, after the edge.
+ */
 static void ior_poller_dispatch(
 		ior_threads_poller *poller, ior_poller_fd_node *node, uint32_t ready, ior_poller_req **done)
 {
+	int changed = 0;
 	ior_poller_req **pp = &node->reqs;
 	while (*pp) {
 		ior_poller_req *r = *pp;
@@ -300,15 +358,22 @@ static void ior_poller_dispatch(
 		uint32_t res = node->proc ? ready : ready & (r->mask | IOR_POLL_ERR | IOR_POLL_HUP);
 		if (r->cancelled) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, -ECANCELED);
+			ior_poller_stage(done, r, -ECANCELED, 1);
+			changed = 1;
+		} else if (res && r->multi) {
+			ior_poller_stage(done, r, (int) res, 0);
+			pp = &r->next;
 		} else if (res) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, (int) res);
+			ior_poller_stage(done, r, (int) res, 1);
+			changed = 1;
 		} else {
 			pp = &r->next;
 		}
 	}
-	ior_poller_node_sync(poller, node, done); /* may free node */
+	if (changed) {
+		ior_poller_node_sync(poller, node, done); /* may free node */
+	}
 }
 
 /* Lock held. No kevent bookkeeping: the kq is closed right after in destroy. */
@@ -321,8 +386,11 @@ static void ior_poller_cancel_all(ior_threads_poller *poller, ior_poller_req **d
 		ior_poller_req *r = node->reqs;
 		while (r) {
 			ior_poller_req *next = r->next;
-			ior_poller_done_push(done, r, -ECANCELED);
+			ior_poller_stage(done, r, -ECANCELED, 1);
 			r = next;
+		}
+		if (node->multi) {
+			close(node->fd);
 		}
 		free(node);
 		node = next_node;
@@ -473,7 +541,8 @@ int ior_threads_poller_add(
 		return -ENOMEM;
 	}
 	r->fd = fd;
-	r->mask = ior_mask;
+	r->mask = ior_mask & ~IOR_THREADS_POLLER_MULTI;
+	r->multi = (ior_mask & IOR_THREADS_POLLER_MULTI) != 0;
 	r->deadline_ns = deadline_ns;
 	r->req = req;
 
