@@ -13,6 +13,7 @@ set(BENCH_SOURCES
     scenario_cancel.c
     scenario_connect.c
     scenario_sigwait.c
+    scenario_poll.c
 )
 
 if(WIN32)

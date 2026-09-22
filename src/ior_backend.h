@@ -20,6 +20,10 @@ struct ior_work_token {
 /* Set in a cancel op's flags by prep_cancel_fd: match by fd, not user data. */
 #define IOR_CANCEL_BY_FD (1U << 0)
 
+/* Set in a poll op's len by prep_poll_multishot (io_uring's own encoding):
+ * the poll persists, one completion per readiness edge. */
+#define IOR_POLL_ADD_MULTI (1U << 0)
+
 /* Backend-specific SQE structures */
 #ifdef IOR_HAVE_URING
 #include <liburing.h>
@@ -152,6 +156,7 @@ typedef struct ior_backend_ops {
 	void (*prep_send)(ior_sqe *sqe, ior_fd_t sockfd, const void *buf, unsigned nbytes, int flags);
 	void (*prep_recv)(ior_sqe *sqe, ior_fd_t sockfd, void *buf, unsigned nbytes, int flags);
 	void (*prep_poll_add)(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
+	void (*prep_poll_multishot)(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 	void (*prep_accept)(
 			ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags);
 	void (*prep_connect)(ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen);

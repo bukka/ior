@@ -14,15 +14,20 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 typedef struct ior_poller_req {
 	int fd;
 	uint32_t mask;
 	uint64_t deadline_ns; /* absolute monotonic, 0 = none */
 	void *req;
+	int multi; /* persistent: completes at every readiness until dropped */
+	uint64_t rearm_ns; /* multi: left out of the poll set until then (0 = polled) */
 	int cancelled; /* set by cancel(); completes with -ECANCELED */
 	int res; /* staged result on the done list */
-	struct ior_poller_req *next;
+	int retired; /* staged with its last result: unlinked, freed after the callback */
+	struct ior_poller_req *next; /* incoming queue, then the active list */
+	struct ior_poller_req *done_next; /* staged completions */
 } ior_poller_req;
 
 /*
@@ -31,6 +36,12 @@ typedef struct ior_poller_req {
  * work and drops it only around poll() and around completion callbacks, which
  * run with no poller lock held. cancel() only marks a request; the poller
  * thread unlinks it, so the active list keeps matching the pfds it filled.
+ *
+ * poll() is level-triggered, so a multishot request would report the same
+ * readiness on every call: after a report it is left out of the poll set for
+ * IOR_THREADS_POLLER_MULTI_REARM_NS, then polled again. Readiness that is
+ * still there is reported again, so no edge is lost; one that went away is
+ * waited for.
  */
 struct ior_threads_poller {
 	pthread_t thread;
@@ -77,27 +88,38 @@ static uint32_t ior_poller_from_poll(short revents)
 	return mask;
 }
 
-/* Stage r for completion with res on the done list (lock held). */
-static void ior_poller_done_push(ior_poller_req **done, ior_poller_req *r, int res)
+/*
+ * Stage r for completion with res on the done list (lock held). A retired
+ * request has been unlinked and is freed after its callback; a multishot
+ * request reporting readiness stays on the active list.
+ */
+static void ior_poller_stage(ior_poller_req **done, ior_poller_req *r, int res, int retired)
 {
 	r->res = res;
-	r->next = *done;
+	r->retired = retired;
+	r->done_next = *done;
 	*done = r;
 }
 
-/* Complete a batch of unlinked requests; runs with the lock released. */
+/* Complete a batch of staged requests; runs with the lock released. */
 static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req *done)
 {
 	while (done) {
-		ior_poller_req *next = done->next;
-		poller->cb(poller->owner, done->req, done->res);
-		free(done);
+		ior_poller_req *next = done->done_next;
+		poller->cb(poller->owner, done->req, done->res, !done->retired);
+		if (done->retired) {
+			free(done);
+		}
 		done = next;
 	}
 }
 
-/* Lock held. */
-static void ior_poller_ingest_incoming(ior_threads_poller *poller)
+/*
+ * Lock held. A multishot request on a regular file ends at once with its
+ * mask: the file is always ready and has no edges to wait for (poll() would
+ * report it at every call), matching epoll's refusal and io_uring.
+ */
+static void ior_poller_ingest_incoming(ior_threads_poller *poller, ior_poller_req **done)
 {
 	ior_poller_req *r = poller->incoming_head;
 	poller->incoming_head = NULL;
@@ -105,19 +127,28 @@ static void ior_poller_ingest_incoming(ior_threads_poller *poller)
 
 	while (r) {
 		ior_poller_req *next = r->next;
-		r->next = poller->active;
-		poller->active = r;
+		struct stat st;
+		if (r->multi && !r->cancelled && fstat(r->fd, &st) == 0 && S_ISREG(st.st_mode)) {
+			uint32_t ready = r->mask & (IOR_POLL_IN | IOR_POLL_OUT);
+			ior_poller_stage(done, r, ready ? (int) ready : -EINVAL, 1);
+		} else {
+			r->next = poller->active;
+			poller->active = r;
+		}
 		r = next;
 	}
 }
 
-/* Nearest deadline as a poll timeout in ms (-1 = none). Lock held. */
+/* Nearest deadline or re-arm time as a poll timeout in ms (-1 = none). Lock held. */
 static int ior_poller_timeout_ms(ior_threads_poller *poller)
 {
 	uint64_t nearest = 0;
 	for (ior_poller_req *r = poller->active; r; r = r->next) {
 		if (r->deadline_ns && (!nearest || r->deadline_ns < nearest)) {
 			nearest = r->deadline_ns;
+		}
+		if (r->rearm_ns && (!nearest || r->rearm_ns < nearest)) {
+			nearest = r->rearm_ns;
 		}
 	}
 	if (!nearest) {
@@ -138,15 +169,17 @@ static void ior_poller_cancel_all(ior_threads_poller *poller, ior_poller_req **d
 	poller->active = NULL;
 	while (r) {
 		ior_poller_req *next = r->next;
-		ior_poller_done_push(done, r, -ECANCELED);
+		ior_poller_stage(done, r, -ECANCELED, 1);
 		r = next;
 	}
 }
 
 /*
  * Resolve the active list after poll(): cancelled requests (-ECANCELED),
- * ready ones (mask or -EBADF), then expired deadlines (-ETIME). pret <= 0
- * means no revents are valid. Lock held.
+ * ready ones (mask or -EBADF), then expired deadlines (-ETIME). A ready
+ * multishot request stays, held out of the next polls for a while; one whose
+ * hold has ended is polled again. pret <= 0 means no revents are valid. Lock
+ * held.
  */
 static void ior_poller_resolve(ior_threads_poller *poller, int pret, ior_poller_req **done)
 {
@@ -159,17 +192,24 @@ static void ior_poller_resolve(ior_threads_poller *poller, int pret, ior_poller_
 		i++;
 		if (r->cancelled) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, -ECANCELED);
+			ior_poller_stage(done, r, -ECANCELED, 1);
 		} else if (revents & POLLNVAL) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, -EBADF);
+			ior_poller_stage(done, r, -EBADF, 1);
+		} else if (revents && r->multi) {
+			ior_poller_stage(done, r, (int) ior_poller_from_poll(revents), 0);
+			r->rearm_ns = now + IOR_THREADS_POLLER_MULTI_REARM_NS;
+			pp = &r->next;
 		} else if (revents) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, (int) ior_poller_from_poll(revents));
+			ior_poller_stage(done, r, (int) ior_poller_from_poll(revents), 1);
 		} else if (r->deadline_ns && r->deadline_ns <= now) {
 			*pp = r->next;
-			ior_poller_done_push(done, r, -ETIME);
+			ior_poller_stage(done, r, -ETIME, 1);
 		} else {
+			if (r->rearm_ns && r->rearm_ns <= now) {
+				r->rearm_ns = 0;
+			}
 			pp = &r->next;
 		}
 	}
@@ -183,10 +223,16 @@ static void *ior_poller_thread(void *arg)
 		ior_poller_req *done = NULL;
 
 		pthread_mutex_lock(&poller->lock);
-		ior_poller_ingest_incoming(poller);
+		ior_poller_ingest_incoming(poller, &done);
 		if (atomic_load_explicit(&poller->shutdown, memory_order_acquire)) {
 			pthread_mutex_unlock(&poller->lock);
+			ior_poller_complete_list(poller, done);
 			break;
+		}
+		if (done) {
+			pthread_mutex_unlock(&poller->lock);
+			ior_poller_complete_list(poller, done);
+			continue;
 		}
 
 		/* Slot 0 is the wakeup fd; one slot per active request after it. */
@@ -215,7 +261,8 @@ static void *ior_poller_thread(void *arg)
 		poller->pfds[0].revents = 0;
 		size_t i = 1;
 		for (ior_poller_req *r = poller->active; r; r = r->next, i++) {
-			poller->pfds[i].fd = r->fd;
+			/* A negative fd keeps the slot but is ignored by poll(). */
+			poller->pfds[i].fd = r->rearm_ns ? -1 : r->fd;
 			poller->pfds[i].events = ior_poller_to_poll(r->mask);
 			poller->pfds[i].revents = 0;
 		}
@@ -242,7 +289,7 @@ static void *ior_poller_thread(void *arg)
 	/* Shutdown: fail everything still pending, including late arrivals. */
 	ior_poller_req *done = NULL;
 	pthread_mutex_lock(&poller->lock);
-	ior_poller_ingest_incoming(poller);
+	ior_poller_ingest_incoming(poller, &done);
 	ior_poller_cancel_all(poller, &done);
 	pthread_mutex_unlock(&poller->lock);
 	ior_poller_complete_list(poller, done);
@@ -296,7 +343,8 @@ int ior_threads_poller_add(
 		return -ENOMEM;
 	}
 	r->fd = fd;
-	r->mask = ior_mask;
+	r->mask = ior_mask & ~IOR_THREADS_POLLER_MULTI;
+	r->multi = (ior_mask & IOR_THREADS_POLLER_MULTI) != 0;
 	r->deadline_ns = deadline_ns;
 	r->req = req;
 

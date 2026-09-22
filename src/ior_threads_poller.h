@@ -27,21 +27,39 @@ typedef struct ior_threads_poller ior_threads_poller;
 #define IOR_THREADS_POLLER_PROC (1U << 31)
 
 /*
+ * Mask bit of a persistent (multishot) request: the callback runs with the
+ * ready mask at every readiness edge and the request stays registered, until
+ * it is cancelled, reaches its deadline or fails, which runs the callback a
+ * last time with the negative result and drops it. The epoll and kqueue
+ * pollers watch such a request edge-triggered (EPOLLET, EV_CLEAR), on a
+ * dup(2) of the descriptor so that one-shot requests on the same descriptor
+ * keep their level-triggered registration. The poll(2) poller cannot see
+ * edges: it reports readiness that persists again after
+ * IOR_THREADS_POLLER_MULTI_REARM_NS.
+ */
+#define IOR_THREADS_POLLER_MULTI (1U << 30)
+#define IOR_THREADS_POLLER_MULTI_REARM_NS 1000000ULL
+
+/*
  * Completion callback, invoked on the poller thread with no poller lock held.
  * res is the ready IOR_POLL_* mask (> 0), -ETIME (deadline reached),
  * -ECANCELED (cancelled or poller shutdown), or another negative errno (e.g.
- * -EBADF). Must not block for long and must not call back into the poller.
+ * -EBADF). `more` is non-zero for an edge of a multishot request, which stays
+ * registered; the request is done with any other call (a multishot one can
+ * also end with a positive res, its last readiness, when there are no edges
+ * to watch). Must not block for long and must not call back into the poller.
  */
-typedef void (*ior_threads_poller_cb)(void *owner, void *req, int res);
+typedef void (*ior_threads_poller_cb)(void *owner, void *req, int res, int more);
 
 /* Create the poller and start its thread. */
 int ior_threads_poller_create(
 		ior_threads_poller **poller_out, void *owner, ior_threads_poller_cb cb);
 
 /*
- * Register a one-shot readiness request. ior_mask is an IOR_POLL_* mask;
- * deadline_ns is an absolute monotonic deadline (0 = none). Thread-safe
- * against the poller thread, but not against destroy().
+ * Register a readiness request. ior_mask is an IOR_POLL_* mask, one-shot
+ * unless IOR_THREADS_POLLER_MULTI is set; deadline_ns is an absolute monotonic
+ * deadline (0 = none). Thread-safe against the poller thread, but not against
+ * destroy().
  */
 int ior_threads_poller_add(
 		ior_threads_poller *poller, int fd, uint32_t ior_mask, uint64_t deadline_ns, void *req);

@@ -85,6 +85,7 @@ int bench_run_work(const bench_options *opts, bench_metrics *m, const char **bac
 int bench_run_cancel(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_connect(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_sigwait(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
+int bench_run_poll(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 
 #ifdef __cplusplus
 }

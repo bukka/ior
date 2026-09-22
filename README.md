@@ -20,6 +20,12 @@ The goal is to provide maximum performance on platforms with native async I/O su
   `ior_prep_connect`), readiness-driven on the thread pool and through
   AcceptEx/ConnectEx on Windows
 - Timer/timeout operations
+- Readiness polling (`ior_prep_poll_add`), one-shot or multishot
+  (`ior_prep_poll_multishot`): a persistent poll posts one completion per
+  readiness edge, flagged `IOR_CQE_F_MORE`, until cancelled -
+  `IORING_POLL_ADD_MULTI` on io_uring, an edge-triggered watch (`EPOLLET`,
+  `EV_CLEAR`) on the thread pool's poller, the WSAPoll readiness emulation on
+  Windows
 - Process waits (`ior_prep_waitpid`): a pidfd poll on io_uring, a parked
   op on the thread pool's poller (pidfd or `EVFILT_PROC`), a threadpool
   wait on the process handle on Windows
@@ -263,6 +269,14 @@ void ior_prep_connect(ior_ctx *ctx, ior_sqe *sqe, int fd,
 // Timeout operation
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
                       unsigned count, unsigned flags);
+
+// Wait for fd readiness: completes with the ready IOR_POLL_* mask. The
+// one-shot form completes once; the multishot form stays armed and posts a
+// completion per readiness edge with IOR_CQE_F_MORE in its flags, its last
+// one (a cancel's -ECANCELED, an error) without it. Consume readiness fully
+// after each completion, as with EPOLLET.
+void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
+void ior_prep_poll_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 
 // Wait for a process like waitpid(2): completes with its pid, the wait
 // status in *status (the exit code on Windows), or -ECHILD. A wait for one
