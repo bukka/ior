@@ -26,6 +26,7 @@
 #define IOR_H
 
 #include <stdint.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <time.h>
 
@@ -57,6 +58,25 @@ typedef HANDLE ior_fd_t;
 #define IOR_INVALID_FD INVALID_HANDLE_VALUE
 /** Process identifier for ior_prep_waitpid() (a process id on Windows). */
 typedef DWORD ior_pid_t;
+/**
+ * Signal set for ior_prep_sigwait(). Windows has no sigset_t: this is a bit
+ * per CRT signal number, built with ior_sigemptyset()/ior_sigaddset().
+ */
+typedef struct ior_sigset {
+	uint32_t bits;
+} ior_sigset_t;
+/**
+ * What ior_prep_sigwait() reports about the signal it collected. Windows has
+ * no siginfo_t: the signal, and the console control event that raised it.
+ */
+typedef struct ior_siginfo {
+	/** The signal: SIGINT or SIGBREAK. */
+	int si_signo;
+	/** The CTRL_*_EVENT the console delivered (CTRL_C_EVENT for SIGINT;
+	 *  CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT or
+	 *  CTRL_SHUTDOWN_EVENT for SIGBREAK, as the CRT maps them). */
+	int si_code;
+} ior_siginfo_t;
 #else
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -66,6 +86,10 @@ typedef int ior_fd_t;
 #define IOR_INVALID_FD (-1)
 /** Process identifier for ior_prep_waitpid() (pid_t on POSIX). */
 typedef pid_t ior_pid_t;
+/** Signal set for ior_prep_sigwait() (sigset_t on POSIX). */
+typedef sigset_t ior_sigset_t;
+/** Signal information filled by ior_prep_sigwait() (siginfo_t on POSIX). */
+typedef siginfo_t ior_siginfo_t;
 #endif
 
 /**
@@ -122,6 +146,8 @@ typedef struct ior_timespec {
 /** Wait for a process state change (ior_prep_waitpid); completes with its
  *  pid. */
 #define IOR_OP_WAITPID 15
+/** Wait for a signal (ior_prep_sigwait); completes with its number. */
+#define IOR_OP_SIGWAIT 16
 /** @} */
 
 /**
@@ -647,6 +673,73 @@ void ior_prep_connect(
  * @return 0 on success, -EINVAL for bad arguments, or -ENOMEM.
  */
 int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options);
+
+/**
+ * Prepare a wait for one of a set of signals (like sigwaitinfo(2)).
+ *
+ * Completes with the number of the signal taken as res (> 0), its details
+ * stored in @p info (if non-NULL) as sigwaitinfo(2) stores them, or a
+ * negative errno: -ECANCELED when cancelled, -EAGAIN when the signal was
+ * consumed elsewhere between its arrival and ior collecting it (see below).
+ * The signal is consumed: it is not delivered to a handler and not seen by
+ * any other wait. Every signal in @p set must be blocked in every thread of
+ * the process before it can arrive, as sigwaitinfo(2) requires; the
+ * caller's own threads are the caller's to mask (ior's threads block
+ * everything already). A signal sent to the process as a whole is what the
+ * op waits for; one directed at a particular thread with pthread_kill(3) is
+ * seen only if that thread is the one calling ior, and not at all on the
+ * thread backend, whose worker is the waiting thread.
+ *
+ * On io_uring the op is a poll on a signalfd, which occupies no thread and
+ * is cancellable, and a link timeout bounds it. When the poll fires, the
+ * signal is collected on the reaping thread; if it is gone by then (another
+ * op in this context waiting for the same signal collected it, or a wait
+ * of the caller's own), the op completes with -EAGAIN and can be submitted
+ * again. On the thread backend a worker waits in sigtimedwait(2) in short
+ * slices, so a cancel reports -EALREADY and the op completes with -ECANCELED
+ * within a slice, as it does for a fired link timeout and at
+ * ior_queue_exit(); every pending op occupies a worker for as long as it
+ * waits. Where the platform has no sigtimedwait (macOS) the worker blocks in
+ * sigwait(3) until a signal from the set arrives, uncancellable, filling
+ * only si_signo in @p info, and ior_queue_exit() waits for it.
+ *
+ * Windows knows console control events only: @p set may name SIGINT
+ * (Ctrl+C) and SIGBREAK (Ctrl+Break, and the close, logoff and shutdown
+ * events, as the CRT maps them); any other signal makes this call return
+ * -ENOTSUP. The event is claimed by the op ahead of the CRT's signal()
+ * handlers and the default action, and @p info carries the CTRL_*_EVENT in
+ * si_code. The system ends the process once the handler returns from a
+ * close, logoff or shutdown event, so a completion for those may never be
+ * seen. An op is cancellable and bounded by a link timeout.
+ *
+ * @p set and @p info must stay valid until the completion arrives.
+ *
+ * @param ctx   I/O context.
+ * @param sqe   Entry from ior_get_sqe().
+ * @param set   Signals to wait for; built with ior_sigemptyset() and
+ *              ior_sigaddset() (sigemptyset(3)/sigaddset(3) on POSIX).
+ * @param info  Where to store the signal's details, or NULL.
+ * @return 0 on success, -EINVAL for a NULL or empty set, -ENOTSUP for a
+ *         signal the platform cannot wait for, -ENOMEM, or the error of
+ *         signalfd(2) on io_uring.
+ */
+int ior_prep_sigwait(ior_ctx *ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_siginfo_t *info);
+
+/**
+ * @name Signal sets
+ * Portable construction of the ::ior_sigset_t given to ior_prep_sigwait():
+ * sigemptyset(3), sigaddset(3) and sigismember(3) on POSIX, bit operations on
+ * Windows, where the set holds CRT signal numbers.
+ * @{
+ */
+/** Empty @p set. Returns 0. */
+int ior_sigemptyset(ior_sigset_t *set);
+/** Add @p signo to @p set. Returns 0, or -EINVAL for an invalid signal. */
+int ior_sigaddset(ior_sigset_t *set, int signo);
+/** Test @p set for @p signo. Returns 1 if present, 0 if not, -EINVAL for an
+ *  invalid signal. */
+int ior_sigismember(const ior_sigset_t *set, int signo);
+/** @} */
 
 /**
  * Prepare a one-shot wait for fd readiness (like io_uring's POLL_ADD).

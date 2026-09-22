@@ -242,6 +242,79 @@ int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int
 	return ctx->ops->prep_waitpid(ctx->backend_ctx, sqe, pid, status, options);
 }
 
+int ior_sigemptyset(ior_sigset_t *set)
+{
+	if (!set) {
+		return -EINVAL;
+	}
+#ifdef _WIN32
+	set->bits = 0;
+	return 0;
+#else
+	return sigemptyset(set) == 0 ? 0 : -EINVAL;
+#endif
+}
+
+int ior_sigaddset(ior_sigset_t *set, int signo)
+{
+	if (!set) {
+		return -EINVAL;
+	}
+#ifdef _WIN32
+	if (signo <= 0 || signo >= 32) {
+		return -EINVAL;
+	}
+	set->bits |= 1U << signo;
+	return 0;
+#else
+	return sigaddset(set, signo) == 0 ? 0 : -EINVAL;
+#endif
+}
+
+int ior_sigismember(const ior_sigset_t *set, int signo)
+{
+	if (!set) {
+		return -EINVAL;
+	}
+#ifdef _WIN32
+	if (signo <= 0 || signo >= 32) {
+		return -EINVAL;
+	}
+	return (set->bits >> signo) & 1U;
+#else
+	int ret = sigismember(set, signo);
+	return ret < 0 ? -EINVAL : ret;
+#endif
+}
+
+#if !defined(_WIN32) && !defined(NSIG)
+/* Strict-standard headers hide NSIG; sigismember rejects what is past it. */
+#define NSIG 65
+#endif
+
+/* Does the set name at least one signal? A wait on none would never end. */
+static int ior_sigset_has_any(const ior_sigset_t *set)
+{
+#ifdef _WIN32
+	return set->bits != 0;
+#else
+	for (int signo = 1; signo < NSIG; signo++) {
+		if (sigismember(set, signo) == 1) {
+			return 1;
+		}
+	}
+	return 0;
+#endif
+}
+
+int ior_prep_sigwait(ior_ctx *ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_siginfo_t *info)
+{
+	if (!ctx || !sqe || !set || !ior_sigset_has_any(set)) {
+		return -EINVAL;
+	}
+	return ctx->ops->prep_sigwait(ctx->backend_ctx, sqe, set, info);
+}
+
 void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data)
 {
 	if (ctx && sqe) {

@@ -23,6 +23,9 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Process waits (`ior_prep_waitpid`): a pidfd poll on io_uring, a parked
   op on the thread pool's poller (pidfd or `EVFILT_PROC`), a threadpool
   wait on the process handle on Windows
+- Signal waits (`ior_prep_sigwait`): a signalfd poll on io_uring, a worker
+  in `sigtimedwait` on the thread pool, the console control events
+  (`SIGINT`, `SIGBREAK`) on Windows
 - Async cancellation of submitted operations (`ior_prep_cancel`,
   `ior_prep_cancel_fd`), with io_uring semantics on every backend
 - A completion notification descriptor (`ior_notify_fd`) for embedding a
@@ -268,6 +271,22 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
 // (a cancel then reports -EALREADY). Windows takes only pid > 0.
 int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status,
                      int options);
+
+// Wait for a signal of the set like sigwaitinfo(2): completes with its
+// number, the details in *info. The signals must be blocked in every
+// thread; ior's own threads block everything already. io_uring polls a
+// signalfd (cancellable, no thread; -EAGAIN if another wait took the
+// signal first), the thread pool holds a worker in sigtimedwait slices
+// (a cancel reports -EALREADY, the op then ends -ECANCELED). Windows
+// accepts SIGINT and SIGBREAK only, the console control events.
+int ior_prep_sigwait(ior_ctx *ctx, ior_sqe *sqe, const ior_sigset_t *set,
+                     ior_siginfo_t *info);
+
+// Portable signal sets: sigset_t/siginfo_t on POSIX, a bitmask of CRT
+// signal numbers and a {si_signo, si_code} pair on Windows.
+int ior_sigemptyset(ior_sigset_t *set);
+int ior_sigaddset(ior_sigset_t *set, int signo);
+int ior_sigismember(const ior_sigset_t *set, int signo);
 
 // Splice operation (Linux only)
 void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in,

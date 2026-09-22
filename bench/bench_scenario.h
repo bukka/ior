@@ -54,6 +54,11 @@ typedef struct bench_options {
 	 * processes for the whole run, to price pending process waits into the
 	 * socket path (a process manager's children behind a busy loop). */
 	uint32_t waits;
+
+	/* socket: keep this many IOR_OP_SIGWAIT ops pending on a queued signal
+	 * for the whole run. On the thread backend each pins a worker, so this
+	 * also shows what pending signal waits cost the socket path in threads. */
+	uint32_t sigwaits;
 } bench_options;
 
 /*
@@ -79,6 +84,7 @@ int bench_run_mixed(const bench_options *opts, bench_metrics *m, const char **ba
 int bench_run_work(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_cancel(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_connect(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
+int bench_run_sigwait(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 
 #ifdef __cplusplus
 }

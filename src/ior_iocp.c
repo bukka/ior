@@ -78,6 +78,7 @@ enum {
 	IOCP_OP_WORK_RUNNING, /* callback executing */
 	IOCP_OP_POLL, /* registered with the poller */
 	IOCP_OP_WAIT, /* threadpool wait registered on a process handle */
+	IOCP_OP_SIGWAIT, /* listed for the console control handler */
 	IOCP_OP_DONE,
 };
 
@@ -167,6 +168,13 @@ typedef struct ior_iocp_op {
 	int *wait_status;
 	HANDLE proc_handle;
 	PTP_WAIT tp_wait;
+
+	// IOR_OP_SIGWAIT: the signals waited for (a bit per CRT signal number),
+	// where the details go, and the link in the context's list of waiting
+	// ops (under g_sig_lock).
+	uint32_t sig_mask;
+	ior_siginfo_t *sig_info;
+	struct ior_iocp_op *sig_next;
 
 	// Overlapped I/O: the handle's cancel_gen and epoch when this request was
 	// issued.
@@ -342,6 +350,15 @@ typedef struct ior_ctx_iocp {
 	PTP_POOL work_pool;
 	PTP_CLEANUP_GROUP work_cleanup;
 	TP_CALLBACK_ENVIRON work_env;
+
+	/*
+	 * IOR_OP_SIGWAIT support: the ops waiting for a console control event
+	 * and this context's place in the process-wide list the one control
+	 * handler walks (see iocp_sig_ctrl_handler). All under g_sig_lock.
+	 */
+	ior_iocp_op *sig_ops;
+	struct ior_ctx_iocp *sig_next;
+	bool sig_registered;
 
 	uint32_t flags;
 	uint32_t features;
@@ -652,6 +669,9 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->wait_status = NULL;
 	op->proc_handle = NULL;
 	op->tp_wait = NULL;
+	op->sig_mask = 0;
+	op->sig_info = NULL;
+	op->sig_next = NULL;
 	op->io_cancel_gen = 0;
 	op->io_epoch = 0;
 	op->accept_sock = INVALID_SOCKET;
@@ -1405,6 +1425,151 @@ static bool iocp_waitpid_abort(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	return true;
 }
 
+/*
+ * ================= IOR_OP_SIGWAIT support =================
+ *
+ * The signals Windows has are console control events, delivered on a thread
+ * the system starts to handlers registered process-wide, so every context
+ * with a sigwait pending stands in one list that one handler walks: the
+ * first op whose set has the event's signal claims it (a CAS from
+ * IOCP_OP_SIGWAIT, like a process wait's), takes the details and posts its
+ * completion. With no taker the event goes on to the next handler (the
+ * CRT's signal(), then the default action). The handler is installed with
+ * the first context that registers and removed with the last; the CRT's
+ * mapping of events to signals is kept: Ctrl+C is SIGINT, everything else
+ * SIGBREAK.
+ */
+
+static SRWLOCK g_sig_lock = SRWLOCK_INIT;
+static ior_ctx_iocp *g_sig_ctxs;
+
+static BOOL WINAPI iocp_sig_ctrl_handler(DWORD type)
+{
+	int sig = type == CTRL_C_EVENT ? SIGINT : SIGBREAK;
+	ior_iocp_op *taker = NULL;
+	ior_ctx_iocp *owner = NULL;
+
+	AcquireSRWLockExclusive(&g_sig_lock);
+	for (ior_ctx_iocp *ctx = g_sig_ctxs; ctx && !taker; ctx = ctx->sig_next) {
+		for (ior_iocp_op **pp = &ctx->sig_ops; *pp; pp = &(*pp)->sig_next) {
+			ior_iocp_op *op = *pp;
+			if (!(op->sig_mask & (1U << sig))) {
+				continue;
+			}
+			int expected = IOCP_OP_SIGWAIT;
+			if (!atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_DONE)) {
+				continue; // being aborted: its owner unlinks it
+			}
+			*pp = op->sig_next;
+			op->sig_next = NULL;
+			taker = op;
+			owner = ctx;
+			break;
+		}
+	}
+	ReleaseSRWLockExclusive(&g_sig_lock);
+
+	if (!taker) {
+		return FALSE;
+	}
+	// The context outlives this post: its teardown drains the port until
+	// every reserved completion, this one included, has arrived.
+	if (taker->sig_info) {
+		taker->sig_info->si_signo = sig;
+		taker->sig_info->si_code = (int) type;
+	}
+	taker->work_res = sig;
+	post_armed_op(owner, taker, ERROR_SUCCESS);
+	return TRUE;
+}
+
+// Put ctx on the handler's list, installing the handler for the first one.
+// g_sig_lock held exclusively.
+static bool iocp_sig_register_locked(ior_ctx_iocp *ctx)
+{
+	if (ctx->sig_registered) {
+		return true;
+	}
+	if (!g_sig_ctxs && !SetConsoleCtrlHandler(iocp_sig_ctrl_handler, TRUE)) {
+		return false;
+	}
+	ctx->sig_next = g_sig_ctxs;
+	g_sig_ctxs = ctx;
+	ctx->sig_registered = true;
+	return true;
+}
+
+// Take ctx off the handler's list, removing the handler with the last one.
+static void iocp_sig_unregister(ior_ctx_iocp *ctx)
+{
+	AcquireSRWLockExclusive(&g_sig_lock);
+	if (ctx->sig_registered) {
+		for (ior_ctx_iocp **pp = &g_sig_ctxs; *pp; pp = &(*pp)->sig_next) {
+			if (*pp == ctx) {
+				*pp = ctx->sig_next;
+				break;
+			}
+		}
+		ctx->sig_next = NULL;
+		ctx->sig_registered = false;
+		if (!g_sig_ctxs) {
+			SetConsoleCtrlHandler(iocp_sig_ctrl_handler, FALSE);
+		}
+	}
+	ReleaseSRWLockExclusive(&g_sig_lock);
+}
+
+static int issue_sigwait(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	op->work_owner = ctx;
+
+	AcquireSRWLockExclusive(&g_sig_lock);
+	bool ok = iocp_sig_register_locked(ctx);
+	if (ok) {
+		// Reserve the active_count slot up front, like a process wait: the
+		// handler completes the op from the system's thread. Oldest first,
+		// so ops take events in submission order.
+		atomic_fetch_add(&ctx->active_count, 1);
+		atomic_store(&op->state, IOCP_OP_SIGWAIT);
+		op->sig_next = NULL;
+		ior_iocp_op **pp = &ctx->sig_ops;
+		while (*pp) {
+			pp = &(*pp)->sig_next;
+		}
+		*pp = op;
+	}
+	ReleaseSRWLockExclusive(&g_sig_lock);
+
+	if (!ok) {
+		return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+	}
+	return 0;
+}
+
+/*
+ * Take a listed sigwait away from the handler: claim it (a handler walking
+ * the list then skips it), unlink it and complete it as aborted. Returns
+ * false when the handler claimed it first: it is completing with its signal.
+ */
+static bool iocp_sigwait_abort(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	int expected = IOCP_OP_SIGWAIT;
+	if (!atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_DONE)) {
+		return false;
+	}
+	AcquireSRWLockExclusive(&g_sig_lock);
+	for (ior_iocp_op **pp = &ctx->sig_ops; *pp; pp = &(*pp)->sig_next) {
+		if (*pp == op) {
+			*pp = op->sig_next;
+			op->sig_next = NULL;
+			break;
+		}
+	}
+	ReleaseSRWLockExclusive(&g_sig_lock);
+	post_armed_op(ctx, op, ERROR_OPERATION_ABORTED);
+	return true;
+}
+
 /* ================= IOR_OP_POLL support ================= */
 
 static SHORT ior_poll_mask_to_wsa(uint32_t ior_mask)
@@ -1686,9 +1851,10 @@ static void op_to_cqe(ior_iocp_op *op)
 	if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
 	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL
-			|| op->opcode == IOR_OP_ASYNC_CANCEL || op->opcode == IOR_OP_WAITPID) {
+			|| op->opcode == IOR_OP_ASYNC_CANCEL || op->opcode == IOR_OP_WAITPID
+			|| op->opcode == IOR_OP_SIGWAIT) {
 		// The callback's return value (ready poll mask, cancel result, the
-		// waited pid), not a byte count.
+		// waited pid, the signal), not a byte count.
 		op->cqe.iocp.res = op->work_res;
 	} else if (op->opcode == IOR_OP_ACCEPT) {
 		// The accepted socket, now the caller's (handles fit in 32 bits).
@@ -1923,13 +2089,15 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			// Work and poll ops have no OVERLAPPED I/O to cancel: flag their
 			// token instead (the poller drops a flagged op once woken). A
 			// process wait is withdrawn from the threadpool below, outside
-			// the lock: its abort posts the guarded op's own completion.
+			// the lock, and a signal wait from the control handler's list:
+			// their aborts post the guarded op's own completion.
 			bool token_cancel = guarded->opcode == IOR_OP_WORK || guarded->opcode == IOR_OP_POLL;
 			bool is_poll = guarded->opcode == IOR_OP_POLL;
 			bool is_wait = guarded->opcode == IOR_OP_WAITPID;
+			bool is_sigwait = guarded->opcode == IOR_OP_SIGWAIT;
 			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
-			} else if (!is_wait) {
+			} else if (!is_wait && !is_sigwait) {
 				// Still under timers.lock: the consumer resolves the pair
 				// under it before the guarded op can be reaped and recycled,
 				// and it judges a collateral abort under it too (see
@@ -1944,6 +2112,9 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			}
 			if (is_wait) {
 				(void) iocp_waitpid_abort(ctx, guarded);
+			}
+			if (is_sigwait) {
+				(void) iocp_sigwait_abort(ctx, guarded);
 			}
 			post_armed_op(ctx, op, ERROR_TIMEOUT);
 			EnterCriticalSection(&tm->lock);
@@ -2205,6 +2376,9 @@ static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 		case IOCP_OP_WAIT:
 			return iocp_waitpid_abort(ctx, op) ? 0 : -ENOENT;
+
+		case IOCP_OP_SIGWAIT:
+			return iocp_sigwait_abort(ctx, op) ? 0 : -ENOENT;
 
 		default:
 			return -ENOENT;
@@ -2475,6 +2649,11 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			ret = issue_waitpid(ctx, op);
 			break;
 
+		case IOR_OP_SIGWAIT:
+			// Likewise withdrawn from the control handler's list.
+			ret = issue_sigwait(ctx, op);
+			break;
+
 		case IOR_OP_TIMER:
 			return arm_timer(ctx, op);
 
@@ -2668,6 +2847,17 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	WaitForSingleObject(ctx->timers.thread, INFINITE);
 	CloseHandle(ctx->timers.thread);
 
+	// Signal waits: each abort posts -ECANCELED (a handler that wins the
+	// race posts the signal instead), then the context leaves the handler's
+	// list, so no event reaches it any more.
+	for (uint32_t i = 0; i < ctx->pool_size; i++) {
+		ior_iocp_op *op = &ctx->op_pool[i];
+		if (atomic_load(&op->state) == IOCP_OP_SIGWAIT) {
+			(void) iocp_sigwait_abort(ctx, op);
+		}
+	}
+	iocp_sig_unregister(ctx);
+
 	if (ctx->work_pool) {
 		/*
 		 * Process waits next, while their wait objects still exist: a
@@ -2756,9 +2946,10 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	 * completion still counted in active_count is now forced to arrive. Armed
 	 * timers were popped with the count given back, deferred ops were freed
 	 * unposted, the poller posted its ops as -ECANCELED before it stopped,
-	 * work callbacks were waited out by the cleanup group, and this pass
-	 * cancels the overlapped requests. A new kind of op that is counted but
-	 * not forced here would hang teardown instead of spinning out.
+	 * work callbacks were waited out by the cleanup group, process and
+	 * signal waits were aborted above, and this pass cancels the overlapped
+	 * requests. A new kind of op that is counted but not forced here would
+	 * hang teardown instead of spinning out.
 	 */
 	for (uint32_t i = 0; i < ctx->pool_size; i++) {
 		ior_iocp_op *op = &ctx->op_pool[i];
@@ -3696,6 +3887,26 @@ static int ior_iocp_backend_prep_waitpid(
 	return 0;
 }
 
+static int ior_iocp_backend_prep_sigwait(
+		void *backend_ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_siginfo_t *info)
+{
+	(void) backend_ctx;
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->fd = NULL;
+	// Console control events are all there is: Ctrl+C, and Ctrl+Break with
+	// the close, logoff and shutdown events behind it. Anything else leaves
+	// the entry a no-op.
+	if (set->bits & ~((1U << SIGINT) | (1U << SIGBREAK))) {
+		op->opcode = IOR_OP_NOP;
+		return -ENOTSUP;
+	}
+	op->opcode = IOR_OP_SIGWAIT;
+	op->sig_mask = set->bits;
+	op->sig_info = info;
+	return 0;
+}
+
 static void ior_iocp_backend_prep_cancel(ior_sqe *sqe, uint64_t user_data)
 {
 	ior_iocp_op *op = (ior_iocp_op *) sqe;
@@ -3834,6 +4045,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_cancel = ior_iocp_backend_prep_cancel,
 	.prep_cancel_fd = ior_iocp_backend_prep_cancel_fd,
 	.prep_waitpid = ior_iocp_backend_prep_waitpid,
+	.prep_sigwait = ior_iocp_backend_prep_sigwait,
 	.prep_work = ior_iocp_backend_prep_work,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,
 	.sqe_set_flags = ior_iocp_backend_sqe_set_flags,

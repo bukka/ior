@@ -20,6 +20,7 @@
 #include <time.h>
 #include <poll.h>
 #include <limits.h>
+#include <signal.h>
 #ifdef IOR_HAVE_PIDFD_OPEN
 #include <sys/syscall.h>
 #endif
@@ -429,7 +430,7 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		w->ready = 0;
 		w->connecting = 0;
 		w->pidfd = -1;
-		if (w->sqe.threads.opcode == IOR_OP_WORK) {
+		if (w->sqe.threads.opcode == IOR_OP_WORK || w->sqe.threads.opcode == IOR_OP_SIGWAIT) {
 			atomic_init(&w->token.cancelled, 0);
 			w->token.shutdown = &pool->wp->shutdown;
 		}
@@ -1064,9 +1065,10 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		/*
 		 * A guarded work op cannot be poll-gated: the callback runs on this
 		 * worker while the timer thread arbitrates the deadline and flags
-		 * the token so the callback can bail out.
+		 * the token so the callback can bail out. A signal wait is the same
+		 * shape: its worker checks the token between slices.
 		 */
-		if (lt && opcode == IOR_OP_WORK) {
+		if (lt && (opcode == IOR_OP_WORK || opcode == IOR_OP_SIGWAIT)) {
 			ior_cqe gcqe, lcqe;
 			ior_threads_pool_lt_arb *arb = ior_threads_pool_lt_arb_arm(pool, lt);
 			// An async cancel flags this token (w stays RUNNING, and this
@@ -1191,6 +1193,58 @@ static int ior_threads_pool_accept(
 	return nfd;
 }
 
+/*
+ * A worker's wait for a signal of the set, which every thread ior owns has
+ * blocked (see ior_thread_create) and the caller has blocked in its own.
+ * sigtimedwait(2) sleeps in slices so the token, flagged by a cancel, a fired
+ * link timeout or teardown, is looked at between them: this is the only way
+ * to get the worker back, since a signal not in the set stays pending and
+ * one in it would be taken for the caller's. Without sigtimedwait (macOS)
+ * sigwait(3) blocks until a signal of the set arrives, whatever the token
+ * says, and only its number is known.
+ */
+#define IOR_THREADS_SIGWAIT_SLICE_NS 20000000LL
+
+static int32_t ior_threads_pool_sigwait(const ior_sqe *sqe, ior_work_token *token)
+{
+	const sigset_t *set = (const sigset_t *) (uintptr_t) sqe->threads.addr;
+	siginfo_t *info = (siginfo_t *) (uintptr_t) sqe->threads.off;
+
+#ifdef IOR_HAVE_SIGTIMEDWAIT
+	siginfo_t local;
+	if (!info) {
+		info = &local;
+	}
+	const struct timespec slice = { .tv_sec = 0, .tv_nsec = IOR_THREADS_SIGWAIT_SLICE_NS };
+	for (;;) {
+		if (ior_work_cancelled(token)) {
+			return -ECANCELED;
+		}
+		int sig = sigtimedwait(set, info, &slice);
+		if (sig > 0) {
+			return sig;
+		}
+		if (errno != EAGAIN && errno != EINTR) {
+			return -errno;
+		}
+	}
+#else
+	if (ior_work_cancelled(token)) {
+		return -ECANCELED;
+	}
+	int sig;
+	int err = sigwait(set, &sig);
+	if (err != 0) {
+		return -err;
+	}
+	if (info) {
+		memset(info, 0, sizeof(*info));
+		info->si_signo = sig;
+	}
+	return sig;
+#endif
+}
+
 static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, ior_work *w, ior_cqe *cqe, ior_work_token *token)
 {
@@ -1311,6 +1365,12 @@ static void ior_threads_pool_process_single_sqe(
 			IOR_LOG_TRACE("recv end: res=%d", cqe->threads.res);
 			break;
 		}
+
+		case IOR_OP_SIGWAIT:
+			IOR_LOG_TRACE("sigwait start");
+			cqe->threads.res = ior_threads_pool_sigwait(sqe, token);
+			IOR_LOG_TRACE("sigwait end: res=%d", cqe->threads.res);
+			break;
 
 		case IOR_OP_LINK_TIMEOUT:
 			// A link timeout is normally consumed alongside its guarded op in

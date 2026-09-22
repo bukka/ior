@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +65,149 @@ void bench_sleep_forever(void)
 	for (;;) {
 		pause();
 	}
+}
+
+int bench_sig_number(int which)
+{
+	return SIGRTMIN + 2 + which;
+}
+
+int bench_sig_block(int signo)
+{
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, signo);
+	int err = pthread_sigmask(SIG_BLOCK, &set, NULL);
+	return err ? -err : 0;
+}
+
+int bench_sig_queue(int signo, int value)
+{
+	union sigval v;
+	v.sival_int = value;
+	return sigqueue(getpid(), signo, v) < 0 ? -errno : 0;
+}
+
+int bench_sig_value(const ior_siginfo_t *info)
+{
+	return info->si_value.sival_int;
+}
+
+int bench_sig_drain(int signo)
+{
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, signo);
+	int n = 0;
+	for (;;) {
+		sigset_t pending;
+		if (sigpending(&pending) < 0 || !sigismember(&pending, signo)) {
+			return n;
+		}
+		int sig;
+		if (sigwait(&set, &sig) != 0) {
+			return n;
+		}
+		n++;
+	}
+}
+
+typedef struct posix_thread_start {
+	void (*fn)(void *);
+	void *arg;
+} posix_thread_start;
+
+static void *posix_thread_main(void *arg)
+{
+	posix_thread_start st = *(posix_thread_start *) arg;
+	free(arg);
+	st.fn(st.arg);
+	return NULL;
+}
+
+int bench_thread_start(bench_thread *t, void (*fn)(void *), void *arg)
+{
+	posix_thread_start *st = malloc(sizeof(*st));
+	if (!st) {
+		return -ENOMEM;
+	}
+	st->fn = fn;
+	st->arg = arg;
+	pthread_t tid;
+	int err = pthread_create(&tid, NULL, posix_thread_main, st);
+	if (err) {
+		free(st);
+		return -err;
+	}
+	t->handle = (uintptr_t) tid;
+	return 0;
+}
+
+void bench_thread_join(bench_thread *t)
+{
+	pthread_join((pthread_t) t->handle, NULL);
+}
+
+typedef struct posix_gate {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	uint32_t credits;
+	int closed;
+} posix_gate;
+
+int bench_gate_init(bench_gate *g)
+{
+	posix_gate *pg = calloc(1, sizeof(*pg));
+	if (!pg) {
+		return -ENOMEM;
+	}
+	pthread_mutex_init(&pg->lock, NULL);
+	pthread_cond_init(&pg->cond, NULL);
+	g->impl = pg;
+	return 0;
+}
+
+void bench_gate_destroy(bench_gate *g)
+{
+	posix_gate *pg = g->impl;
+	if (!pg) {
+		return;
+	}
+	pthread_cond_destroy(&pg->cond);
+	pthread_mutex_destroy(&pg->lock);
+	free(pg);
+	g->impl = NULL;
+}
+
+void bench_gate_post(bench_gate *g, uint32_t n)
+{
+	posix_gate *pg = g->impl;
+	pthread_mutex_lock(&pg->lock);
+	pg->credits += n;
+	pthread_cond_signal(&pg->cond);
+	pthread_mutex_unlock(&pg->lock);
+}
+
+uint32_t bench_gate_take(bench_gate *g)
+{
+	posix_gate *pg = g->impl;
+	pthread_mutex_lock(&pg->lock);
+	while (pg->credits == 0 && !pg->closed) {
+		pthread_cond_wait(&pg->cond, &pg->lock);
+	}
+	uint32_t n = pg->credits;
+	pg->credits = 0;
+	pthread_mutex_unlock(&pg->lock);
+	return n;
+}
+
+void bench_gate_close(bench_gate *g)
+{
+	posix_gate *pg = g->impl;
+	pthread_mutex_lock(&pg->lock);
+	pg->closed = 1;
+	pthread_cond_broadcast(&pg->cond);
+	pthread_mutex_unlock(&pg->lock);
 }
 
 int bench_fd_is_valid(ior_fd_t fd)
