@@ -64,7 +64,9 @@ typedef struct ior_sqe_threads {
 		uint32_t file_index;
 	};
 	uint64_t splice_off_in;
-	uint64_t __pad[2];
+	/* TIMER / LINK_TIMEOUT: the caller's timespec (addr points at it until
+	 * submit), copied here by submit so the caller's may go out of scope. */
+	ior_timespec ts;
 } ior_sqe_threads;
 
 typedef struct ior_cqe_threads {
