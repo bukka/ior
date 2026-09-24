@@ -78,7 +78,7 @@ sudo cmake --build build --target install
 
 ### Basic Example
 ```c
-#include <ior/ior.h>
+#include <ior.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>

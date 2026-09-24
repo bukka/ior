@@ -162,10 +162,11 @@ With both backends built, CTest runs every common test twice, the second time
 under `IOR_BACKEND=threads`.
 
 `cmake --install` puts the header at `include/ior/ior.h` and a pkg-config file
-at `lib/pkgconfig/ior.pc`; `pkg-config --static --libs ior` adds liburing for
-an io_uring build. The library is built with position independent code, so the
-static archive can go into a shared object; set
-`CMAKE_POSITION_INDEPENDENT_CODE` to override.
+at `lib/pkgconfig/ior.pc`, whose `--cflags` add `include/ior`, so code includes
+`<ior.h>`; `pkg-config --static --libs ior` adds liburing for an io_uring
+build. The library is built with position independent code, so the static
+archive can go into a shared object; set `CMAKE_POSITION_INDEPENDENT_CODE` to
+override.
 
 The thread backend's IOR_OP_POLL readiness poller uses epoll on Linux, kqueue
 on FreeBSD/OpenBSD/macOS, and poll() elsewhere; `IOR_FORCE_POLL=ON` selects
@@ -223,7 +224,7 @@ cmake --build --preset windows-msvc
 cmake --install build --config RelWithDebInfo
 ```
 
-Installed layout: headers in `include/ior/` (`ior.h`, `config.h`), library in
+Installed layout: the header in `include/ior/` (`ior.h`, included as `<ior.h>`), library in
 `lib/` (`libior.a` / `ior.lib`), plus `pkgconfig/ior.pc` (unused on MSVC).
 
 ## Using IOR
@@ -231,7 +232,7 @@ Installed layout: headers in `include/ior/` (`ior.h`, `config.h`), library in
 **Unix** - pkg-config or manual:
 ```bash
 gcc myapp.c $(pkg-config --cflags --libs ior) -o myapp
-gcc myapp.c -I/usr/local/include -L/usr/local/lib -lior -lpthread -o myapp
+gcc myapp.c -I/usr/local/include/ior -L/usr/local/lib -lior -lpthread -o myapp
 ```
 CMake:
 ```cmake
@@ -243,7 +244,7 @@ target_link_libraries(myapp PRIVATE ${IOR_LIBRARIES})
 
 **Windows** - link `ior.lib` and `ws2_32`; pkg-config is not used:
 ```cmake
-target_include_directories(myapp PRIVATE C:/dev/ior-install/include)
+target_include_directories(myapp PRIVATE C:/dev/ior-install/include/ior)
 target_link_libraries(myapp PRIVATE C:/dev/ior-install/lib/ior.lib ws2_32)
 ```
 

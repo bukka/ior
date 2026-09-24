@@ -74,7 +74,8 @@ if(NOT DEFINED CMAKE_POSITION_INDEPENDENT_CODE)
     set_target_properties(ior PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-# The public header is consumed as <ior/ior.h>, in-tree and installed alike:
+# The public header is consumed as <ior.h> from its own directory, in-tree
+# and installed alike, so the private headers next to it in src/ stay hidden:
 # a copy is staged under the build tree (refreshed whenever ior.h changes).
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/ior.h
@@ -85,8 +86,8 @@ configure_file(
 # Include directories
 target_include_directories(ior
     PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+        $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include/ior>
+        $<INSTALL_INTERFACE:include/ior>
     PRIVATE
         ${CMAKE_BINARY_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
