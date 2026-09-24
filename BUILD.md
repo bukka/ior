@@ -140,6 +140,7 @@ Set with `-D<OPTION>=<VALUE>`.
 | `IOR_BUILD_TESTS` | ON | Build the test suite |
 | `IOR_WITH_URING` | ON | Look for liburing (Linux only) |
 | `IOR_FORCE_THREADS` | OFF | Use the thread backend even if io_uring works |
+| `IOR_WITH_THREADS` | OFF | Build the thread backend next to io_uring (Linux); pick one at run time with `IOR_BACKEND` |
 | `IOR_FORCE_PIPE` | OFF | Force pipe instead of eventfd (testing) |
 | `IOR_FORCE_POLL` | OFF | Force poll() readiness poller instead of epoll/kqueue (testing) |
 | `IOR_ENABLE_LOG` | OFF | Enable the logging system |
@@ -151,6 +152,20 @@ Set with `-D<OPTION>=<VALUE>`.
 `IOR_WITH_URING=OFF` never looks for liburing; `IOR_FORCE_THREADS=ON` ignores a
 working io_uring. Both yield the thread backend on Linux and have no effect on
 Windows/macOS.
+
+A build normally carries one backend. `IOR_WITH_THREADS=ON` builds the thread
+backend alongside io_uring on Linux, so one binary can run either: io_uring is
+the default, and the `IOR_BACKEND` environment variable (`io_uring`, `threads`,
+`iocp`) picks the other for every context created with `IOR_BACKEND_AUTO`. A
+name that is unknown or not built in fails `ior_queue_init()` with `-ENOSYS`.
+With both backends built, CTest runs every common test twice, the second time
+under `IOR_BACKEND=threads`.
+
+`cmake --install` puts the header at `include/ior/ior.h` and a pkg-config file
+at `lib/pkgconfig/ior.pc`; `pkg-config --static --libs ior` adds liburing for
+an io_uring build. The library is built with position independent code, so the
+static archive can go into a shared object; set
+`CMAKE_POSITION_INDEPENDENT_CODE` to override.
 
 The thread backend's IOR_OP_POLL readiness poller uses epoll on Linux, kqueue
 on FreeBSD/OpenBSD/macOS, and poll() elsewhere; `IOR_FORCE_POLL=ON` selects

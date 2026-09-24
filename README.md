@@ -366,6 +366,11 @@ const char *ior_get_backend_name(ior_ctx *ctx);
 uint32_t ior_get_features(ior_ctx *ctx);
 ```
 
+With `IOR_BACKEND_AUTO` the best backend built in is used, unless the
+`IOR_BACKEND` environment variable names one (`io_uring`, `threads`, `iocp`);
+a name that is unknown or not built in fails init with `-ENOSYS`. See
+[BUILD.md](BUILD.md) for building both Linux backends into one library.
+
 ## API Design
 
 ### Opaque Types

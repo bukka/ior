@@ -446,9 +446,9 @@ static void test_sigwait_two_on_one(void **state)
 		ior_cqe_seen(s->ctx, cqe);
 		return;
 	}
-#ifdef IOR_HAVE_URING
-	fail_msg("the second poll did not report the taken signal");
-#endif
+	if (ior_get_backend_type(s->ctx) == IOR_BACKEND_IOURING) {
+		fail_msg("the second poll did not report the taken signal");
+	}
 	assert_int_equal(ret, -ETIME);
 	int32_t r = end_pending(s, other, SIG_A);
 	assert_true(r == -ECANCELED || r == SIG_A);

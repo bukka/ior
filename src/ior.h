@@ -346,7 +346,11 @@ struct ior_params {
 	uint32_t sq_thread_idle;
 	/** [out] IOR_FEAT_* flags the chosen backend provides. */
 	uint32_t features;
-	/** Desired backend, or IOR_BACKEND_AUTO. */
+	/** Desired backend, or IOR_BACKEND_AUTO: the best one built in, unless
+	 *  the IOR_BACKEND environment variable names one ("io_uring",
+	 *  "threads" or "iocp"); a name that is unknown or not built in makes
+	 *  init fail with -ENOSYS. A build carries one backend unless
+	 *  IOR_WITH_THREADS added the thread backend next to io_uring. */
 	ior_backend_type backend;
 };
 
