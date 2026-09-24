@@ -60,9 +60,10 @@ elseif(CMAKE_C_COMPILER_ID MATCHES "MSVC")
 
 	# MSVC requires C11 mode plus an experimental flag to enable <stdatomic.h>.
 	# /std:c11 is normally implied by CMAKE_C_STANDARD=11, but the atomics header
-	# is gated behind /experimental:c11atomics (still required as of VS 2022/2026,
-	# because locking atomics are not yet complete). Without it, <stdatomic.h>
-	# fails to compile. Note: MSVC still defines __STDC_NO_ATOMICS__ even with the
+	# is gated behind /experimental:c11atomics (still required by MSVC 19.44 in
+	# VS 2022 17.14 and 19.51 in VS 2026 18.10, under /std:c11, c17 and clatest
+	# alike, because locking atomics are not yet complete). Without it,
+	# <stdatomic.h> fails to compile. Note: MSVC still defines __STDC_NO_ATOMICS__ even with the
 	# flag, so feature detection must compile a test program rather than check that
 	# macro (see the atomics check below).
 	add_compile_options(/experimental:c11atomics)
