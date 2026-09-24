@@ -442,6 +442,12 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 	for (uint32_t p = consumed; p != cached; p++) {
 		ior_work *w = ior_threads_pool_work_alloc(pool);
 		w->sqe = sqes[p & ctx->sq_ring.mask];
+		/* The caller's timespec is promised only until submit returns, as
+		 * on io_uring: take a copy now, before the timer is armed. */
+		if ((w->sqe.threads.opcode == IOR_OP_TIMER || w->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT)
+				&& w->sqe.threads.addr) {
+			w->sqe.threads.ts = *(const ior_timespec *) (uintptr_t) w->sqe.threads.addr;
+		}
 		w->seq = pool->next_seq++;
 		w->chain = NULL;
 		w->cur_token = NULL;
@@ -669,18 +675,26 @@ static int ior_threads_pool_fd_ready(int fd, short events)
 	return pret != 0;
 }
 
-// Absolute deadline of a link timeout, 0 for none (NULL timespec).
+/* The timespec of a timer or link timeout op: the copy submit took, or NULL
+ * when the caller gave none. */
+static const ior_timespec *ior_threads_pool_ts(const ior_work *w)
+{
+	return w->sqe.threads.addr ? &w->sqe.threads.ts : NULL;
+}
+
+static int ior_threads_pool_ts_valid(const ior_timespec *ts)
+{
+	return ts && ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000L;
+}
+
+// Absolute monotonic deadline of a link timeout, 0 for none (NULL timespec).
 static uint64_t ior_threads_pool_lt_deadline(const ior_work *lt)
 {
-	ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->sqe.threads.addr;
+	const ior_timespec *ts = ior_threads_pool_ts(lt);
 	if (!ts) {
 		return 0;
 	}
-	uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-	if (!(lt->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)) {
-		ns += ior_worker_pool_monotonic_ns();
-	}
-	return ns ? ns : 1;
+	return ior_worker_pool_deadline_ns(ts, lt->sqe.threads.timeout_flags);
 }
 
 /*
@@ -767,8 +781,8 @@ static void ior_threads_pool_lt_dropped(void *owner, void *arg)
  */
 static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *lt)
 {
-	ior_timespec *ts = (ior_timespec *) (uintptr_t) lt->sqe.threads.addr;
-	if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L) {
+	const ior_timespec *ts = ior_threads_pool_ts(lt);
+	if (!ior_threads_pool_ts_valid(ts)) {
 		return NULL;
 	}
 
@@ -781,10 +795,7 @@ static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *po
 	atomic_init(&arb->state, 0);
 	atomic_init(&arb->refs, 2); // this worker + the timer thread
 
-	uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-	uint64_t deadline_ns = (lt->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
-			? ts_ns
-			: ior_worker_pool_monotonic_ns() + ts_ns;
+	uint64_t deadline_ns = ior_worker_pool_deadline_ns(ts, lt->sqe.threads.timeout_flags);
 
 	if (ior_worker_pool_arm_timer(
 				pool->wp, deadline_ns, ior_threads_pool_lt_fired, ior_threads_pool_lt_dropped, arb)
@@ -1492,8 +1503,7 @@ static void ior_threads_pool_timer_fired(void *owner, void *arg)
 
 static int ior_threads_pool_timer_valid(const ior_work *work)
 {
-	ior_timespec *ts = (ior_timespec *) (uintptr_t) work->sqe.threads.addr;
-	return ts && ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000L;
+	return ior_threads_pool_ts_valid(ior_threads_pool_ts(work));
 }
 
 /*
@@ -1505,15 +1515,9 @@ static int ior_threads_pool_timer_valid(const ior_work *work)
  */
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work)
 {
-	ior_timespec *ts = (ior_timespec *) (uintptr_t) work->sqe.threads.addr;
 	int err = 0;
-
-	// IOR_TIMEOUT_ABS: ts is an absolute CLOCK_MONOTONIC deadline; otherwise
-	// it is a relative duration from now.
-	uint64_t ts_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
-	uint64_t deadline_ns = (work->sqe.threads.timeout_flags & IOR_TIMEOUT_ABS)
-			? ts_ns
-			: ior_worker_pool_monotonic_ns() + ts_ns;
+	uint64_t deadline_ns = ior_worker_pool_deadline_ns(
+			ior_threads_pool_ts(work), work->sqe.threads.timeout_flags);
 
 	pthread_mutex_lock(&pool->arm_lock);
 	int ret = ior_worker_pool_arm_timer(

@@ -104,6 +104,15 @@ int test_make_tcp_socket(ior_fd_t *fd);
  */
 uint64_t test_monotonic_now_ns(void);
 
+/*
+ * The other clocks a timeout can name (IOR_TIMEOUT_REALTIME,
+ * IOR_TIMEOUT_BOOTTIME), in nanoseconds, read the way the backends read them:
+ * CLOCK_REALTIME / the system time since the Unix epoch, and CLOCK_BOOTTIME
+ * (CLOCK_MONOTONIC where there is none) / GetTickCount64.
+ */
+uint64_t test_realtime_now_ns(void);
+uint64_t test_boottime_now_ns(void);
+
 #ifdef IOR_HAVE_IOCP
 /*
  * IOCP-only helpers (Windows). These open overlapped handles with

@@ -194,11 +194,30 @@ typedef struct ior_timespec {
 /**
  * @name Timeout flags
  * Bits for the flags argument of ior_prep_timeout() and ior_prep_link_timeout().
+ *
+ * An absolute deadline is read on the monotonic clock unless a clock flag
+ * names another: CLOCK_MONOTONIC on POSIX, QueryPerformanceCounter on Windows
+ * (as nanoseconds: counter * 1e9 / frequency). A relative timeout is a
+ * duration: io_uring counts it on the flagged clock, which matters across a
+ * suspend (IOR_TIMEOUT_BOOTTIME keeps counting, the default does not); the
+ * thread and IOCP backends count every relative timeout on their monotonic
+ * clock, and convert an absolute deadline on another clock into one at arm
+ * time, so a suspend between submit and expiry is not seen by them.
  * @{
  */
-/** Interpret the timespec as an absolute deadline on the monotonic clock
- *  rather than a relative duration. */
+/** Interpret the timespec as an absolute deadline rather than a relative
+ *  duration. */
 #define IOR_TIMEOUT_ABS (1U << 0)
+/** The deadline (or duration, on io_uring) is on the boot-time clock, which
+ *  keeps counting while the system is suspended: CLOCK_BOOTTIME on Linux and
+ *  FreeBSD, CLOCK_MONOTONIC on macOS (where it already counts sleep),
+ *  GetTickCount64 on Windows (milliseconds since boot). io_uring's
+ *  IORING_TIMEOUT_BOOTTIME. */
+#define IOR_TIMEOUT_BOOTTIME (1U << 1)
+/** The deadline is on the wall clock, as nanoseconds since the Unix epoch:
+ *  CLOCK_REALTIME on POSIX, the system time on Windows. A deadline in the
+ *  past fires at once. io_uring's IORING_TIMEOUT_REALTIME. */
+#define IOR_TIMEOUT_REALTIME (1U << 2)
 /** @} */
 
 /**
@@ -536,14 +555,21 @@ void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in
 /**
  * Prepare a timeout that completes with -ETIME after @p ts elapses.
  *
+ * @p ts is read by ior_submit() and copied then, on every backend, so it may
+ * live on the caller's stack until submit returns (io_uring reads it during
+ * io_uring_enter(); the other backends copy it into the entry).
+ *
  * @param ctx    I/O context.
  * @param sqe    Entry from ior_get_sqe().
- * @param ts     Timeout value: a relative duration, or an absolute monotonic
- *               deadline if IOR_TIMEOUT_ABS is set in @p flags.
+ * @param ts     Timeout value: a relative duration, or an absolute deadline
+ *               if IOR_TIMEOUT_ABS is set in @p flags, on the clock the
+ *               other IOR_TIMEOUT_* flags select (see there).
  * @param count  Number of completions to wait for before the timeout fires
  *               (io_uring semantics; 0 = a pure time-based timeout). Ignored by
  *               backends that do not support it.
- * @param flags  IOR_TIMEOUT_ABS to treat @p ts as an absolute deadline, else 0.
+ * @param flags  IOR_TIMEOUT_ABS to treat @p ts as an absolute deadline,
+ *               IOR_TIMEOUT_BOOTTIME / IOR_TIMEOUT_REALTIME to pick its clock,
+ *               else 0.
  */
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned count, unsigned flags);
 
@@ -563,12 +589,16 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  * completion uncancelled. If the guarded op is cancelled with ior_prep_cancel()
  * instead, both it and this link timeout complete with -ECANCELED.
  *
+ * @p ts is read by ior_submit() and copied then, as for ior_prep_timeout().
+ *
  * @param ctx    I/O context.
  * @param sqe    Entry from ior_get_sqe(), submitted right after the guarded op.
  * @param ts     Deadline after which the guarded op is cancelled: a relative
- *               duration, or an absolute monotonic deadline if IOR_TIMEOUT_ABS
- *               is set in @p flags.
- * @param flags  IOR_TIMEOUT_ABS to treat @p ts as an absolute deadline, else 0.
+ *               duration, or an absolute deadline if IOR_TIMEOUT_ABS is set in
+ *               @p flags, on the clock the other IOR_TIMEOUT_* flags select.
+ * @param flags  IOR_TIMEOUT_ABS to treat @p ts as an absolute deadline,
+ *               IOR_TIMEOUT_BOOTTIME / IOR_TIMEOUT_REALTIME to pick its clock,
+ *               else 0.
  */
 void ior_prep_link_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned flags);
 

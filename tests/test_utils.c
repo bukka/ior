@@ -43,6 +43,35 @@ uint64_t test_monotonic_now_ns(void)
 #endif
 }
 
+uint64_t test_realtime_now_ns(void)
+{
+#ifdef _WIN32
+	FILETIME ft;
+	GetSystemTimePreciseAsFileTime(&ft);
+	uint64_t t = ((uint64_t) ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+	return (t - 116444736000000000ULL) * 100ULL;
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+#endif
+}
+
+uint64_t test_boottime_now_ns(void)
+{
+#ifdef _WIN32
+	return GetTickCount64() * 1000000ULL;
+#else
+	struct timespec ts;
+#ifdef CLOCK_BOOTTIME
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+#else
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+#endif
+}
+
 int setup_ior_ctx(void **state)
 {
 	test_state *ts = calloc(1, sizeof(test_state));

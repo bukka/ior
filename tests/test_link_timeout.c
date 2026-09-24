@@ -3,6 +3,7 @@
 
 #define TAG_OP ((void *) 0x1) // the guarded recv
 #define TAG_TMO ((void *) 0x2) // the link timeout
+#define TAG_BARRIER ((void *) 0x3) // a timeout the guarded recv drains behind
 
 typedef struct lt_state {
 	ior_ctx *ctx;
@@ -193,6 +194,75 @@ static void test_link_timeout_fires_abs(void **state)
 }
 
 /*
+ * Submit a guarded recv and its link timeout with the timespec in this
+ * frame, behind a 150 ms timeout and an IO_DRAIN barrier: the guard is armed
+ * only once the recv is issued, long after this frame is gone.
+ */
+static void submit_guarded_recv_from_scope(lt_state *s, char *buf, size_t len, int64_t ns)
+{
+	ior_timespec first = { .tv_sec = 0, .tv_nsec = 150000000LL };
+	ior_timespec ts = {
+		.tv_sec = ns / 1000000000LL,
+		.tv_nsec = ns % 1000000000LL,
+	};
+
+	ior_sqe *b = ior_get_sqe(s->ctx);
+	assert_non_null(b);
+	ior_prep_timeout(s->ctx, b, &first, 0, 0);
+	ior_sqe_set_data(s->ctx, b, TAG_BARRIER);
+
+	ior_sqe *r = ior_get_sqe(s->ctx);
+	assert_non_null(r);
+	ior_prep_recv(s->ctx, r, s->sock[1], buf, (unsigned) len, 0);
+	ior_sqe_set_data(s->ctx, r, TAG_OP);
+	ior_sqe_set_flags(s->ctx, r, IOR_SQE_IO_LINK | IOR_SQE_IO_DRAIN);
+
+	ior_sqe *t = ior_get_sqe(s->ctx);
+	assert_non_null(t);
+	ior_prep_link_timeout(s->ctx, t, &ts, 0);
+	ior_sqe_set_data(s->ctx, t, TAG_TMO);
+
+	assert_true(ior_submit(s->ctx) >= 0);
+}
+
+static void clobber_stack(void)
+{
+	volatile unsigned char junk[8192];
+	for (size_t i = 0; i < sizeof(junk); i++) {
+		junk[i] = 0x55;
+	}
+}
+
+/*
+ * A link timeout's timespec may go out of scope once ior_submit() returns:
+ * the deadline is armed later (when the guarded op parks), from the copy
+ * submit took. With the frame overwritten a late read would see garbage.
+ */
+static void test_link_timeout_ts_out_of_scope(void **state)
+{
+	lt_state *s = (lt_state *) *state;
+	char buf[64];
+	memset(buf, 0, sizeof(buf));
+
+	uint64_t start = test_monotonic_now_ns();
+	submit_guarded_recv_from_scope(s, buf, sizeof(buf), 100000000LL);
+	clobber_stack();
+
+	ior_cqe *cqe = NULL;
+	assert_return_code(ior_wait_cqe(s->ctx, &cqe), 0);
+	assert_ptr_equal(ior_cqe_get_data(s->ctx, cqe), TAG_BARRIER);
+	ior_cqe_seen(s->ctx, cqe);
+
+	int32_t res_op = 0, res_tmo = 0;
+	reap_pair(s->ctx, &res_op, &res_tmo);
+	uint64_t ms = (test_monotonic_now_ns() - start) / 1000000ULL;
+
+	assert_int_equal(res_op, -ECANCELED);
+	assert_true(res_tmo == -ETIME || res_tmo == -ETIMEDOUT);
+	assert_true(ms >= 200 && ms < 3000);
+}
+
+/*
  * Concurrency stress: many guarded recvs, each with its own link timeout, in
  * flight at once over many rounds. Data is pre-loaded so every guarded op wins
  * and every link timeout resolves as -ECANCELED. On the threads backend each
@@ -363,6 +433,7 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_link_timeout_fires, setup_lt, teardown_lt),
 		cmocka_unit_test_setup_teardown(test_link_timeout_op_first, setup_lt, teardown_lt),
 		cmocka_unit_test_setup_teardown(test_link_timeout_fires_abs, setup_lt, teardown_lt),
+		cmocka_unit_test_setup_teardown(test_link_timeout_ts_out_of_scope, setup_lt, teardown_lt),
 		cmocka_unit_test_setup_teardown(
 				test_link_timeout_concurrency, setup_lt_conc, teardown_lt_conc),
 	};

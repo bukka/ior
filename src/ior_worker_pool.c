@@ -33,11 +33,40 @@ int ior_thread_create(
 	return ret;
 }
 
-uint64_t ior_worker_pool_monotonic_ns(void)
+static uint64_t ior_worker_pool_clock_ns(clockid_t clock)
 {
 	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
+	clock_gettime(clock, &ts);
 	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+uint64_t ior_worker_pool_monotonic_ns(void)
+{
+	return ior_worker_pool_clock_ns(CLOCK_MONOTONIC);
+}
+
+uint64_t ior_worker_pool_deadline_ns(const ior_timespec *ts, unsigned flags)
+{
+	uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	uint64_t now = ior_worker_pool_monotonic_ns();
+	if (!(flags & IOR_TIMEOUT_ABS)) {
+		return now + ns;
+	}
+
+	clockid_t clock = CLOCK_MONOTONIC;
+	if (flags & IOR_TIMEOUT_REALTIME) {
+		clock = CLOCK_REALTIME;
+	} else if (flags & IOR_TIMEOUT_BOOTTIME) {
+#ifdef CLOCK_BOOTTIME
+		clock = CLOCK_BOOTTIME;
+#endif
+		/* Elsewhere CLOCK_MONOTONIC stands in (on macOS it counts sleep). */
+	}
+	if (clock == CLOCK_MONOTONIC) {
+		return ns ? ns : 1;
+	}
+	uint64_t clock_now = ior_worker_pool_clock_ns(clock);
+	return ns > clock_now ? now + (ns - clock_now) : now;
 }
 
 // Must be called with pool->lock held.

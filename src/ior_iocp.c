@@ -125,8 +125,11 @@ typedef struct ior_iocp_op {
 	// Bumped every time the op returns to the pool; never reset.
 	uint32_t gen;
 
-	// Timeout-specific fields
+	// Timeout-specific fields. The caller's timespec is promised only until
+	// submit returns: submit copies it into timeout_val and points timeout_ts
+	// there, so a link timeout armed later reads the copy.
 	ior_timespec *timeout_ts;
+	ior_timespec timeout_val;
 	uint32_t timeout_flags;
 
 	// Timer bookkeeping (for IOR_OP_TIMER)
@@ -2047,18 +2050,41 @@ static uint64_t qpc_now_ns(void)
 	return sec * 1000000000ULL + (rem * 1000000000ULL) / f;
 }
 
+/* The wall clock as nanoseconds since the Unix epoch (FILETIME counts 100 ns
+ * units since 1601). */
+static uint64_t realtime_now_ns(void)
+{
+	FILETIME ft;
+	GetSystemTimePreciseAsFileTime(&ft);
+	uint64_t t = ((uint64_t) ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+	return (t - 116444736000000000ULL) * 100ULL;
+}
+
+/* Time since boot including sleep, at millisecond resolution. */
+static uint64_t boottime_now_ns(void)
+{
+	return GetTickCount64() * 1000000ULL;
+}
+
+/*
+ * The QPC deadline a timeout names: now plus ts for a relative one, ts itself
+ * for an absolute one on QPC, and for one on another clock (boot time, wall
+ * clock) the QPC time as far ahead as ts is of that clock's reading now; a
+ * deadline already past is now.
+ */
 static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts, uint32_t flags)
 {
-	uint64_t delta_ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
 
-	if (flags & IOR_TIMEOUT_ABS) {
-		// Absolute deadline: treat the timespec value directly as the deadline.
-		// Caller is responsible for using a compatible clock base.
-		return delta_ns;
+	if (!(flags & IOR_TIMEOUT_ABS)) {
+		return qpc_now_ns() + ns;
 	}
-
-	// Relative: deadline = now + delta
-	return qpc_now_ns() + delta_ns;
+	if (!(flags & (IOR_TIMEOUT_REALTIME | IOR_TIMEOUT_BOOTTIME))) {
+		return ns;
+	}
+	uint64_t clock_now = (flags & IOR_TIMEOUT_REALTIME) ? realtime_now_ns() : boottime_now_ns();
+	uint64_t now = qpc_now_ns();
+	return ns > clock_now ? now + (ns - clock_now) : now;
 }
 
 /* Timer heap */
@@ -3204,6 +3230,11 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 
 		// Assign submission sequence
 		op->seq = atomic_fetch_add(&ctx->submit_seq, 1) + 1;
+
+		if ((op->opcode == IOR_OP_TIMER || op->opcode == IOR_OP_LINK_TIMEOUT) && op->timeout_ts) {
+			op->timeout_val = *op->timeout_ts;
+			op->timeout_ts = &op->timeout_val;
+		}
 
 		// A link timeout already paired with its guarded op is armed when that
 		// op is issued, not submitted as a standalone op. Still count it: its

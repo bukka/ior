@@ -465,6 +465,8 @@ static void ior_uring_reaped(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, uns
  * completing NOP) and rewritten into another skipped NOP; its deadline is
  * handled by the pool's timer thread instead.
  */
+static unsigned ior_uring_timeout_flags_from(unsigned uflags);
+
 static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 {
 	ior_uring_dispatch_waits(ctx);
@@ -513,11 +515,11 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 							= (struct __kernel_timespec *) (uintptr_t) next->addr;
 					if (kts && kts->tv_sec >= 0 && kts->tv_nsec >= 0
 							&& kts->tv_nsec < 1000000000LL) {
-						uint64_t ts_ns
-								= (uint64_t) kts->tv_sec * 1000000000ULL + (uint64_t) kts->tv_nsec;
-						lt_deadline_ns = (next->timeout_flags & IORING_TIMEOUT_ABS)
-								? ts_ns
-								: ior_worker_pool_monotonic_ns() + ts_ns;
+						/* Same layout as ior_timespec; the pool's timer runs on
+						 * CLOCK_MONOTONIC, so a deadline on another clock is
+						 * converted here, at submit. */
+						lt_deadline_ns = ior_worker_pool_deadline_ns((const ior_timespec *) kts,
+								ior_uring_timeout_flags_from(next->timeout_flags));
 						job->lt_armed = 1;
 					}
 
@@ -988,7 +990,29 @@ static unsigned ior_uring_timeout_flags(unsigned flags)
 	if (flags & IOR_TIMEOUT_ABS) {
 		uflags |= IORING_TIMEOUT_ABS;
 	}
+	if (flags & IOR_TIMEOUT_BOOTTIME) {
+		uflags |= IORING_TIMEOUT_BOOTTIME;
+	}
+	if (flags & IOR_TIMEOUT_REALTIME) {
+		uflags |= IORING_TIMEOUT_REALTIME;
+	}
 	return uflags;
+}
+
+// The reverse, for a LINK_TIMEOUT intercepted at submit (see dispatch_pending).
+static unsigned ior_uring_timeout_flags_from(unsigned uflags)
+{
+	unsigned flags = 0;
+	if (uflags & IORING_TIMEOUT_ABS) {
+		flags |= IOR_TIMEOUT_ABS;
+	}
+	if (uflags & IORING_TIMEOUT_BOOTTIME) {
+		flags |= IOR_TIMEOUT_BOOTTIME;
+	}
+	if (uflags & IORING_TIMEOUT_REALTIME) {
+		flags |= IOR_TIMEOUT_REALTIME;
+	}
+	return flags;
 }
 
 static void ior_uring_backend_prep_timeout(

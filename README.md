@@ -19,7 +19,9 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Socket accept and connect operations (`ior_prep_accept`,
   `ior_prep_connect`), readiness-driven on the thread pool and through
   AcceptEx/ConnectEx on Windows
-- Timer/timeout operations
+- Timer/timeout operations, relative or absolute on the monotonic, boot-time
+  or wall clock (`IOR_TIMEOUT_ABS`, `IOR_TIMEOUT_BOOTTIME`,
+  `IOR_TIMEOUT_REALTIME`); the timespec is copied at submit on every backend
 - Readiness polling (`ior_prep_poll_add`), one-shot or multishot
   (`ior_prep_poll_multishot`): a persistent poll posts one completion per
   readiness edge, flagged `IOR_CQE_F_MORE`, until cancelled -
@@ -266,7 +268,10 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, int fd, struct sockaddr *addr,
 void ior_prep_connect(ior_ctx *ctx, ior_sqe *sqe, int fd,
                       const struct sockaddr *addr, socklen_t addrlen);
 
-// Timeout operation
+// Timeout operation: ts is a relative duration, or with IOR_TIMEOUT_ABS an
+// absolute deadline on the monotonic clock (IOR_TIMEOUT_BOOTTIME and
+// IOR_TIMEOUT_REALTIME select the boot-time or wall clock instead). ts is
+// read by ior_submit(), so it may live on the stack until submit returns.
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
                       unsigned count, unsigned flags);
 

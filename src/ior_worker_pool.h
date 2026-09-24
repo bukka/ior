@@ -3,6 +3,7 @@
 #define IOR_WORKER_POOL_H
 
 #include <stdint.h>
+#include "ior.h"
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -146,6 +147,15 @@ uint32_t ior_worker_pool_num_threads(ior_worker_pool *pool);
 void ior_worker_pool_thread_stats(ior_worker_pool *pool, uint32_t *active, uint32_t *idle);
 
 uint64_t ior_worker_pool_monotonic_ns(void);
+
+/*
+ * The CLOCK_MONOTONIC deadline a timeout names: now plus ts for a relative
+ * one, ts itself for an absolute one on the monotonic clock, and for one on
+ * another clock (IOR_TIMEOUT_BOOTTIME, IOR_TIMEOUT_REALTIME) the monotonic
+ * time as far ahead as ts is of that clock's current reading; a deadline
+ * already past is now. ts must be valid. Never 0.
+ */
+uint64_t ior_worker_pool_deadline_ns(const ior_timespec *ts, unsigned flags);
 
 /*
  * pthread_create() for every thread ior owns (workers, timer, pollers). The
