@@ -83,7 +83,7 @@ jobs:
       - name: Build and run a consumer
         run: |
           cat > consumer.c <<'EOF'
-          #include <ior/ior.h>
+          #include <ior.h>
           #include <stdio.h>
 
           int consumer_backend(void)

@@ -517,7 +517,8 @@ if(IOR_BUILD_BENCH)
     add_subdirectory(bench)
 endif()
 
-# Installation: the one public header, as <ior/ior.h> (config.h is private).
+# Installation: the one public header, in include/ior; consumers include
+# <ior.h> with that directory on the include path (ior.pc adds it).
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/ior.h
     DESTINATION include/ior
 )
