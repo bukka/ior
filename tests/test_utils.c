@@ -72,6 +72,19 @@ uint64_t test_boottime_now_ns(void)
 #endif
 }
 
+void test_setenv(const char *name, const char *value)
+{
+#ifdef _WIN32
+	_putenv_s(name, value ? value : "");
+#else
+	if (value) {
+		setenv(name, value, 1);
+	} else {
+		unsetenv(name);
+	}
+#endif
+}
+
 int setup_ior_ctx(void **state)
 {
 	test_state *ts = calloc(1, sizeof(test_state));

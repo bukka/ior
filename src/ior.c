@@ -5,8 +5,26 @@
 #include <string.h>
 #include <errno.h>
 
+/*
+ * The backend for IOR_BACKEND_AUTO: the one IOR_BACKEND names in the
+ * environment, if set (a name that is unknown or not built in fails init
+ * with -ENOSYS rather than being ignored), else the best one built in.
+ */
 static ior_backend_type detect_backend(void)
 {
+	const char *env = getenv("IOR_BACKEND");
+	if (env && *env) {
+		if (strcmp(env, "io_uring") == 0 || strcmp(env, "uring") == 0) {
+			return IOR_BACKEND_IOURING;
+		}
+		if (strcmp(env, "threads") == 0) {
+			return IOR_BACKEND_THREADS;
+		}
+		if (strcmp(env, "iocp") == 0) {
+			return IOR_BACKEND_IOCP;
+		}
+		return IOR_BACKEND_AUTO;
+	}
 #ifdef IOR_HAVE_URING
 	return IOR_BACKEND_IOURING;
 #elif defined(IOR_HAVE_IOCP)

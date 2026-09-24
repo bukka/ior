@@ -45,12 +45,72 @@ jobs:
       
       - name: Configure (force threads)
         run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIOR_FORCE_THREADS=ON
-      
+
       - name: Build
         run: cmake --build build
-      
+
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  # Both Linux backends in one library: CTest runs every common test on each
+  # (the second time under IOR_BACKEND=threads), then the installed header and
+  # ior.pc are used by a consumer as php-src would.
+  linux-both:
+    name: Linux io_uring + threads (IOR_WITH_THREADS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev libcmocka-dev pkg-config
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIOR_WITH_THREADS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install
+        run: cmake --install build --prefix "$PWD/stage"
+
+      # The static archive must link into a shared object (PIC) and pull in
+      # liburing through pkg-config --static; IOR_BACKEND picks the backend.
+      - name: Build and run a consumer
+        run: |
+          cat > consumer.c <<'EOF'
+          #include <ior/ior.h>
+          #include <stdio.h>
+
+          int consumer_backend(void)
+          {
+          	ior_ctx *ctx = NULL;
+          	if (ior_queue_init(8, &ctx) < 0) {
+          		return -1;
+          	}
+          	printf("%s\n", ior_get_backend_name(ctx));
+          	ior_queue_exit(ctx);
+          	return 0;
+          }
+
+          #ifndef CONSUMER_LIB
+          int main(void)
+          {
+          	return consumer_backend() < 0;
+          }
+          #endif
+          EOF
+          export PKG_CONFIG_PATH="$PWD/stage/lib/pkgconfig"
+          FLAGS="$(pkg-config --cflags --static --libs ior)"
+          cc -shared -fPIC -DCONSUMER_LIB consumer.c -o libconsumer.so $FLAGS
+          cc consumer.c -o consumer $FLAGS
+          test "$(./consumer)" = io_uring
+          test "$(IOR_BACKEND=threads ./consumer)" = threads
+          ! IOR_BACKEND=no-such-backend ./consumer
 
   linux-uring-asan:
     name: Linux io_uring + AddressSanitizer

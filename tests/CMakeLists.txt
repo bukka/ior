@@ -56,6 +56,16 @@ foreach(test ${TESTS})
 
     # Set timeout for tests
     set_tests_properties(${test} PROPERTIES TIMEOUT 30)
+
+    # With both backends in one library, run the same binary on the thread
+    # backend too, selected through the environment.
+    if(IOR_HAVE_URING AND IOR_HAVE_THREADS)
+        add_test(NAME ${test}_threads COMMAND ${test})
+        set_tests_properties(${test}_threads PROPERTIES
+            TIMEOUT 30
+            ENVIRONMENT "IOR_BACKEND=threads"
+        )
+    endif()
 endforeach()
 
 # Signal delivery (POSIX only: every ior thread must block signals)

@@ -113,6 +113,9 @@ uint64_t test_monotonic_now_ns(void);
 uint64_t test_realtime_now_ns(void);
 uint64_t test_boottime_now_ns(void);
 
+/* Set (value non-NULL) or unset an environment variable. */
+void test_setenv(const char *name, const char *value);
+
 #ifdef IOR_HAVE_IOCP
 /*
  * IOCP-only helpers (Windows). These open overlapped handles with

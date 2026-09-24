@@ -67,10 +67,25 @@ endif()
 # Create library
 add_library(ior ${IOR_SOURCES} ${IOR_BACKEND_SOURCES})
 
+# A consumer that links the static library into a shared object (a PHP
+# extension, say) needs position independent code; opt out by setting
+# CMAKE_POSITION_INDEPENDENT_CODE explicitly.
+if(NOT DEFINED CMAKE_POSITION_INDEPENDENT_CODE)
+    set_target_properties(ior PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# The public header is consumed as <ior/ior.h>, in-tree and installed alike:
+# a copy is staged under the build tree (refreshed whenever ior.h changes).
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/ior.h
+    ${CMAKE_BINARY_DIR}/include/ior/ior.h
+    COPYONLY
+)
+
 # Include directories
 target_include_directories(ior
     PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_BINARY_DIR}

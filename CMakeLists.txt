@@ -114,6 +114,7 @@ option(IOR_BUILD_TESTS "Build test programs" ON)
 option(IOR_BUILD_BENCH "Build the ior_bench benchmark tool" ON)
 option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)
 option(IOR_FORCE_THREADS "Force thread backend even if io_uring available (testing)" OFF)
+option(IOR_WITH_THREADS "Build the thread backend alongside io_uring on Linux, selectable at run time with IOR_BACKEND=threads" OFF)
 option(IOR_FORCE_PIPE "Force pipe for thread event notification (testing)" OFF)
 option(IOR_FORCE_POLL "Force poll() for the readiness poller even if epoll/kqueue is available (testing)" OFF)
 option(IOR_ENABLE_LOG "Enable logging system" OFF)
@@ -459,9 +460,12 @@ endif()
 set(IOR_HAVE_THREADS FALSE)
 
 if(NOT IOR_PLATFORM_WINDOWS)
-    if(NOT IOR_HAVE_URING OR IOR_FORCE_THREADS)
+    if(NOT IOR_HAVE_URING OR IOR_FORCE_THREADS OR IOR_WITH_THREADS)
         set(IOR_HAVE_THREADS TRUE)
     endif()
+endif()
+if(IOR_HAVE_URING AND IOR_HAVE_THREADS)
+    message(STATUS "Both backends built; io_uring is the default, IOR_BACKEND=threads selects the other")
 endif()
 
 if(IOR_HAVE_THREADS)
@@ -513,16 +517,18 @@ if(IOR_BUILD_BENCH)
     add_subdirectory(bench)
 endif()
 
-# Installation
-install(DIRECTORY include/
-    DESTINATION include
-)
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/config.h
+# Installation: the one public header, as <ior/ior.h> (config.h is private).
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/ior.h
     DESTINATION include/ior
 )
 
-# pkg-config file (not meaningful on Windows/MSVC, but harmless to generate)
+# pkg-config file (not meaningful on Windows/MSVC, but harmless to generate).
+# A consumer of the static library links io_uring's dependency through
+# `pkg-config --static`.
+set(IOR_PC_REQUIRES_PRIVATE "")
+if(IOR_HAVE_URING)
+    set(IOR_PC_REQUIRES_PRIVATE "liburing")
+endif()
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/ior.pc.in
     ${CMAKE_CURRENT_BINARY_DIR}/ior.pc
@@ -559,5 +565,6 @@ message(STATUS "")
 message(STATUS "Build Options:")
 message(STATUS "  Tests:         ${IOR_BUILD_TESTS}")
 message(STATUS "  Force threads: ${IOR_FORCE_THREADS}")
+message(STATUS "  With threads:  ${IOR_WITH_THREADS}")
 message(STATUS "  Force pipe:    ${IOR_FORCE_PIPE}")
 message(STATUS "")
