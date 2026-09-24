@@ -100,8 +100,21 @@ cmake --build --preset windows-msvc
 ctest --preset windows-msvc
 ```
 
-`windows-msvc` auto-selects the newest installed Visual Studio. To pin one, use
-`windows-vs2022` or `windows-vs2026` instead.
+`windows-msvc` auto-selects the newest installed Visual Studio and builds in
+`build`. To pin one, use `windows-vs2022` or `windows-vs2026` for all three
+steps instead; they build in `build-vs2022` and `build-vs2026`, so both can
+coexist on a machine with both versions installed:
+
+```bat
+cmake --preset windows-vs2026
+cmake --build --preset windows-vs2026
+ctest --preset windows-vs2026
+```
+
+Both are verified: MSVC 19.44 (VS 2022 17.14) and MSVC 19.51 (VS 2026 18.10)
+build and pass the tests, including under ASan, and CI runs both (the
+`windows-2022` and `windows-2025` images). VS 2026 still needs
+`/experimental:c11atomics` for `<stdatomic.h>`; CMakeLists.txt adds it.
 
 Without presets, pass the generator and the vcpkg toolchain (required so the
 manifest resolves cmocka):
@@ -125,9 +138,9 @@ ignored.
 
 **AddressSanitizer:** use the `windows-msvc-asan` preset (Debug, in a separate
 `build-asan` dir). Tests need `clang_rt.asan_dynamic-x86_64.dll` on `PATH` -
-easiest from a **Developer PowerShell for VS**; the test preset also adds it
-automatically when `VCToolsInstallDir` is set. UBSan and TSan are unavailable
-with MSVC (the options are ignored with a warning).
+easiest from the **Developer PowerShell** of the Visual Studio that built them
+(each version ships its own copy in its toolset's `bin` dir). UBSan and TSan
+are unavailable with MSVC (the options are ignored with a warning).
 
 ## Build options
 

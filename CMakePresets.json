@@ -27,16 +27,18 @@
     {
       "name": "windows-vs2022",
       "displayName": "Windows (force Visual Studio 2022)",
-      "description": "Pin the VS 2022 (v17) generator explicitly",
+      "description": "Pin the VS 2022 (v17) generator explicitly, in build-vs2022 so it can sit next to a VS 2026 build",
       "inherits": "windows-msvc",
-      "generator": "Visual Studio 17 2022"
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build-vs2022"
     },
     {
       "name": "windows-vs2026",
       "displayName": "Windows (force Visual Studio 2026)",
-      "description": "Pin the VS 2026 (v18) generator explicitly. Requires CMake 4.2 or later.",
+      "description": "Pin the VS 2026 (v18) generator explicitly, in build-vs2026. Requires CMake 4.2 or later.",
       "inherits": "windows-msvc",
-      "generator": "Visual Studio 18 2026"
+      "generator": "Visual Studio 18 2026",
+      "binaryDir": "${sourceDir}/build-vs2026"
     },
     {
       "name": "windows-msvc-asan",
@@ -125,6 +127,16 @@
       "configuration": "Debug"
     },
     {
+      "name": "windows-vs2022",
+      "configurePreset": "windows-vs2022",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "windows-vs2026",
+      "configurePreset": "windows-vs2026",
+      "configuration": "RelWithDebInfo"
+    },
+    {
       "name": "linux-default",
       "configurePreset": "linux-default"
     },
@@ -150,6 +162,22 @@
       "name": "windows-msvc-asan",
       "configurePreset": "windows-msvc-asan",
       "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-vs2022",
+      "configurePreset": "windows-vs2022",
+      "configuration": "RelWithDebInfo",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-vs2026",
+      "configurePreset": "windows-vs2026",
+      "configuration": "RelWithDebInfo",
       "output": {
         "outputOnFailure": true
       }

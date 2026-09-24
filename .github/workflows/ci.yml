@@ -216,9 +216,22 @@ jobs:
         env:
           ASAN_OPTIONS: halt_on_error=1
 
+  # Both supported Visual Studio versions. windows-latest has meant Windows
+  # Server 2025 with only VS 2026 since June 2026, so the images are named:
+  # windows-2022 carries VS 2022 (v17), windows-2025 carries VS 2026 (v18).
+  # The windows-msvc presets pick the newest VS on the image, so no pinning
+  # is needed here.
   windows-iocp:
-    name: Windows IOCP (MSVC)
-    runs-on: windows-latest
+    name: Windows IOCP (${{ matrix.vs }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            vs: MSVC, VS 2022
+          - os: windows-2025
+            vs: MSVC, VS 2026
     steps:
       - uses: actions/checkout@v5
 
@@ -249,15 +262,23 @@ jobs:
           if ($exe) { & $exe.FullName } else { Write-Host "test_basic.exe not found" }
 
   windows-iocp-asan:
-    name: Windows IOCP + AddressSanitizer (MSVC)
-    runs-on: windows-latest
+    name: Windows IOCP + AddressSanitizer (${{ matrix.vs }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            vs: MSVC, VS 2022
+          - os: windows-2025
+            vs: MSVC, VS 2026
     steps:
       - uses: actions/checkout@v5
 
       # Sets up the MSVC developer environment (PATH, VCToolsInstallDir,
-      # VCPKG_ROOT, etc.) for all later steps. The ASan test preset relies on
-      # VCToolsInstallDir to locate clang_rt.asan_dynamic-x86_64.dll at test
-      # runtime; the preset toolchain path uses VCPKG_ROOT.
+      # VCPKG_ROOT, etc.) for all later steps. The ASan tests need the
+      # toolset's bin dir on PATH to load clang_rt.asan_dynamic-x86_64.dll at
+      # run time; the preset toolchain path uses VCPKG_ROOT.
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
