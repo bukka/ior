@@ -103,6 +103,8 @@ static int ior_threads_backend_init(void **backend_ctx, ior_params *params)
 	ctx->features |= IOR_FEAT_SPLICE;
 #endif
 
+	params->sq_entries = ctx->sq_ring.size;
+	params->cq_entries = ctx->cq_ring.size;
 	params->features = ctx->features;
 
 	*backend_ctx = ctx;
@@ -131,36 +133,65 @@ static void ior_threads_backend_destroy(void *backend_ctx)
 	free(ctx);
 }
 
-static ior_sqe *ior_threads_backend_get_sqe(void *backend_ctx)
+static int ior_threads_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 {
 	if (!backend_ctx) {
-		return NULL;
+		return -EINVAL;
 	}
 
 	ior_ctx_threads *ctx = backend_ctx;
 	ior_threads_pool *pool = ctx->pool;
 
 	/*
-	 * Cap the ops in flight at the work-item pool capacity so a submit always
-	 * has a work item, and the completions promised at the CQ size so every
-	 * completion has a slot when it is posted; the staging ring caps the
-	 * unsubmitted batch. The CQ slot is held until the completion is reaped.
-	 * Only this thread adds to outstanding, so a plain check will do; the
-	 * poller thread reserves CQ slots too, so that one is claimed atomically.
+	 * The staging ring caps the unsubmitted batch: a full one is reported
+	 * first, as a submit is the cheaper remedy and this thread is the only
+	 * one that changes it. Then cap the ops in flight at the work-item pool
+	 * capacity so a submit always has a work item, and the completions
+	 * promised at the CQ size so every completion has a slot when it is
+	 * posted; the CQ slot is held until the completion is reaped. Only this
+	 * thread adds to outstanding, so a plain check will do; the poller thread
+	 * reserves CQ slots too, so that one is claimed atomically.
 	 */
+	if (ior_threads_ring_sq_space_left(&ctx->sq_ring) == 0) {
+		return -ENOSPC;
+	}
 	if (atomic_load(&pool->outstanding) >= pool->work_cap) {
-		return NULL;
+		return -EBUSY;
 	}
 	if (ior_threads_pool_cq_reserve(pool) < 0) {
-		return NULL;
+		return -EBUSY;
 	}
 	ior_sqe *sqe = ior_threads_ring_get_sqe(&ctx->sq_ring);
 	if (!sqe) {
 		ior_threads_pool_cq_release(pool, 1);
-		return NULL;
+		return -ENOSPC;
 	}
 	atomic_fetch_add(&pool->outstanding, 1);
-	return sqe;
+	*sqe_out = sqe;
+	return 0;
+}
+
+static unsigned ior_threads_backend_sq_entries(void *backend_ctx)
+{
+	return ((ior_ctx_threads *) backend_ctx)->sq_ring.size;
+}
+
+static unsigned ior_threads_backend_cq_entries(void *backend_ctx)
+{
+	return ((ior_ctx_threads *) backend_ctx)->cq_ring.size;
+}
+
+static unsigned ior_threads_backend_sq_space_left(void *backend_ctx)
+{
+	return ior_threads_ring_sq_space_left(&((ior_ctx_threads *) backend_ctx)->sq_ring);
+}
+
+static unsigned ior_threads_backend_cq_space_left(void *backend_ctx)
+{
+	ior_ctx_threads *ctx = backend_ctx;
+	uint32_t size = ctx->cq_ring.size;
+	uint32_t pending = atomic_load_explicit(&ctx->pool->cq_pending, memory_order_acquire);
+	return pending < size ? size - pending : 0;
 }
 
 static int ior_threads_backend_submit(void *backend_ctx)
@@ -644,6 +675,10 @@ const ior_backend_ops ior_threads_ops = {
 	.notify_clear = ior_threads_backend_notify_clear,
 	.backend_name = ior_threads_backend_name,
 	.get_features = ior_threads_backend_get_features,
+	.sq_entries = ior_threads_backend_sq_entries,
+	.cq_entries = ior_threads_backend_cq_entries,
+	.sq_space_left = ior_threads_backend_sq_space_left,
+	.cq_space_left = ior_threads_backend_cq_space_left,
 };
 
 #endif /* IOR_HAVE_THREADS */

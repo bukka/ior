@@ -29,6 +29,7 @@ set(TESTS
     test_link_timeout
     test_slow_op
     test_sq_reuse
+    test_capacity
     test_work
     test_cancel
     test_notify

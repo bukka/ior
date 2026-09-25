@@ -329,7 +329,8 @@ typedef struct ior_ctx_iocp {
 
 	_Atomic uint32_t active_count; // ops published to IOCP but not yet dequeued into ready queue
 
-	// Submission queue (software ring)
+	// Submission queue (software ring): free-running head/tail, indexed
+	// through sq_mask, so every one of sq_size slots can be staged.
 	ior_iocp_op **sq_array;
 	uint32_t sq_head;
 	uint32_t sq_tail;
@@ -770,15 +771,20 @@ static int init_sq_ring(ior_ctx_iocp *ctx, uint32_t size)
 	return 0;
 }
 
+static uint32_t sq_space_left(const ior_ctx_iocp *ctx)
+{
+	uint32_t staged = ctx->sq_tail - ctx->sq_head;
+	return staged < ctx->sq_size ? ctx->sq_size - staged : 0;
+}
+
 static int sq_enqueue(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
-	uint32_t next_tail = (ctx->sq_tail + 1) & ctx->sq_mask;
-	if (next_tail == ctx->sq_head) {
-		return -EBUSY;
+	if (sq_space_left(ctx) == 0) {
+		return -ENOSPC;
 	}
 
-	ctx->sq_array[ctx->sq_tail] = op;
-	ctx->sq_tail = next_tail;
+	ctx->sq_array[ctx->sq_tail & ctx->sq_mask] = op;
+	ctx->sq_tail++;
 	return 0;
 }
 
@@ -2893,7 +2899,12 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	atomic_store(&ctx->submit_seq, 0);
 	atomic_store(&ctx->completed_cnt, 0);
 
-	ret = init_op_pool(ctx, sq_entries);
+	/*
+	 * An op holds its pool entry from get_sqe until its completion is reaped,
+	 * so the pool is the completion queue's size: the in-flight bound, as on
+	 * the thread backend, and the ready queue can never be full.
+	 */
+	ret = init_op_pool(ctx, cq_entries);
 	if (ret < 0) {
 		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
@@ -2975,6 +2986,8 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	atomic_store(&ctx->shutdown, 0);
 
 	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_WORK | IOR_FEAT_POLL_ADD;
+	params->sq_entries = ctx->sq_size;
+	params->cq_entries = ctx->ready.size;
 	params->features = ctx->features;
 
 	*backend_ctx = ctx;
@@ -3190,25 +3203,57 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	free(ctx);
 }
 
-static ior_sqe *ior_iocp_backend_get_sqe(void *backend_ctx)
+static int ior_iocp_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 {
 	if (!backend_ctx) {
-		return NULL;
+		return -EINVAL;
 	}
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
+	// A full staging ring first: a submit is the cheaper remedy.
+	if (sq_space_left(ctx) == 0) {
+		return -ENOSPC;
+	}
+
+	// The pool is the completion queue's size: none free means every
+	// completion slot is taken by an op in flight or a completion unreaped.
 	ior_iocp_op *op = alloc_op(ctx);
 	if (!op) {
-		return NULL;
+		return -EBUSY;
 	}
 
 	if (sq_enqueue(ctx, op) < 0) {
 		free_op(ctx, op);
-		return NULL;
+		return -ENOSPC;
 	}
 
-	return (ior_sqe *) op;
+	*sqe_out = (ior_sqe *) op;
+	return 0;
+}
+
+static unsigned ior_iocp_backend_sq_entries(void *backend_ctx)
+{
+	return ((ior_ctx_iocp *) backend_ctx)->sq_size;
+}
+
+static unsigned ior_iocp_backend_cq_entries(void *backend_ctx)
+{
+	return ((ior_ctx_iocp *) backend_ctx)->ready.size;
+}
+
+static unsigned ior_iocp_backend_sq_space_left(void *backend_ctx)
+{
+	return sq_space_left((ior_ctx_iocp *) backend_ctx);
+}
+
+static unsigned ior_iocp_backend_cq_space_left(void *backend_ctx)
+{
+	ior_ctx_iocp *ctx = backend_ctx;
+	EnterCriticalSection(&ctx->pool_lock);
+	unsigned left = ctx->free_count;
+	LeaveCriticalSection(&ctx->pool_lock);
+	return left;
 }
 
 static int ior_iocp_backend_submit(void *backend_ctx)
@@ -3225,8 +3270,8 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 	ior_iocp_op *prev = NULL;
 
 	while (ctx->sq_head != ctx->sq_tail) {
-		ior_iocp_op *op = ctx->sq_array[ctx->sq_head];
-		ctx->sq_head = (ctx->sq_head + 1) & ctx->sq_mask;
+		ior_iocp_op *op = ctx->sq_array[ctx->sq_head & ctx->sq_mask];
+		ctx->sq_head++;
 
 		// Assign submission sequence
 		op->seq = atomic_fetch_add(&ctx->submit_seq, 1) + 1;
@@ -3265,7 +3310,7 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		// Pair a guarded op with an immediately following link timeout: the
 		// link timeout watchdogs this op rather than chaining after it.
 		if (op->sqe_flags & IOR_SQE_IO_LINK && ctx->sq_head != ctx->sq_tail) {
-			ior_iocp_op *nxt = ctx->sq_array[ctx->sq_head];
+			ior_iocp_op *nxt = ctx->sq_array[ctx->sq_head & ctx->sq_mask];
 			if (nxt->opcode == IOR_OP_LINK_TIMEOUT && !nxt->guarded) {
 				op->link_timeout = nxt;
 				nxt->guarded = op;
@@ -4235,6 +4280,10 @@ const ior_backend_ops ior_iocp_ops = {
 	.notify_clear = ior_iocp_backend_notify_clear,
 	.backend_name = ior_iocp_backend_name,
 	.get_features = ior_iocp_backend_get_features,
+	.sq_entries = ior_iocp_backend_sq_entries,
+	.cq_entries = ior_iocp_backend_cq_entries,
+	.sq_space_left = ior_iocp_backend_sq_space_left,
+	.cq_space_left = ior_iocp_backend_cq_space_left,
 };
 
 #endif /* IOR_HAVE_IOCP */

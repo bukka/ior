@@ -63,11 +63,14 @@ int ior_queue_init_params(unsigned entries, ior_ctx **ctx_out, ior_params *param
 		return -EINVAL;
 	}
 
-	if (params->sq_entries == 0) {
-		params->sq_entries = entries;
+	/* The backend writes the sizes it settles on into a copy, so the caller's
+	 * params change only on success. */
+	ior_params used = *params;
+	if (used.sq_entries == 0) {
+		used.sq_entries = entries;
 	}
 
-	ior_backend_type backend = params->backend;
+	ior_backend_type backend = used.backend;
 	if (backend == IOR_BACKEND_AUTO) {
 		backend = detect_backend();
 	}
@@ -85,12 +88,15 @@ int ior_queue_init_params(unsigned entries, ior_ctx **ctx_out, ior_params *param
 	ctx->backend = backend;
 	ctx->ops = ops;
 
-	int ret = ops->init(&ctx->backend_ctx, params);
+	int ret = ops->init(&ctx->backend_ctx, &used);
 	if (ret < 0) {
 		free(ctx);
 		return ret;
 	}
 
+	params->sq_entries = used.sq_entries;
+	params->cq_entries = used.cq_entries;
+	params->features = used.features;
 	*ctx_out = ctx;
 	return 0;
 }
@@ -118,7 +124,20 @@ void ior_queue_exit(ior_ctx *ctx)
 /* Submission operations - just call through vtable */
 ior_sqe *ior_get_sqe(ior_ctx *ctx)
 {
-	return ctx ? ctx->ops->get_sqe(ctx->backend_ctx) : NULL;
+	ior_sqe *sqe = NULL;
+	if (ctx) {
+		ctx->ops->get_sqe(ctx->backend_ctx, &sqe);
+	}
+	return sqe;
+}
+
+int ior_get_sqe_ex(ior_ctx *ctx, ior_sqe **sqe_out)
+{
+	if (!sqe_out) {
+		return -EINVAL;
+	}
+	*sqe_out = NULL;
+	return ctx ? ctx->ops->get_sqe(ctx->backend_ctx, sqe_out) : -EINVAL;
 }
 
 int ior_submit(ior_ctx *ctx)
@@ -445,4 +464,25 @@ const char *ior_get_backend_name(ior_ctx *ctx)
 uint32_t ior_get_features(ior_ctx *ctx)
 {
 	return ctx ? ctx->ops->get_features(ctx->backend_ctx) : 0;
+}
+
+/* Queue capacity */
+unsigned ior_sq_entries(ior_ctx *ctx)
+{
+	return ctx ? ctx->ops->sq_entries(ctx->backend_ctx) : 0;
+}
+
+unsigned ior_cq_entries(ior_ctx *ctx)
+{
+	return ctx ? ctx->ops->cq_entries(ctx->backend_ctx) : 0;
+}
+
+unsigned ior_sq_space_left(ior_ctx *ctx)
+{
+	return ctx ? ctx->ops->sq_space_left(ctx->backend_ctx) : 0;
+}
+
+unsigned ior_cq_space_left(ior_ctx *ctx)
+{
+	return ctx ? ctx->ops->cq_space_left(ctx->backend_ctx) : 0;
 }

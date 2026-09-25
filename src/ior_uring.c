@@ -30,6 +30,8 @@ typedef struct ior_ctx_uring {
 	struct io_uring ring;
 	uint32_t flags;
 	uint32_t features;
+	uint32_t sq_entries; // ring sizes as the kernel set them up
+	uint32_t cq_entries;
 
 	/*
 	 * IOR_OP_WORK support. Callbacks run on a lazily created shared worker
@@ -750,6 +752,10 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	}
 	ctx->features |= IOR_FEAT_WORK;
 
+	ctx->sq_entries = uring_params.sq_entries;
+	ctx->cq_entries = uring_params.cq_entries;
+	params->sq_entries = ctx->sq_entries;
+	params->cq_entries = ctx->cq_entries;
 	params->features = ctx->features;
 	*backend_ctx = ctx;
 	return 0;
@@ -809,18 +815,50 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 	free(ctx);
 }
 
-static ior_sqe *ior_uring_backend_get_sqe(void *backend_ctx)
+static int ior_uring_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 {
 	if (!backend_ctx) {
-		return NULL;
+		return -EINVAL;
 	}
 
 	ior_ctx_uring *ctx = backend_ctx;
-	struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
-	if (sqe) {
-		memset(sqe, 0, sizeof(*sqe));
+	/*
+	 * A full CQ is refused rather than overflowed: the kernel would buffer
+	 * the completions, but off the ring and on a slow path, and the other
+	 * backends refuse here too. Reaping makes room.
+	 */
+	if (io_uring_cq_ready(&ctx->ring) >= ctx->cq_entries) {
+		return -EBUSY;
 	}
-	return (ior_sqe *) sqe;
+	struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+	if (!sqe) {
+		return -ENOSPC;
+	}
+	memset(sqe, 0, sizeof(*sqe));
+	*sqe_out = (ior_sqe *) sqe;
+	return 0;
+}
+
+static unsigned ior_uring_backend_sq_entries(void *backend_ctx)
+{
+	return ((ior_ctx_uring *) backend_ctx)->sq_entries;
+}
+
+static unsigned ior_uring_backend_cq_entries(void *backend_ctx)
+{
+	return ((ior_ctx_uring *) backend_ctx)->cq_entries;
+}
+
+static unsigned ior_uring_backend_sq_space_left(void *backend_ctx)
+{
+	return io_uring_sq_space_left(&((ior_ctx_uring *) backend_ctx)->ring);
+}
+
+static unsigned ior_uring_backend_cq_space_left(void *backend_ctx)
+{
+	ior_ctx_uring *ctx = backend_ctx;
+	unsigned ready = io_uring_cq_ready(&ctx->ring);
+	return ready < ctx->cq_entries ? ctx->cq_entries - ready : 0;
 }
 
 static int ior_uring_backend_submit(void *backend_ctx)
@@ -1415,6 +1453,10 @@ const ior_backend_ops ior_uring_ops = {
 	.notify_clear = ior_uring_backend_notify_clear,
 	.backend_name = ior_uring_backend_name,
 	.get_features = ior_uring_backend_get_features,
+	.sq_entries = ior_uring_backend_sq_entries,
+	.cq_entries = ior_uring_backend_cq_entries,
+	.sq_space_left = ior_uring_backend_sq_space_left,
+	.cq_space_left = ior_uring_backend_cq_space_left,
 };
 
 #endif /* IOR_HAVE_URING */
