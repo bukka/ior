@@ -219,6 +219,14 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count);
 // Shutdown pool and wait for all threads to finish
 void ior_threads_pool_destroy(ior_threads_pool *pool);
 
+/*
+ * Promise a CQ slot (see cq_pending): 0, or -EBUSY when every slot is
+ * promised already. Release returns nr slots once their completions are
+ * reaped; releasing more than are promised is logged and clamped.
+ */
+int ior_threads_pool_cq_reserve(ior_threads_pool *pool);
+void ior_threads_pool_cq_release(ior_threads_pool *pool, uint32_t nr);
+
 // Get number of worker threads
 uint32_t ior_threads_pool_get_num_threads(ior_threads_pool *pool);
 

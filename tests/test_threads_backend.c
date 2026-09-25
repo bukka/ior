@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "test_utils.h"
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #define NOP_TAG(i) ((void *) (uintptr_t) (0x100 + (i)))
 #define RECV_TAG(i) ((void *) (uintptr_t) (0x1000 + (i)))
@@ -243,6 +246,136 @@ static void test_cq_full_multishot_ends(void **state)
 	ior_queue_exit(ctx);
 }
 
+typedef struct edge_feeder {
+	ior_fd_t sock[2];
+	atomic_int stop;
+} edge_feeder;
+
+/* Make a readiness edge on sock[1] over and over, draining it between. */
+static void *feed_edges(void *arg)
+{
+	edge_feeder *f = arg;
+	char buf[64];
+	while (!atomic_load(&f->stop)) {
+		(void) send(f->sock[0], "x", 1, MSG_DONTWAIT);
+		(void) recv(f->sock[1], buf, sizeof(buf), MSG_DONTWAIT);
+	}
+	return NULL;
+}
+
+static uint64_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
+}
+
+/*
+ * ior_get_sqe and the poller thread (reserving a slot for a multishot edge)
+ * promise completion slots concurrently. Keep the queue at its limit while
+ * edges keep coming: a slot promised twice would end with a completion
+ * posted into a full ring and lost, which shows as a poll that never
+ * reports its end or a slot that is never given back.
+ */
+static void test_cq_reserve_race(void **state)
+{
+	(void) state;
+	enum { SIZE = 32 };
+	ior_ctx *ctx = init_threads(SIZE, SIZE);
+	edge_feeder f;
+	assert_return_code(test_make_socketpair(f.sock), 0);
+	atomic_init(&f.stop, 0);
+	pthread_t t;
+	assert_return_code(pthread_create(&t, NULL, feed_edges, &f), 0);
+
+	int poll_armed = 0;
+	uint64_t end = now_ms() + 300;
+	while (now_ms() < end) {
+		ior_sqe *sqe;
+		if (!poll_armed && (sqe = ior_get_sqe(ctx))) {
+			ior_prep_poll_multishot(ctx, sqe, f.sock[1], IOR_POLL_IN);
+			ior_sqe_set_data(ctx, sqe, POLL_TAG);
+			poll_armed = 1;
+		}
+		int nops = 0;
+		while ((sqe = ior_get_sqe(ctx))) {
+			ior_prep_nop(ctx, sqe);
+			ior_sqe_set_data(ctx, sqe, NOP_TAG(0));
+			nops++;
+		}
+		assert_true(ior_submit(ctx) >= 0);
+
+		// Let the nops land and edges pile up behind them before reaping,
+		// so the ring runs full.
+		ior_cqe *cqes[SIZE];
+		uint64_t wait_end = now_ms() + 1000;
+		while (ior_peek_batch_cqe(ctx, cqes, SIZE) < (unsigned) nops) {
+			if (now_ms() >= wait_end) {
+				fail_msg("a completion was lost");
+			}
+		}
+
+		while (nops > 0) {
+			void *tag;
+			uint32_t flags;
+			int32_t res = reap_one(ctx, &tag, &flags);
+			if (tag == POLL_TAG) {
+				assert_true(res > 0);
+				if (!(flags & IOR_CQE_F_MORE)) {
+					poll_armed = 0;
+				}
+			} else {
+				assert_int_equal(res, 0);
+				nops--;
+			}
+		}
+		// Edges posted since, and possibly the poll's end.
+		unsigned n;
+		while ((n = ior_peek_batch_cqe(ctx, cqes, SIZE)) > 0) {
+			for (unsigned i = 0; i < n; i++) {
+				assert_ptr_equal(ior_cqe_get_data(ctx, cqes[i]), POLL_TAG);
+				if (!(ior_cqe_get_flags(ctx, cqes[i]) & IOR_CQE_F_MORE)) {
+					poll_armed = 0;
+				}
+			}
+			ior_cq_advance(ctx, n);
+		}
+	}
+
+	atomic_store(&f.stop, 1);
+	pthread_join(t, NULL);
+
+	// A live poll ends with -ECANCELED; one reported ended must be gone.
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_cancel(ctx, sqe, POLL_TAG);
+	ior_sqe_set_data(ctx, sqe, CANCEL_TAG(0));
+	assert_int_equal(ior_submit(ctx), 1);
+	int cancel_seen = 0;
+	while (!cancel_seen || poll_armed) {
+		void *tag;
+		uint32_t flags;
+		int32_t res = reap_one(ctx, &tag, &flags);
+		if (tag == CANCEL_TAG(0)) {
+			assert_int_equal(res, poll_armed ? 0 : -ENOENT);
+			cancel_seen = 1;
+		} else {
+			assert_ptr_equal(tag, POLL_TAG);
+			if (!(flags & IOR_CQE_F_MORE)) {
+				poll_armed = 0;
+			}
+		}
+	}
+
+	// Every slot is free again.
+	submit_nops(ctx, SIZE);
+	ior_cq_advance(ctx, SIZE);
+
+	test_close_fd(f.sock[0]);
+	test_close_fd(f.sock[1]);
+	ior_queue_exit(ctx);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -250,6 +383,7 @@ int main(void)
 		cmocka_unit_test(test_cq_full_get_sqe),
 		cmocka_unit_test(test_cq_full_cancel_parked),
 		cmocka_unit_test(test_cq_full_multishot_ends),
+		cmocka_unit_test(test_cq_reserve_race),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

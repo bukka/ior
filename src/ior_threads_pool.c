@@ -37,7 +37,6 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, ior_work *w, ior_cqe *cqe, ior_work_token *token);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
-static int ior_threads_pool_cq_reserve(ior_threads_pool *pool);
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work);
 static int ior_threads_pool_timer_valid(const ior_work *work);
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
@@ -1707,10 +1706,11 @@ static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_c
 }
 
 /*
- * Promise a CQ slot for a completion beyond the one each op holds (a
- * multishot edge). Fails with -EBUSY when every slot is promised already.
+ * Promise a CQ slot: one for each SQE handed out (its op's last completion),
+ * one for each multishot edge. A CAS, as get_sqe and the poller thread
+ * reserve concurrently and a check-then-add could promise one slot too many.
  */
-static int ior_threads_pool_cq_reserve(ior_threads_pool *pool)
+int ior_threads_pool_cq_reserve(ior_threads_pool *pool)
 {
 	uint32_t size = pool->ctx->cq_ring.size;
 	uint32_t n = atomic_load_explicit(&pool->cq_pending, memory_order_relaxed);
@@ -1720,6 +1720,22 @@ static int ior_threads_pool_cq_reserve(ior_threads_pool *pool)
 		}
 	} while (!atomic_compare_exchange_weak(&pool->cq_pending, &n, n + 1));
 	return 0;
+}
+
+void ior_threads_pool_cq_release(ior_threads_pool *pool, uint32_t nr)
+{
+	uint32_t n = atomic_load_explicit(&pool->cq_pending, memory_order_relaxed);
+	uint32_t left;
+	do {
+		if (nr > n) {
+			// A completion marked seen that was never posted: without the
+			// clamp the count would wrap and get_sqe would refuse for good.
+			IOR_LOG_ERROR("%u completions reaped, %u pending", nr, n);
+			left = 0;
+		} else {
+			left = n - nr;
+		}
+	} while (!atomic_compare_exchange_weak(&pool->cq_pending, &n, left));
 }
 
 // ===== Timers =====

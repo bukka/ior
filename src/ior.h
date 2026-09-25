@@ -339,7 +339,12 @@ typedef struct ior_params ior_params;
 struct ior_params {
 	/** Submission queue size; 0 uses the `entries` argument to init. */
 	uint32_t sq_entries;
-	/** Completion queue size; 0 lets the backend choose (typically 2x SQ). */
+	/**
+	 * Completion queue size; 0 lets the backend choose (typically 2x SQ).
+	 * On the thread backend it also caps the operations in flight, as each
+	 * holds a slot until its completion is reaped: size it above the number
+	 * of operations expected to stay parked.
+	 */
 	uint32_t cq_entries;
 	/** IOR_SETUP_* setup flags. */
 	uint32_t flags;
@@ -838,9 +843,12 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
  * completes at once with its mask as the last completion.
  *
  * The operation may also end on its own, with a positive res and no
- * IOR_CQE_F_MORE, when a completion cannot be posted: io_uring and the
- * thread backend do so when the completion queue is full, the IOCP backend
- * when its operation pool is exhausted. Re-arm by submitting a new poll.
+ * IOR_CQE_F_MORE, when a completion cannot be posted: io_uring does so when
+ * the completion queue is full, the IOCP backend when its operation pool is
+ * exhausted. The thread backend does so when every completion slot is
+ * promised, which counts the ops in flight as well as unreaped completions,
+ * so parked operations can end a multishot poll with the ring empty.
+ * Re-arm by submitting a new poll.
  *
  * io_uring uses IORING_POLL_ADD_MULTI. The thread backend watches the
  * descriptor edge-triggered on its poller (EPOLLET on epoll, EV_CLEAR on
