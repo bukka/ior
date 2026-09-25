@@ -47,6 +47,33 @@ enum {
 };
 
 /*
+ * How a positionless read or write is issued. Only the first form has a
+ * per-call non-blocking flag; the others are the plain syscall, either on a
+ * descriptor whose mode the op has taken over (see ior_threads_pool_fdmode)
+ * or on one that runs to completion anyway (a regular file).
+ */
+enum {
+	IOR_RW_NOWAIT = 0, /* preadv2/pwritev2 with RWF_NOWAIT (Linux) */
+	IOR_RW_PLAIN_MODE, /* read/write; the descriptor's mode is taken over */
+	IOR_RW_PLAIN, /* read/write; the descriptor's mode does not matter */
+};
+
+/*
+ * A descriptor whose blocking mode the backend has looked at for the ops in
+ * flight on it. One entry per descriptor, keyed by number, holding one
+ * reference per op that needed a non-blocking descriptor; `owned` records
+ * that the switch is ior's to undo, and the last op to complete restores the
+ * mode. A descriptor the caller keeps non-blocking gets an entry that owns
+ * nothing; under IOR_SETUP_FD_NONBLOCK there are no entries at all.
+ */
+typedef struct ior_threads_pool_fdmode {
+	struct ior_threads_pool_fdmode *next; // bucket chain, or free-list link
+	int fd;
+	uint32_t refs;
+	_Atomic int owned; // set once the switch has been made (outside the lock)
+} ior_threads_pool_fdmode;
+
+/*
  * A submitted operation, copied out of the SQ ring at submit time. Workers
  * consume these from the shared worker pool's dispatch queue, so a slow op
  * never pins an SQ slot. Items live in a fixed pool and move between the free
@@ -66,6 +93,8 @@ typedef struct ior_work {
 	 */
 	_Atomic int state; // IOR_WORK_*
 	int ready; // rw op: the poller reported readiness, skip the probe
+	int fdmode; // holds a reference on the descriptor's mode entry (see ior_threads_pool_fdmode)
+	int rw_plain; // positionless read/write: IOR_RW_* form the syscall takes
 	int connecting; // connect op: started, the next pass reads SO_ERROR
 	int pidfd; // waitpid op: the pidfd parked on the poller, -1 if none
 	struct ior_work_token *cur_token; // token the running callback observes
@@ -119,6 +148,21 @@ struct ior_threads_pool {
 	ior_work *work_free; // free list
 	uint32_t work_cap;
 	uint64_t next_seq; // next submission sequence to assign
+
+	/*
+	 * Switched descriptors (see ior_threads_pool_fdmode), a chained hash by
+	 * descriptor number. Nodes come from a fixed array of work_cap, one per
+	 * in-flight op at most. fdmode_lock covers the table and the ioctl that
+	 * restores, so a restore is never interleaved with a new op's look at
+	 * the mode; the look and the switch themselves run outside it. A leaf
+	 * lock, taken with no other held, and kept off work_lock so that taking
+	 * a mode over does not contend with completions.
+	 */
+	pthread_mutex_t fdmode_lock;
+	ior_threads_pool_fdmode **fdmode_buckets;
+	ior_threads_pool_fdmode *fdmode_nodes;
+	ior_threads_pool_fdmode *fdmode_free;
+	uint32_t fdmode_mask;
 
 	/*
 	 * outstanding = reserved-but-not-completed (get_sqe backpressure);

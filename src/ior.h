@@ -165,13 +165,16 @@ typedef struct ior_timespec {
 /**
  * Every descriptor submitted to this context is already in non-blocking mode.
  *
- * The thread backend otherwise puts a descriptor in non-blocking mode before
- * an operation that has no per-call non-blocking flag, costing one ioctl; this
- * flag says the caller has done it already and the ioctl can be skipped. Set
- * it only if that holds for every descriptor you submit: an operation on a
- * descriptor that does block occupies a worker thread until it completes, and
- * cannot be cancelled meanwhile. Ignored by the io_uring and IOCP backends,
- * which never change descriptor state.
+ * The thread backend otherwise takes a blocking descriptor's mode over for an
+ * operation that has no per-call non-blocking form (accept, connect, and a
+ * read or write at the current position where RWF_NOWAIT is unavailable),
+ * one fcntl and one ioctl to switch it and one ioctl to restore it once the
+ * last such operation on it completes; this flag says the caller keeps its
+ * descriptors non-blocking and all of that can be skipped. Set it only if
+ * that holds for every descriptor you submit: an operation on a descriptor
+ * that does block occupies a worker thread until it completes, and cannot be
+ * cancelled meanwhile. Ignored by the io_uring and IOCP backends, which never
+ * change descriptor state.
  */
 #define IOR_SETUP_FD_NONBLOCK (1U << 3)
 /** @} */
@@ -518,8 +521,8 @@ void ior_prep_nop(ior_ctx *ctx, ior_sqe *sqe);
  * @param fd      Source file or socket descriptor.
  * @param buf     Destination buffer.
  * @param nbytes  Maximum number of bytes to read.
- * @param offset  File offset, or IOR_OFF_NONE to read at the current position
- *                (required for non-seekable fds such as sockets and pipes).
+ * @param offset  File offset, or IOR_OFF_NONE to read at the current position.
+ *                A non-seekable fd (socket, pipe) ignores the offset.
  */
 void ior_prep_read(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, void *buf, unsigned nbytes, uint64_t offset);
@@ -532,8 +535,8 @@ void ior_prep_read(
  * @param fd      Destination file or socket descriptor.
  * @param buf     Source buffer.
  * @param nbytes  Number of bytes to write.
- * @param offset  File offset, or IOR_OFF_NONE to write at the current position
- *                (required for non-seekable fds such as sockets and pipes).
+ * @param offset  File offset, or IOR_OFF_NONE to write at the current position.
+ *                A non-seekable fd (socket, pipe) ignores the offset.
  */
 void ior_prep_write(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const void *buf, unsigned nbytes, uint64_t offset);
@@ -642,10 +645,11 @@ void ior_prep_recv(
  * filled with the peer address as accept(2) does; @p addrlen must be
  * initialised to the buffer size and stays valid until completion.
  *
- * The thread backend puts the listening socket in non-blocking mode (see
- * IOR_SETUP_FD_NONBLOCK) and waits for readiness on its poller, so the op is
- * cancellable and never occupies a worker; the accepted socket gets exactly
- * the state @p flags asks for, whatever the listener's mode.
+ * The thread backend takes a blocking listener's mode over while the op
+ * waits for readiness on its poller (see IOR_SETUP_FD_NONBLOCK), so the op is
+ * cancellable and never occupies a worker, and restores it once the last
+ * op on the listener completes; the accepted socket gets exactly the state
+ * @p flags asks for, whatever the listener's mode.
  *
  * Under IOR_SETUP_FD_NONBLOCK, pass IOR_ACCEPT_NONBLOCK. That promise covers
  * the accepted socket as soon as you submit an operation on it, and nothing
@@ -668,9 +672,10 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
  * Completes with 0 once the connection is established, or a negative errno
  * (-ECONNREFUSED, -ETIMEDOUT, ...). @p addr must stay valid until completion.
  *
- * The thread backend puts the socket in non-blocking mode (see
+ * The thread backend takes a blocking socket's mode over (see
  * IOR_SETUP_FD_NONBLOCK), starts the connection and waits for writability on
- * its poller, so the op is cancellable and never occupies a worker. On
+ * its poller, so the op is cancellable and never occupies a worker, and
+ * restores the mode once the op completes. On
  * Windows an unbound socket is bound to the wildcard address first, as
  * ConnectEx requires. A connect that fails or is cancelled leaves the socket
  * unusable for another connect on every backend, as connect(2) and

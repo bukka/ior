@@ -400,9 +400,10 @@ The thread pool backend uses:
 - A single readiness poller thread (epoll/kqueue/poll) that parks
   read/write/send/recv on pollable descriptors, so workers never block on a
   socket, non-blocking descriptors never spin on `EAGAIN`, and pending
-  operations stay cancellable. Descriptors it cannot ask for a non-blocking
-  attempt per call are put in non-blocking mode (see below). It also parks
-  a wait for one child there (a pidfd on Linux, `EVFILT_PROC` on kqueue)
+  operations stay cancellable. A descriptor it cannot ask for a non-blocking
+  attempt per call has its mode taken over for the op and restored after
+  (see below). It also parks a wait for one child there (a pidfd on Linux,
+  `EVFILT_PROC` on kqueue)
 - Operation chaining with `IOR_SQE_IO_LINK` flag
 - Ordering guarantees with `IOR_SQE_IO_DRAIN` flag
 - eventfd (Linux/FreeBSD 13+) or pipe-based notification
@@ -411,27 +412,48 @@ The thread pool backend uses:
 
 #### Descriptor blocking mode
 
-The thread backend may set `O_NONBLOCK` on a pollable descriptor you submit,
-and leaves it set. Do not rely on the blocking mode of a descriptor handed to
-ior, and do not assume a synchronous `read()` or `send()` of your own on that
-descriptor still waits.
+A descriptor comes back from ior in the mode it went in. The thread backend
+never waits in a worker for a pollable descriptor: an op that would block
+parks on the poller instead, which needs a syscall that reports rather than
+waits. It gets one in this order:
 
-This is what lets a worker run an op that has no per-call non-blocking flag
-(`read`/`write` at the current position, and `send` on macOS, whose `sosend()`
-ignores `MSG_DONTWAIT`) without occupying a worker thread until the peer
-catches up. Readiness alone cannot give that guarantee for writes: `poll()`
-promises only `SO_SNDLOWAT` bytes of room, while a blocking write does not
-return until all of `len` is queued, so a write larger than the free space
-would wait however ready the descriptor looked.
+1. A per-call non-blocking form, where the kernel has one: `MSG_DONTWAIT` for
+   `send`/`recv`, and `RWF_NOWAIT` through `preadv2()`/`pwritev2()` for a
+   `read`/`write` at the current position on Linux, which sockets, pipes and
+   eventfds honour. The descriptor is not touched.
+2. Otherwise the descriptor's own mode, taken over for the op: `accept` and
+   `connect` everywhere, `read`/`write` at the current position elsewhere than
+   Linux or on a descriptor the kernel refuses `RWF_NOWAIT` for (a tty), and
+   `send` on macOS, whose `sosend()` ignores `MSG_DONTWAIT`. The first such op
+   on a blocking descriptor looks at its flags and switches it (`fcntl` plus
+   `ioctl`); ops in flight on the same descriptor share that one switch, and
+   the last of them to complete, cancelled or not, restores the mode before
+   its completion is posted. A descriptor you keep non-blocking yourself is
+   never switched or restored.
+3. A regular file needs neither: `RWF_NOWAIT` refusing a buffered write, or
+   reporting uncached data, sends the plain syscall to the worker, where it
+   runs to completion as on io_uring's worker queue.
 
-As on io_uring, a send or write may therefore complete short; callers must
-handle a partial result and submit the remainder. io_uring issues socket ops
-non-blocking in the kernel and needs no descriptor change; IOCP uses
+Taking the mode over is what lets a worker run a write without waiting.
+Readiness alone cannot: `poll()` promises only `SO_SNDLOWAT` bytes of room,
+while a blocking write does not return until all of `len` is queued, so a
+write larger than the free space would wait however ready the descriptor
+looked. As on io_uring, a send or write may therefore complete short; callers
+must handle a partial result and submit the remainder. io_uring issues socket
+ops non-blocking in the kernel and needs no descriptor change; IOCP uses
 overlapped I/O and needs none either.
+
+Two things stay with the caller. While an op of the second kind is in flight,
+a synchronous `read()` or `send()` of your own on that descriptor sees
+non-blocking mode, as does any other process sharing the open file
+description. And the switch is tracked by descriptor number, so close a
+descriptor only once its ops have completed (cancel them first): a number
+reused meanwhile would be restored in its place, and two numbers for one
+open file description (`dup()`) are two switches, restored independently.
 
 If your descriptors are non-blocking already - as they are when you pre-poll
 them yourself - pass `IOR_SETUP_FD_NONBLOCK` at setup and the backend skips
-the ioctl entirely:
+the look, the switch and the restore entirely:
 
 ```c
 ior_params params = { .flags = IOR_SETUP_FD_NONBLOCK };
