@@ -397,7 +397,10 @@ void ior_queue_exit(ior_ctx *ctx);
  * ior_sqe_set_data()/ior_sqe_set_flags(), then publish it with ior_submit().
  *
  * @param ctx  I/O context.
- * @return A pointer to an SQE, or NULL if the submission queue is full.
+ * @return A pointer to an SQE, or NULL if the queue is full: the submission
+ *         queue, or on the thread backend the completion queue, which keeps
+ *         a slot for every submitted operation until its completion has been
+ *         reaped (ior_cqe_seen(), ior_cq_advance()). Reap, then retry.
  */
 ior_sqe *ior_get_sqe(ior_ctx *ctx);
 
@@ -835,9 +838,9 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
  * completes at once with its mask as the last completion.
  *
  * The operation may also end on its own, with a positive res and no
- * IOR_CQE_F_MORE, when a completion cannot be posted: io_uring does so when
- * the completion queue is full, the IOCP backend when its operation pool is
- * exhausted. Re-arm by submitting a new poll.
+ * IOR_CQE_F_MORE, when a completion cannot be posted: io_uring and the
+ * thread backend do so when the completion queue is full, the IOCP backend
+ * when its operation pool is exhausted. Re-arm by submitting a new poll.
  *
  * io_uring uses IORING_POLL_ADD_MULTI. The thread backend watches the
  * descriptor edge-triggered on its poller (EPOLLET on epoll, EV_CLEAR on

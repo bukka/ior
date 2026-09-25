@@ -37,6 +37,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, ior_work *w, ior_cqe *cqe, ior_work_token *token);
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
+static int ior_threads_pool_cq_reserve(ior_threads_pool *pool);
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work);
 static int ior_threads_pool_timer_valid(const ior_work *work);
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
@@ -230,30 +231,33 @@ static void ior_threads_pool_fdmode_release(ior_threads_pool *pool, ior_work *w)
 }
 
 /*
- * Retire one operation: post its completion, record it for drain ordering,
- * return its work item to the pool, and drop the in-flight/outstanding counts
- * so get_sqe and worker provisioning see the freed capacity. The item is
- * marked DONE before the CQE is posted so that a cancel submitted by a
- * consumer who has seen the CQE finds nothing in flight (-ENOENT) rather
- * than a stale state. A descriptor mode the op took over is restored before
- * the CQE too, so the consumer never sees the switch.
+ * Retire one operation: return its work item to the pool and drop the
+ * outstanding count, then post its completion and record it for drain
+ * ordering. The counts go first so that a consumer who has reaped the CQE is
+ * always given an SQE (the CQ slot itself stays promised until the reap, see
+ * cq_pending); the CQE is the caller's copy and nothing after the release
+ * reads the item, which may already be serving a new op. The item is marked
+ * DONE before it is released, so a cancel submitted by a consumer who has
+ * seen the CQE finds nothing in flight (-ENOENT). A descriptor mode the op
+ * took over is restored before the CQE too, so the consumer never sees the
+ * switch.
  */
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe)
 {
+	uint64_t seq = work->seq;
 	atomic_store_explicit(&work->state, IOR_WORK_DONE, memory_order_release);
 
 	if (work->fdmode) {
 		ior_threads_pool_fdmode_release(pool, work);
 	}
-	ior_threads_pool_post_completion(pool, cqe);
-	ior_threads_pool_drain_complete(pool, work->seq);
 
 	pthread_mutex_lock(&pool->work_lock);
 	ior_threads_pool_work_release(pool, work);
 	pthread_mutex_unlock(&pool->work_lock);
-
 	atomic_fetch_sub(&pool->outstanding, 1);
-	atomic_fetch_sub(&pool->num_inflight, 1);
+
+	ior_threads_pool_post_completion(pool, cqe);
+	ior_threads_pool_drain_complete(pool, seq);
 }
 
 static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res)
@@ -302,7 +306,7 @@ static uint64_t ior_threads_pool_cancel_chain(ior_threads_pool *pool, ior_work *
  * worker pool on success or is cancelled on failure. A ready rw op resumes on
  * a worker as a whole (its syscall runs there); a ready poll op completes here.
  */
-static void ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
+static int ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 {
 	ior_threads_pool *pool = owner;
 	ior_work *w = req;
@@ -313,18 +317,25 @@ static void ior_threads_pool_poll_done(void *owner, void *req, int res, int more
 	 * is not claimed back: a cancel racing this is found there and delivers
 	 * the final -ECANCELED after the edge. One that claimed the op already
 	 * (possible only once the poller has unlinked it) gets no edge; its
-	 * cancellation follows.
+	 * cancellation follows. An edge needs a CQ slot of its own; when none
+	 * is free the edge is declined and the poller ends the op with it as
+	 * the last completion, posted in the slot the op holds, as io_uring
+	 * ends a multishot on a full CQ.
 	 */
 	if (more) {
-		if (atomic_load_explicit(&w->state, memory_order_acquire) == IOR_WORK_POLLING) {
-			ior_cqe cqe;
-			memset(&cqe, 0, sizeof(cqe));
-			cqe.threads.user_data = w->sqe.threads.user_data;
-			cqe.threads.res = res;
-			cqe.threads.flags = IOR_CQE_F_MORE;
-			ior_threads_pool_post_completion(pool, &cqe);
+		if (atomic_load_explicit(&w->state, memory_order_acquire) != IOR_WORK_POLLING) {
+			return 0;
 		}
-		return;
+		if (ior_threads_pool_cq_reserve(pool) < 0) {
+			return 1;
+		}
+		ior_cqe cqe;
+		memset(&cqe, 0, sizeof(cqe));
+		cqe.threads.user_data = w->sqe.threads.user_data;
+		cqe.threads.res = res;
+		cqe.threads.flags = IOR_CQE_F_MORE;
+		ior_threads_pool_post_completion(pool, &cqe);
+		return 0;
 	}
 
 	// Claim the op back from the poller. A cancel that raced the poller's
@@ -361,7 +372,7 @@ static void ior_threads_pool_poll_done(void *owner, void *req, int res, int more
 		int ret = ior_threads_pool_dispatch_locked(pool, w);
 		pthread_mutex_unlock(&pool->work_lock);
 		if (ret == 0) {
-			return; // the worker owns w and its whole chain again
+			return 0; // the worker owns w and its whole chain again
 		}
 		res = -ECANCELED;
 	}
@@ -389,6 +400,7 @@ static void ior_threads_pool_poll_done(void *owner, void *req, int res, int more
 	}
 
 	atomic_fetch_add(&pool->tasks_completed, count);
+	return 0;
 }
 
 /* Get or lazily create the shared poller (NULL on allocation failure). */
@@ -449,7 +461,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	pool->work_cap = ctx->cq_ring.size;
 	pool->next_seq = 0;
 	atomic_init(&pool->outstanding, 0);
-	atomic_init(&pool->num_inflight, 0);
+	atomic_init(&pool->cq_pending, 0);
 	pool->drain_upto = 0;
 
 	if (pthread_mutex_init(&pool->work_lock, NULL) != 0) {
@@ -561,7 +573,6 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 	 */
 	uint32_t consumed = atomic_load_explicit(&ctx->sq_ring.consumed, memory_order_relaxed);
 	uint32_t cached = atomic_load_explicit(&ctx->sq_ring.cached_tail, memory_order_acquire);
-	uint32_t n = cached - consumed;
 	const ior_sqe *sqes = (const ior_sqe *) ctx->sq_ring.entries;
 
 	ior_worker_pool_job *first = NULL;
@@ -622,8 +633,6 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		prev = w;
 		prev_link = has_link;
 	}
-
-	atomic_fetch_add(&pool->num_inflight, n);
 
 	pthread_mutex_unlock(&pool->work_lock);
 
@@ -1677,34 +1686,40 @@ static void ior_threads_pool_process_single_sqe(
 	}
 }
 
+/*
+ * Post a completion into the slot promised for it (see cq_pending): the ring
+ * cannot be full, so this never waits on the consumer, which may well be the
+ * thread posting (a cancel completes on the submitting thread).
+ */
 static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe)
 {
 	ior_ctx_threads *ctx = pool->ctx;
 
-	// Try to post CQE to completion ring
 	int ret = ior_threads_ring_post_cqe(&ctx->cq_ring, cqe);
-
-	if (ret == -EOVERFLOW) {
-		IOR_LOG_WARN("cqe overlow");
-		// CQ ring full - exponential backoff
-		int backoff_us = 100;
-		const int max_backoff_us = 10000;
-
-		while (ior_threads_ring_post_cqe(&ctx->cq_ring, cqe) == -EOVERFLOW) {
-			usleep(backoff_us);
-
-			if (backoff_us < max_backoff_us) {
-				backoff_us *= 2;
-			}
-
-			// Signal event to wake consumer
-			ior_threads_event_signal(&ctx->event);
-		}
+	if (ret < 0) {
+		// Cannot happen: every completion has a slot promised before it is posted.
+		IOR_LOG_ERROR("completion lost: %d", ret);
 	}
 
 	IOR_LOG_TRACE("signaling completion");
 	// Signal event to wake waiting thread
 	ior_threads_event_signal(&ctx->event);
+}
+
+/*
+ * Promise a CQ slot for a completion beyond the one each op holds (a
+ * multishot edge). Fails with -EBUSY when every slot is promised already.
+ */
+static int ior_threads_pool_cq_reserve(ior_threads_pool *pool)
+{
+	uint32_t size = pool->ctx->cq_ring.size;
+	uint32_t n = atomic_load_explicit(&pool->cq_pending, memory_order_relaxed);
+	do {
+		if (n >= size) {
+			return -EBUSY;
+		}
+	} while (!atomic_compare_exchange_weak(&pool->cq_pending, &n, n + 1));
+	return 0;
 }
 
 // ===== Timers =====

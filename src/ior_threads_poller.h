@@ -48,8 +48,12 @@ typedef struct ior_threads_poller ior_threads_poller;
  * registered; the request is done with any other call (a multishot one can
  * also end with a positive res, its last readiness, when there are no edges
  * to watch). Must not block for long and must not call back into the poller.
+ *
+ * The return value matters only for an edge: non-zero declines it, which
+ * ends the request. The callback then runs a last time, with that readiness
+ * as the result, or with -ECANCELED if a cancel got in first.
  */
-typedef void (*ior_threads_poller_cb)(void *owner, void *req, int res, int more);
+typedef int (*ior_threads_poller_cb)(void *owner, void *req, int res, int more);
 
 /* Create the poller and start its thread. */
 int ior_threads_poller_create(
