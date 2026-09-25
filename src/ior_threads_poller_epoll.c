@@ -26,6 +26,7 @@ typedef struct ior_poller_req {
 	void *req;
 	int multi; /* persistent: completes at every edge until dropped */
 	int cancelled; /* set by cancel(); completes with -ECANCELED */
+	int ended; /* an edge was declined: retires with res as its last result */
 	int res; /* staged result while the fd bookkeeping completes */
 	int retired; /* staged with its last result: unlinked, freed after the callback */
 	struct ior_poller_req *next; /* incoming queue, then the node's list */
@@ -129,9 +130,13 @@ static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req 
 {
 	while (done) {
 		ior_poller_req *next = done->done_next;
-		poller->cb(poller->owner, done->req, done->res, !done->retired);
+		int declined = poller->cb(poller->owner, done->req, done->res, !done->retired);
 		if (done->retired) {
 			free(done);
+		} else if (declined) {
+			/* Only this thread reads the flag: the next pass retires the
+			 * request, with res still holding the declined readiness. */
+			done->ended = 1;
 		}
 		done = next;
 	}
@@ -247,8 +252,9 @@ static void ior_poller_ingest_incoming(ior_threads_poller *poller, ior_poller_re
 }
 
 /*
- * Unlink every request that cancel() marked, or whose deadline has passed,
- * staging -ECANCELED / -ETIME. Lock held.
+ * Unlink every request that cancel() marked, that declined its last edge, or
+ * whose deadline has passed, staging -ECANCELED / its readiness / -ETIME.
+ * Lock held.
  */
 static void ior_poller_sweep(ior_threads_poller *poller, ior_poller_req **done)
 {
@@ -263,6 +269,10 @@ static void ior_poller_sweep(ior_threads_poller *poller, ior_poller_req **done)
 			if (r->cancelled) {
 				*pp = r->next;
 				ior_poller_stage(done, r, -ECANCELED, 1);
+				changed = 1;
+			} else if (r->ended) {
+				*pp = r->next;
+				ior_poller_stage(done, r, r->res, 1);
 				changed = 1;
 			} else if (r->deadline_ns && r->deadline_ns <= now) {
 				*pp = r->next;

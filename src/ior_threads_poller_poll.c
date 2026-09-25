@@ -24,6 +24,7 @@ typedef struct ior_poller_req {
 	int multi; /* persistent: completes at every readiness until dropped */
 	uint64_t rearm_ns; /* multi: left out of the poll set until then (0 = polled) */
 	int cancelled; /* set by cancel(); completes with -ECANCELED */
+	int ended; /* a readiness was declined: retires with res as its last result */
 	int res; /* staged result on the done list */
 	int retired; /* staged with its last result: unlinked, freed after the callback */
 	struct ior_poller_req *next; /* incoming queue, then the active list */
@@ -106,9 +107,13 @@ static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req 
 {
 	while (done) {
 		ior_poller_req *next = done->done_next;
-		poller->cb(poller->owner, done->req, done->res, !done->retired);
+		int declined = poller->cb(poller->owner, done->req, done->res, !done->retired);
 		if (done->retired) {
 			free(done);
+		} else if (declined) {
+			/* Only this thread reads the flag: the next pass retires the
+			 * request, with res still holding the declined readiness. */
+			done->ended = 1;
 		}
 		done = next;
 	}
@@ -136,6 +141,24 @@ static void ior_poller_ingest_incoming(ior_threads_poller *poller, ior_poller_re
 			poller->active = r;
 		}
 		r = next;
+	}
+}
+
+/*
+ * Unlink every request that declined its last readiness, staging it as the
+ * last result, or -ECANCELED if a cancel got in first. Lock held.
+ */
+static void ior_poller_retire_ended(ior_threads_poller *poller, ior_poller_req **done)
+{
+	ior_poller_req **pp = &poller->active;
+	while (*pp) {
+		ior_poller_req *r = *pp;
+		if (r->ended) {
+			*pp = r->next;
+			ior_poller_stage(done, r, r->cancelled ? -ECANCELED : r->res, 1);
+		} else {
+			pp = &r->next;
+		}
 	}
 }
 
@@ -224,6 +247,7 @@ static void *ior_poller_thread(void *arg)
 
 		pthread_mutex_lock(&poller->lock);
 		ior_poller_ingest_incoming(poller, &done);
+		ior_poller_retire_ended(poller, &done);
 		if (atomic_load_explicit(&poller->shutdown, memory_order_acquire)) {
 			pthread_mutex_unlock(&poller->lock);
 			ior_poller_complete_list(poller, done);

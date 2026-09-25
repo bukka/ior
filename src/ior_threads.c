@@ -138,17 +138,28 @@ static ior_sqe *ior_threads_backend_get_sqe(void *backend_ctx)
 	}
 
 	ior_ctx_threads *ctx = backend_ctx;
+	ior_threads_pool *pool = ctx->pool;
 
-	// Cap in-flight at the work-item pool capacity (the CQ bound) so a submit
-	// always has a work item; the staging ring caps the unsubmitted batch.
-	if (atomic_load(&ctx->pool->outstanding) >= ctx->pool->work_cap) {
+	/*
+	 * Cap the ops in flight at the work-item pool capacity so a submit always
+	 * has a work item, and the completions promised at the CQ size so every
+	 * completion has a slot when it is posted; the staging ring caps the
+	 * unsubmitted batch. The CQ slot is held until the completion is reaped.
+	 * Only this thread adds to outstanding, so a plain check will do; the
+	 * poller thread reserves CQ slots too, so that one is claimed atomically.
+	 */
+	if (atomic_load(&pool->outstanding) >= pool->work_cap) {
+		return NULL;
+	}
+	if (ior_threads_pool_cq_reserve(pool) < 0) {
 		return NULL;
 	}
 	ior_sqe *sqe = ior_threads_ring_get_sqe(&ctx->sq_ring);
 	if (!sqe) {
+		ior_threads_pool_cq_release(pool, 1);
 		return NULL;
 	}
-	atomic_fetch_add(&ctx->pool->outstanding, 1);
+	atomic_fetch_add(&pool->outstanding, 1);
 	return sqe;
 }
 
@@ -330,6 +341,8 @@ static void ior_threads_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 
 	ior_ctx_threads *ctx = backend_ctx;
 	ior_threads_ring_cqe_seen(&ctx->cq_ring);
+	// The slot is free once the ring's head has moved past it.
+	ior_threads_pool_cq_release(ctx->pool, 1);
 }
 
 static unsigned ior_threads_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqes, unsigned max)
@@ -350,6 +363,7 @@ static void ior_threads_backend_cq_advance(void *backend_ctx, unsigned nr)
 
 	ior_ctx_threads *ctx = backend_ctx;
 	ior_threads_ring_advance(&ctx->cq_ring, nr);
+	ior_threads_pool_cq_release(ctx->pool, nr);
 }
 
 /* SQE preparation helpers */

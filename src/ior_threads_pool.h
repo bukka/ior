@@ -165,12 +165,16 @@ struct ior_threads_pool {
 	uint32_t fdmode_mask;
 
 	/*
-	 * outstanding = reserved-but-not-completed (get_sqe backpressure);
-	 * num_inflight = submitted-but-not-completed. Both decrement at completion,
-	 * in any order - no lock-free-pick skew.
+	 * outstanding = SQEs handed out whose op has not finished: get_sqe stops
+	 * at work_cap so a submit always finds a work item. cq_pending = CQ
+	 * slots promised: one per SQE handed out, for its op's last completion,
+	 * plus one per multishot edge posted, each released as the consumer
+	 * reaps it. get_sqe stops at the CQ size and an edge is posted only if
+	 * a slot is free, so posting a completion never finds the CQ full and
+	 * never waits on the consumer.
 	 */
 	_Atomic uint32_t outstanding;
-	_Atomic uint32_t num_inflight;
+	_Atomic uint32_t cq_pending;
 
 	/*
 	 * IO_DRAIN ordering, keyed on submission sequence. A drain op waits until
@@ -214,6 +218,14 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count);
 
 // Shutdown pool and wait for all threads to finish
 void ior_threads_pool_destroy(ior_threads_pool *pool);
+
+/*
+ * Promise a CQ slot (see cq_pending): 0, or -EBUSY when every slot is
+ * promised already. Release returns nr slots once their completions are
+ * reaped; releasing more than are promised is logged and clamped.
+ */
+int ior_threads_pool_cq_reserve(ior_threads_pool *pool);
+void ior_threads_pool_cq_release(ior_threads_pool *pool, uint32_t nr);
 
 // Get number of worker threads
 uint32_t ior_threads_pool_get_num_threads(ior_threads_pool *pool);
