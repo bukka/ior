@@ -1008,7 +1008,7 @@ static int ior_threads_pool_watch_proc(ior_threads_pool *pool, ior_work *w, ior_
 {
 #if defined(IOR_HAVE_KQUEUE)
 	return ior_threads_pool_hand_to_poller(pool, w, lt, (int) pid, IOR_THREADS_POLLER_PROC);
-#elif defined(IOR_HAVE_PIDFD_OPEN) && defined(IOR_HAVE_EPOLL)
+#elif defined(IOR_HAVE_PIDFD_OPEN)
 	int pidfd = (int) syscall(SYS_pidfd_open, pid, 0);
 	if (pidfd < 0) {
 		return -ENOTSUP;
