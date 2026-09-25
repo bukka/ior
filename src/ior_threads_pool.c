@@ -189,7 +189,18 @@ static int ior_threads_pool_fdmode_acquire(ior_threads_pool *pool, ior_work *w)
 	}
 	int on = 1;
 	if (ioctl(fd, FIONBIO, &on) < 0) {
-		return -errno;
+		/*
+		 * XNU sets the file's flag before the driver sees FIONBIO, so a
+		 * refusal (a kqueue, a shm object) can still have switched the
+		 * descriptor; then the switch is ours to undo, and the restoring
+		 * ioctl clears the flag the same way, refused or not.
+		 */
+		int err = errno;
+		fl = fcntl(fd, F_GETFL, 0);
+		if (fl >= 0 && (fl & O_NONBLOCK)) {
+			atomic_store_explicit(&m->owned, 1, memory_order_release);
+		}
+		return -err;
 	}
 	atomic_store_explicit(&m->owned, 1, memory_order_release);
 	IOR_LOG_TRACE("fd %d switched to non-blocking", fd);

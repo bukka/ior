@@ -16,6 +16,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <poll.h>
+#ifdef IOR_PLATFORM_MACOS
+#include <sys/event.h>
+#endif
 
 #define TAG_A ((void *) 0x1)
 #define TAG_B ((void *) 0x2)
@@ -456,6 +459,51 @@ static void test_setup_flag(void **state)
 	ior_queue_exit(ctx);
 }
 
+/* XNU sets O_NONBLOCK on the file before the driver sees FIONBIO, so a
+ * descriptor whose driver refuses it (a kqueue) is switched all the same.
+ * The thread backend must treat the refused switch as its own and restore
+ * it. A read on an empty kqueue never becomes ready, so the parked op is
+ * cancelled. */
+static void test_refused_switch_restored(void **state)
+{
+	(void) state;
+#ifdef IOR_PLATFORM_MACOS
+	int kq = kqueue();
+	assert_true(kq >= 0);
+	ior_ctx *ctx = make_ctx(0);
+
+	char buf[16];
+	submit_read(ctx, kq, buf, sizeof(buf), IOR_OFF_NONE, TAG_A);
+	assert_pending(ctx);
+	if (switches_modes(ctx)) {
+		assert_true(is_nonblocking(kq)); // switched despite the refusal
+	}
+
+	ior_sqe *c = ior_get_sqe(ctx);
+	assert_non_null(c);
+	ior_prep_cancel(ctx, c, TAG_A);
+	ior_sqe_set_data(ctx, c, TAG_CANCEL);
+	assert_true(ior_submit(ctx) >= 0);
+
+	int32_t res;
+	for (int i = 0; i < 2; i++) {
+		void *tag = reap_either(ctx, &res);
+		if (tag == TAG_A) {
+			assert_int_equal(res, -ECANCELED);
+		} else {
+			assert_ptr_equal(tag, TAG_CANCEL);
+			assert_int_equal(res, 0);
+		}
+	}
+
+	assert_false(is_nonblocking(kq));
+	ior_queue_exit(ctx);
+	close(kq);
+#else
+	skip();
+#endif
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -469,6 +517,7 @@ int main(void)
 		cmocka_unit_test(test_cancel_restores),
 		cmocka_unit_test(test_caller_nonblocking_kept),
 		cmocka_unit_test(test_setup_flag),
+		cmocka_unit_test(test_refused_switch_restored),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 }
