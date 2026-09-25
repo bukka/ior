@@ -68,17 +68,27 @@ foreach(test ${TESTS})
     endif()
 endforeach()
 
-# Signal delivery (POSIX only: every ior thread must block signals)
+# POSIX only: signal delivery (every ior thread must block signals) and
+# descriptor blocking mode (the checks read O_NONBLOCK)
 if(NOT WIN32)
-    add_executable(test_signals test_signals.c)
-    target_include_directories(test_signals PRIVATE
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_BINARY_DIR}
-    )
-    target_link_libraries(test_signals PRIVATE test_utils ior cmocka::cmocka)
-    apply_sanitizers(test_signals)
-    add_test(NAME test_signals COMMAND test_signals)
-    set_tests_properties(test_signals PROPERTIES TIMEOUT 30)
+    foreach(test test_signals test_fd_mode)
+        add_executable(${test} ${test}.c)
+        target_include_directories(${test} PRIVATE
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_BINARY_DIR}
+        )
+        target_link_libraries(${test} PRIVATE test_utils ior cmocka::cmocka)
+        apply_sanitizers(${test})
+        add_test(NAME ${test} COMMAND ${test})
+        set_tests_properties(${test} PROPERTIES TIMEOUT 30)
+        if(IOR_HAVE_URING AND IOR_HAVE_THREADS)
+            add_test(NAME ${test}_threads COMMAND ${test})
+            set_tests_properties(${test}_threads PROPERTIES
+                TIMEOUT 30
+                ENVIRONMENT "IOR_BACKEND=threads"
+            )
+        endif()
+    endforeach()
 endif()
 
 # Thread backend tests (only if thread backend is compiled)

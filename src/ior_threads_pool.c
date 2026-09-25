@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "config.h"
-#if defined(IOR_HAVE_SPLICE) || defined(IOR_HAVE_ACCEPT4)
+#if defined(IOR_HAVE_SPLICE) || defined(IOR_HAVE_ACCEPT4) || defined(IOR_HAVE_PREADV2)
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <unistd.h>
@@ -15,6 +15,8 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <time.h>
@@ -127,18 +129,122 @@ static int ior_threads_pool_drain_wait(ior_threads_pool *pool, ior_work *w)
 																					   : 0;
 }
 
+// ===== Descriptor mode ownership =====
+
+static ior_threads_pool_fdmode **ior_threads_pool_fdmode_slot(ior_threads_pool *pool, int fd)
+{
+	ior_threads_pool_fdmode **slot = &pool->fdmode_buckets[(uint32_t) fd & pool->fdmode_mask];
+	while (*slot && (*slot)->fd != fd) {
+		slot = &(*slot)->next;
+	}
+	return slot;
+}
+
+/*
+ * Take over the blocking mode of w's descriptor for the op's lifetime, so its
+ * syscall reports -EAGAIN instead of waiting. Ops on one descriptor share an
+ * entry: the first looks at the mode (fcntl) and switches it if it was
+ * blocking (ioctl), later ones find the switch made and pay nothing, and the
+ * last to complete restores it through ior_threads_pool_fdmode_release. The
+ * look and the switch run outside the lock; an op that joins before they are
+ * done repeats them, harmlessly, rather than running on a descriptor that is
+ * still blocking. A descriptor the caller keeps non-blocking itself is left
+ * alone, as is every descriptor under IOR_SETUP_FD_NONBLOCK. Returns 0 if the
+ * descriptor is non-blocking now, a negative errno if its mode could not be
+ * looked at or switched (the caller then falls back to a readiness probe).
+ */
+static int ior_threads_pool_fdmode_acquire(ior_threads_pool *pool, ior_work *w)
+{
+	if (w->fdmode || (pool->ctx->flags & IOR_SETUP_FD_NONBLOCK)) {
+		return 0;
+	}
+	int fd = w->sqe.threads.fd;
+
+	pthread_mutex_lock(&pool->fdmode_lock);
+	ior_threads_pool_fdmode **slot = ior_threads_pool_fdmode_slot(pool, fd);
+	ior_threads_pool_fdmode *m = *slot;
+	if (m) {
+		m->refs++;
+	} else {
+		m = pool->fdmode_free;
+		pool->fdmode_free = m->next;
+		m->fd = fd;
+		m->refs = 1;
+		atomic_store_explicit(&m->owned, 0, memory_order_relaxed);
+		m->next = NULL;
+		*slot = m;
+	}
+	pthread_mutex_unlock(&pool->fdmode_lock);
+	w->fdmode = 1;
+
+	if (atomic_load_explicit(&m->owned, memory_order_acquire)) {
+		return 0;
+	}
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl < 0) {
+		return -errno;
+	}
+	if (fl & O_NONBLOCK) {
+		return 0; // the caller's own, or a switch made meanwhile and owned
+	}
+	int on = 1;
+	if (ioctl(fd, FIONBIO, &on) < 0) {
+		/*
+		 * XNU sets the file's flag before the driver sees FIONBIO, so a
+		 * refusal (a kqueue, a shm object) can still have switched the
+		 * descriptor; then the switch is ours to undo, and the restoring
+		 * ioctl clears the flag the same way, refused or not.
+		 */
+		int err = errno;
+		fl = fcntl(fd, F_GETFL, 0);
+		if (fl >= 0 && (fl & O_NONBLOCK)) {
+			atomic_store_explicit(&m->owned, 1, memory_order_release);
+		}
+		return -err;
+	}
+	atomic_store_explicit(&m->owned, 1, memory_order_release);
+	IOR_LOG_TRACE("fd %d switched to non-blocking", fd);
+	return 0;
+}
+
+// Drop w's reference on its descriptor's mode entry; the last one restores.
+static void ior_threads_pool_fdmode_release(ior_threads_pool *pool, ior_work *w)
+{
+	int fd = w->sqe.threads.fd;
+
+	pthread_mutex_lock(&pool->fdmode_lock);
+	ior_threads_pool_fdmode **slot = ior_threads_pool_fdmode_slot(pool, fd);
+	ior_threads_pool_fdmode *m = *slot;
+	if (--m->refs == 0) {
+		if (atomic_load_explicit(&m->owned, memory_order_acquire)) {
+			int off = 0;
+			(void) ioctl(fd, FIONBIO, &off);
+			IOR_LOG_TRACE("fd %d restored to blocking", fd);
+		}
+		*slot = m->next;
+		m->next = pool->fdmode_free;
+		pool->fdmode_free = m;
+	}
+	pthread_mutex_unlock(&pool->fdmode_lock);
+	w->fdmode = 0;
+}
+
 /*
  * Retire one operation: post its completion, record it for drain ordering,
  * return its work item to the pool, and drop the in-flight/outstanding counts
  * so get_sqe and worker provisioning see the freed capacity. The item is
  * marked DONE before the CQE is posted so that a cancel submitted by a
  * consumer who has seen the CQE finds nothing in flight (-ENOENT) rather
- * than a stale state.
+ * than a stale state. A descriptor mode the op took over is restored before
+ * the CQE too, so the consumer never sees the switch.
  */
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe)
 {
 	atomic_store_explicit(&work->state, IOR_WORK_DONE, memory_order_release);
 
+	if (work->fdmode) {
+		ior_threads_pool_fdmode_release(pool, work);
+	}
 	ior_threads_pool_post_completion(pool, cqe);
 	ior_threads_pool_drain_complete(pool, work->seq);
 
@@ -384,6 +490,29 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pool->work_free = &pool->work_items[i];
 	}
 
+	// Switched-descriptor table: at most one entry per in-flight op.
+	uint32_t fdmode_cap = ior_threads_pool_round_up_pow2(pool->work_cap);
+	pool->fdmode_mask = fdmode_cap - 1;
+	pool->fdmode_buckets = calloc(fdmode_cap, sizeof(*pool->fdmode_buckets));
+	pool->fdmode_nodes = calloc(pool->work_cap, sizeof(*pool->fdmode_nodes));
+	if (!pool->fdmode_buckets || !pool->fdmode_nodes
+			|| pthread_mutex_init(&pool->fdmode_lock, NULL) != 0) {
+		free(pool->fdmode_nodes);
+		free(pool->fdmode_buckets);
+		pthread_cond_destroy(&pool->drain_cond);
+		pthread_mutex_destroy(&pool->drain_lock);
+		free(pool->drain_done);
+		free(pool->work_items);
+		pthread_mutex_destroy(&pool->arm_lock);
+		pthread_mutex_destroy(&pool->work_lock);
+		free(pool);
+		return NULL;
+	}
+	for (uint32_t i = 0; i < pool->work_cap; i++) {
+		pool->fdmode_nodes[i].next = pool->fdmode_free;
+		pool->fdmode_free = &pool->fdmode_nodes[i];
+	}
+
 	// Worker lifecycle, dispatch FIFO and timers live in the shared pool.
 	ior_worker_pool_config wp_config = {
 		.min_threads = config->min_threads,
@@ -392,6 +521,9 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	};
 	pool->wp = ior_worker_pool_create(&wp_config, ior_threads_pool_run_job, pool);
 	if (!pool->wp) {
+		pthread_mutex_destroy(&pool->fdmode_lock);
+		free(pool->fdmode_nodes);
+		free(pool->fdmode_buckets);
 		pthread_cond_destroy(&pool->drain_cond);
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
@@ -453,6 +585,8 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		w->cur_token = NULL;
 		w->deadline_ns = 0;
 		w->ready = 0;
+		w->fdmode = 0;
+		w->rw_plain = IOR_RW_NOWAIT;
 		w->connecting = 0;
 		w->pidfd = -1;
 		if (w->sqe.threads.opcode == IOR_OP_WORK || w->sqe.threads.opcode == IOR_OP_SIGWAIT) {
@@ -532,7 +666,10 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	// polls complete with -ECANCELED before the poller thread exits.
 	ior_threads_poller_destroy(atomic_load(&pool->poller));
 
-	// Cleanup
+	// Cleanup. Every op has completed by now, so the mode table is empty.
+	pthread_mutex_destroy(&pool->fdmode_lock);
+	free(pool->fdmode_nodes);
+	free(pool->fdmode_buckets);
 	pthread_cond_destroy(&pool->drain_cond);
 	pthread_mutex_destroy(&pool->drain_lock);
 	free(pool->drain_done);
@@ -612,43 +749,96 @@ static int ior_threads_pool_rw_nowait(const ior_sqe *sqe)
 #define IOR_SEND_HONOURS_DONTWAIT 1
 #endif
 
-/*
- * Does the op need the descriptor put in non-blocking mode before its syscall?
- * Only one that cannot ask the kernel for a non-blocking attempt of its own: a
- * read or write at the current position (read(2) has no per-call non-blocking
- * flag and the descriptor may be a blocking socket or pipe), and send where
- * MSG_DONTWAIT is ignored. Elsewhere send/recv are issued with that flag
- * instead (one syscall, no descriptor state), and positioned I/O is
- * regular-file semantics that runs to completion, as on io_uring's worker
- * queue.
- */
-static int ior_threads_pool_rw_needs_nonblock(const ior_sqe *sqe)
+static int ior_threads_pool_rw_positionless(const ior_sqe *sqe)
 {
-	if (!IOR_SEND_HONOURS_DONTWAIT && sqe->threads.opcode == IOR_OP_SEND) {
-		return 1;
-	}
-	// accept(2) and connect(2) have no per-call non-blocking flag either.
-	if (sqe->threads.opcode == IOR_OP_ACCEPT || sqe->threads.opcode == IOR_OP_CONNECT) {
-		return 1;
-	}
 	return (sqe->threads.opcode == IOR_OP_READ || sqe->threads.opcode == IOR_OP_WRITE)
 			&& sqe->threads.off == IOR_OFF_NONE;
 }
 
 /*
- * Take ownership of a descriptor's blocking mode, so its syscall reports
- * -EAGAIN instead of waiting. One ioctl, where the alternative costs a poll().
- * A probe cannot replace this for writes: poll() promises only SO_SNDLOWAT
- * bytes of room, while a blocking write does not return until all of len is
- * queued, so a write larger than the free space parks the worker however
- * ready the descriptor looked. Skipped entirely when the caller has declared
- * its descriptors non-blocking with IOR_SETUP_FD_NONBLOCK. Returns 0 if the
- * descriptor is non-blocking.
+ * Does the op need the descriptor's own mode taken over before its syscall?
+ * Only one that cannot ask the kernel for a non-blocking attempt per call:
+ * accept(2) and connect(2), send where MSG_DONTWAIT is ignored, and a read or
+ * write at the current position where preadv2(2) is missing or refused
+ * RWF_NOWAIT for this descriptor (IOR_RW_PLAIN_MODE). Elsewhere the per-call
+ * form is used instead (one syscall, no descriptor state), and positioned I/O
+ * is regular-file semantics that runs to completion, as on io_uring's worker
+ * queue. Taking the mode over is what lets a worker run a write without
+ * waiting: a readiness probe cannot replace it, since poll() promises only
+ * SO_SNDLOWAT bytes of room while a blocking write does not return until all
+ * of len is queued.
  */
-static int ior_threads_pool_set_nonblock(int fd)
+static int ior_threads_pool_rw_needs_mode(const ior_work *w)
 {
-	int on = 1;
-	return ioctl(fd, FIONBIO, &on) < 0 ? -1 : 0;
+	const ior_sqe *sqe = &w->sqe;
+	if (!IOR_SEND_HONOURS_DONTWAIT && sqe->threads.opcode == IOR_OP_SEND) {
+		return 1;
+	}
+	if (sqe->threads.opcode == IOR_OP_ACCEPT || sqe->threads.opcode == IOR_OP_CONNECT) {
+		return 1;
+	}
+	if (!ior_threads_pool_rw_positionless(sqe)) {
+		return 0;
+	}
+#ifdef IOR_HAVE_PREADV2
+	return w->rw_plain == IOR_RW_PLAIN_MODE;
+#else
+	return 1;
+#endif
+}
+
+// Can the op park on the poller after a syscall that would block?
+static int ior_threads_pool_rw_may_park(const ior_sqe *sqe)
+{
+	switch (sqe->threads.opcode) {
+		case IOR_OP_SEND:
+		case IOR_OP_RECV:
+		case IOR_OP_ACCEPT:
+		case IOR_OP_CONNECT:
+			return 1;
+		default:
+			return ior_threads_pool_rw_positionless(sqe);
+	}
+}
+
+/*
+ * Pick the form a positionless read or write takes after an attempt that
+ * did not complete, or 0 to leave the result as it is. A positioned attempt
+ * on an unseekable descriptor (-ESPIPE) becomes positionless, as on io_uring,
+ * where a stream ignores the offset. -EOPNOTSUPP means the kernel refused
+ * RWF_NOWAIT for this descriptor type (a tty, or a buffered write to a
+ * regular file), and -EAGAIN from RWF_NOWAIT on a regular file means the
+ * data is not cached, not that the descriptor is unready: such an op runs
+ * the plain syscall to completion on this worker, as on io_uring's worker
+ * queue, and any other takes the descriptor's mode over first. Returns 1 when
+ * the op is to be attempted again.
+ */
+static int ior_threads_pool_rw_fallback(ior_work *w, int32_t res)
+{
+	uint8_t opcode = w->sqe.threads.opcode;
+	if (opcode != IOR_OP_READ && opcode != IOR_OP_WRITE) {
+		return 0;
+	}
+	if (res == -ESPIPE && w->sqe.threads.off != IOR_OFF_NONE) {
+		w->sqe.threads.off = IOR_OFF_NONE;
+		return 1;
+	}
+#ifdef IOR_HAVE_PREADV2
+	if (w->sqe.threads.off != IOR_OFF_NONE || w->rw_plain != IOR_RW_NOWAIT
+			|| (res != -EOPNOTSUPP && res != -EAGAIN)) {
+		return 0;
+	}
+	struct stat st;
+	if (fstat(w->sqe.threads.fd, &st) == 0 && S_ISREG(st.st_mode)) {
+		w->rw_plain = IOR_RW_PLAIN;
+		return 1;
+	}
+	if (res == -EOPNOTSUPP) {
+		w->rw_plain = IOR_RW_PLAIN_MODE;
+		return 1;
+	}
+#endif
+	return 0;
 }
 
 static int ior_threads_pool_res_would_block(uint8_t opcode, int32_t res)
@@ -1030,17 +1220,19 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 
 		/*
 		 * Readiness gate: poll ops always wait on the poller. An rw op runs
-		 * at once and parks below if it would block, which needs a descriptor
-		 * that reports rather than waits; where the mode cannot be taken over
-		 * a readiness probe stands in, and an unready descriptor is parked
-		 * without attempting the syscall at all.
+		 * at once and parks below if it would block, which needs a syscall
+		 * that reports rather than waits: a per-call non-blocking form where
+		 * there is one, else the descriptor's own mode, taken over for the
+		 * op's lifetime. Where neither is possible a readiness probe stands
+		 * in, and an unready descriptor is parked without attempting the
+		 * syscall at all.
 		 */
+	retry:;
 		short events = ior_threads_pool_rw_events(&w->sqe);
 		int nowait = ior_threads_pool_rw_nowait(&w->sqe);
 		int unready = 0;
-		if (events && !w->ready && ior_threads_pool_rw_needs_nonblock(&w->sqe)
-				&& !(pool->ctx->flags & IOR_SETUP_FD_NONBLOCK)
-				&& ior_threads_pool_set_nonblock(w->sqe.threads.fd) < 0) {
+		if (events && !w->ready && ior_threads_pool_rw_needs_mode(w)
+				&& ior_threads_pool_fdmode_acquire(pool, w) < 0) {
 			unready = !ior_threads_pool_fd_ready(w->sqe.threads.fd, events);
 		}
 		int gate = opcode == IOR_OP_POLL || (unready && !nowait);
@@ -1143,9 +1335,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		 */
 		ior_cqe cqe;
 		w->cur_token = &w->token;
-		int may_park = events && !nowait
-				&& (opcode == IOR_OP_SEND || opcode == IOR_OP_RECV
-						|| ior_threads_pool_rw_needs_nonblock(&w->sqe));
+		int may_park = events && !nowait && ior_threads_pool_rw_may_park(&w->sqe);
 		if (ior_threads_pool_enter(w, may_park ? IOR_WORK_TRYING : IOR_WORK_RUNNING) < 0) {
 			memset(&cqe, 0, sizeof(cqe));
 			cqe.threads.user_data = w->sqe.threads.user_data;
@@ -1153,14 +1343,21 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		} else {
 			ior_threads_pool_process_single_sqe(pool, w, &cqe, &w->token);
 
+			// The attempt settled which form the op takes: go round again,
+			// through the gate, which takes the descriptor's mode over if
+			// that form needs it.
+			if (events && ior_threads_pool_rw_fallback(w, cqe.threads.res)) {
+				goto retry;
+			}
+
 			/*
 			 * The op would block (send/recv are always issued with
-			 * MSG_DONTWAIT; a non-blocking descriptor says so itself): park
-			 * on the poller and retry once it is ready, unless the caller
-			 * asked for MSG_DONTWAIT semantics. A cancel that claimed the op
-			 * meanwhile makes hand_to_poller fail with -ECANCELED, which is
-			 * then the result; a syscall that did complete keeps its real
-			 * result.
+			 * MSG_DONTWAIT; RWF_NOWAIT or a non-blocking descriptor says so
+			 * itself): park on the poller and retry once it is ready, unless
+			 * the caller asked for MSG_DONTWAIT semantics. A cancel that
+			 * claimed the op meanwhile makes hand_to_poller fail with
+			 * -ECANCELED, which is then the result; a syscall that did
+			 * complete keeps its real result.
 			 */
 			if (events && ior_threads_pool_res_would_block(opcode, cqe.threads.res)
 					&& !ior_threads_pool_rw_nowait(&w->sqe)) {
@@ -1192,10 +1389,38 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 }
 
 /*
+ * A read or write at the current position, in the form the op has settled
+ * on (see IOR_RW_*): with RWF_NOWAIT where preadv2(2) exists and has not
+ * refused it for this descriptor, else the plain syscall.
+ */
+static ssize_t ior_threads_pool_rw_read(const ior_work *w, void *buf, size_t len)
+{
+#ifdef IOR_HAVE_PREADV2
+	if (w->rw_plain == IOR_RW_NOWAIT) {
+		struct iovec iov = { .iov_base = buf, .iov_len = len };
+		return preadv2(w->sqe.threads.fd, &iov, 1, -1, RWF_NOWAIT);
+	}
+#endif
+	return read(w->sqe.threads.fd, buf, len);
+}
+
+static ssize_t ior_threads_pool_rw_write(const ior_work *w, const void *buf, size_t len)
+{
+#ifdef IOR_HAVE_PREADV2
+	if (w->rw_plain == IOR_RW_NOWAIT) {
+		struct iovec iov = { .iov_base = (void *) buf, .iov_len = len };
+		return pwritev2(w->sqe.threads.fd, &iov, 1, -1, RWF_NOWAIT);
+	}
+#endif
+	return write(w->sqe.threads.fd, buf, len);
+}
+
+/*
  * Accept with accept4 semantics for the flags. Where accept4 is missing, or
  * where the accepted socket inherits the listener's mode (BSD), set exactly
- * the state the caller asked for: the listener is non-blocking because ior
- * made it so, which must not leak into the accepted socket.
+ * the state the caller asked for: the listener may be non-blocking only
+ * because ior took its mode over, which must not leak into the accepted
+ * socket.
  */
 static int ior_threads_pool_accept(
 		int fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags)
@@ -1309,19 +1534,16 @@ static void ior_threads_pool_process_single_sqe(
 			void *buf = (void *) (uintptr_t) sqe->threads.addr;
 			ssize_t ret;
 			/*
-			 * Use pread() for seekable fds (regular files). For non-seekable
-			 * fds (sockets, pipes, FIFOs) pread() fails with ESPIPE, so fall
-			 * back to read(), which uses the fd's own position. The explicit
-			 * IOR_OFF_NONE sentinel also selects read() directly. This matches
+			 * pread() for seekable fds (regular files). For non-seekable fds
+			 * (sockets, pipes, FIFOs) pread() fails with ESPIPE, on which
+			 * ior_threads_pool_rw_fallback makes the op positionless and it
+			 * comes back here for the current-position form, matching
 			 * io_uring, whose read op works uniformly on files and sockets.
 			 */
 			if (sqe->threads.off == IOR_OFF_NONE) {
-				ret = read(sqe->threads.fd, buf, sqe->threads.len);
+				ret = ior_threads_pool_rw_read(w, buf, sqe->threads.len);
 			} else {
 				ret = pread(sqe->threads.fd, buf, sqe->threads.len, sqe->threads.off);
-				if (ret < 0 && errno == ESPIPE) {
-					ret = read(sqe->threads.fd, buf, sqe->threads.len);
-				}
 			}
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("read end: res=%d", cqe->threads.res);
@@ -1333,15 +1555,12 @@ static void ior_threads_pool_process_single_sqe(
 					(void *) (uintptr_t) sqe->threads.addr, sqe->threads.len, sqe->threads.off);
 			const void *buf = (const void *) (uintptr_t) sqe->threads.addr;
 			ssize_t ret;
-			/* See IOR_OP_READ above: pwrite() for seekable fds, write() for
-			 * non-seekable ones (sockets/pipes) or the IOR_OFF_NONE sentinel. */
+			// See IOR_OP_READ above: pwrite() for seekable fds, the
+			// current-position form otherwise.
 			if (sqe->threads.off == IOR_OFF_NONE) {
-				ret = write(sqe->threads.fd, buf, sqe->threads.len);
+				ret = ior_threads_pool_rw_write(w, buf, sqe->threads.len);
 			} else {
 				ret = pwrite(sqe->threads.fd, buf, sqe->threads.len, sqe->threads.off);
-				if (ret < 0 && errno == ESPIPE) {
-					ret = write(sqe->threads.fd, buf, sqe->threads.len);
-				}
 			}
 			cqe->threads.res = (ret < 0) ? -errno : ret;
 			IOR_LOG_TRACE("write end: res=%d", cqe->threads.res);

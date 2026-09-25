@@ -230,6 +230,26 @@ if(NOT IOR_PLATFORM_WINDOWS)
     endif()
 endif()
 
+# Check for preadv2/pwritev2 with RWF_NOWAIT (Linux 4.14+, glibc 2.26+): a
+# read or write at the current position on a socket or pipe then reports
+# -EAGAIN per call, and the thread backend need not touch the descriptor's
+# blocking mode for it
+set(IOR_HAVE_PREADV2 FALSE)
+if(IOR_PLATFORM_LINUX)
+    check_c_source_compiles("
+        #define _GNU_SOURCE
+        #include <sys/uio.h>
+        int main(void) {
+            struct iovec iov = { 0, 0 };
+            return preadv2(0, &iov, 1, -1, RWF_NOWAIT) < 0 && pwritev2(1, &iov, 1, -1, RWF_NOWAIT) < 0;
+        }
+    " HAVE_PREADV2)
+    if(HAVE_PREADV2)
+        set(IOR_HAVE_PREADV2 TRUE)
+        message(STATUS "preadv2()/pwritev2() with RWF_NOWAIT available")
+    endif()
+endif()
+
 # Check for pidfd_open (Linux 5.3+): lets a wait for one child park on the
 # poller instead of a worker; without it (or on an older kernel) the worker
 # blocks in waitpid()
