@@ -1,4 +1,4 @@
-#IOR - I / O Ring Library
+# IOR - I / O Ring Library
 
 A cross-platform library providing an io_uring-like API for asynchronous I/O operations.
 
@@ -205,8 +205,12 @@ void ior_queue_exit(ior_ctx *ctx);
 
 ### Submission
 ```c
-// Get a submission queue entry
+// Get a submission queue entry (NULL if none is available)
 ior_sqe *ior_get_sqe(ior_ctx *ctx);
+
+// The same, telling a full submission queue (-ENOSPC: submit) from a full
+// completion queue (-EBUSY: reap)
+int ior_get_sqe_ex(ior_ctx *ctx, ior_sqe **sqe_out);
 
 // Submit all pending operations
 int ior_submit(ior_ctx *ctx);
@@ -371,6 +375,36 @@ With `IOR_BACKEND_AUTO` the best backend built in is used, unless the
 a name that is unknown or not built in fails init with `-ENOSYS`. See
 [BUILD.md](BUILD.md) for building both Linux backends into one library.
 
+### Queue Capacity
+```c
+// Sizes the backend settled on (also written back to ior_params by init)
+unsigned ior_sq_entries(ior_ctx *ctx);
+unsigned ior_cq_entries(ior_ctx *ctx);
+
+// Entries free right now
+unsigned ior_sq_space_left(ior_ctx *ctx);
+unsigned ior_cq_space_left(ior_ctx *ctx);
+```
+
+Every backend rounds the requested sizes up to a power of two (the thread
+and IOCP backends raise the submission queue to at least 32, the thread
+backend the completion queue too) and defaults the completion queue to twice
+the submission queue. Init writes the sizes used back to `ior_params`, so
+reset `sq_entries` and `cq_entries` before reusing the same `ior_params` for
+another context, or the first one's sizes carry over. `ior_get_sqe()` refuses an entry for one of two reasons,
+which `ior_get_sqe_ex()` tells apart: the submission queue holds
+`ior_sq_entries()` entries not yet submitted (`-ENOSPC`, so submit), or no
+completion queue slot is free for the operation's completion (`-EBUSY`, so
+reap). When a slot counts as taken differs per backend: on io_uring only a
+completion posted and not yet reaped takes one, the kernel buffering any
+overflow; the thread and IOCP backends never post into a full queue, so a
+slot is taken by `ior_get_sqe()` itself and held until the completion is
+reaped, plus one per multishot poll edge, which makes `ior_cq_entries()` the
+bound on operations in flight there (a completion queue set smaller than the
+submission queue limits even a single batch). A caller that counts operations in
+flight plus completions unreaped against `ior_cq_entries()` has the same
+bound on every backend.
+
 ## API Design
 
 ### Opaque Types
@@ -477,7 +511,9 @@ Completion Port:
 - A dedicated timer thread backed by a min-heap services timeout operations
 - `IOR_SQE_IO_LINK` and `IOR_SQE_IO_DRAIN` are implemented in software on top
   of the port, matching io_uring ordering semantics
-- Operations are drawn from a pre-allocated pool to avoid per-op allocation
+- Operations are drawn from a pre-allocated pool the size of the completion
+  queue, held from `ior_get_sqe()` until the completion is reaped, so the
+  completion queue also bounds the operations in flight
 
 > **Note:** On the IOCP backend, file I/O uses `ReadFile`/`WriteFile` and socket
 > send/receive use `WSASend`/`WSARecv`. For sockets on Windows, prefer

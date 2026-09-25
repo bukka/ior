@@ -133,8 +133,9 @@ typedef struct ior_backend_ops {
 	int (*init)(void **backend_ctx, ior_params *params);
 	void (*destroy)(void *backend_ctx);
 
-	/* Submission queue operations */
-	ior_sqe *(*get_sqe)(void *backend_ctx);
+	/* Submission queue operations. get_sqe: 0, -ENOSPC (submission queue
+	 * full), -EBUSY (no completion slot free). */
+	int (*get_sqe)(void *backend_ctx, ior_sqe **sqe_out);
 	int (*submit)(void *backend_ctx);
 	int (*submit_and_wait)(void *backend_ctx, unsigned wait_nr);
 
@@ -188,6 +189,12 @@ typedef struct ior_backend_ops {
 	/* Backend info */
 	const char *(*backend_name)(void);
 	uint32_t (*get_features)(void *backend_ctx);
+
+	/* Queue capacity (see the public accessors of the same names) */
+	unsigned (*sq_entries)(void *backend_ctx);
+	unsigned (*cq_entries)(void *backend_ctx);
+	unsigned (*sq_space_left)(void *backend_ctx);
+	unsigned (*cq_space_left)(void *backend_ctx);
 } ior_backend_ops;
 
 /* Main context structure */

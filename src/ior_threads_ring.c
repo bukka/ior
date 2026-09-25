@@ -123,6 +123,17 @@ ior_sqe *ior_threads_ring_get_sqe(ior_threads_ring *ring)
 	return &((ior_sqe *) ring->entries)[index];
 }
 
+uint32_t ior_threads_ring_sq_space_left(ior_threads_ring *ring)
+{
+	if (!ring || !ring->is_sq) {
+		return 0;
+	}
+	uint32_t consumed = atomic_load_explicit(&ring->consumed, memory_order_acquire);
+	uint32_t cached = atomic_load_explicit(&ring->cached_tail, memory_order_relaxed);
+	uint32_t staged = cached - consumed;
+	return staged < ring->size ? ring->size - staged : 0;
+}
+
 void ior_threads_ring_consume(ior_threads_ring *ring)
 {
 	if (!ring || !ring->is_sq) {

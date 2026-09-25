@@ -60,6 +60,9 @@ int ior_threads_ring_full(ior_threads_ring *ring);
 // full of not-yet-submitted entries.
 ior_sqe *ior_threads_ring_get_sqe(ior_threads_ring *ring);
 
+// Staging slots free for get_sqe until the next submit.
+uint32_t ior_threads_ring_sq_space_left(ior_threads_ring *ring);
+
 // Free all reserved staging slots up to cached_tail (advance consumed). Called
 // once submit has copied the staged SQEs out of the ring.
 void ior_threads_ring_consume(ior_threads_ring *ring);
