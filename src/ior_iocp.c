@@ -854,9 +854,25 @@ static bool drain_satisfied(ior_ctx_iocp *ctx, const ior_iocp_op *op)
 /* ================= IO issue / completion plumbing ================= */
 
 /*
+ * Make the notify descriptor readable unless a byte is already outstanding
+ * (see iocp_pump_thread_main). pump.lock must be held.
+ */
+static void iocp_pump_signal_locked(iocp_pump *p)
+{
+	if (!p->signalled) {
+		char b = 0;
+		if (send(p->wake_tx, &b, 1, 0) == 1) {
+			p->signalled = true;
+		}
+	}
+}
+
+/*
  * Keep a completion the port refused (see backlog_head) and wake a consumer
  * that may be blocked: the pump's condition variable and wake byte, or a
  * stray NULL packet, which a direct dequeue takes as a spurious wakeup.
+ * Whether the pump runs is decided under its lock, which iocp_pump_ensure
+ * takes to publish the thread, so a pump started meanwhile signals for it.
  */
 static void iocp_backlog_push(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
@@ -873,17 +889,14 @@ static void iocp_backlog_push(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	ReleaseSRWLockExclusive(&ctx->backlog_lock);
 
 	iocp_pump *p = &ctx->pump;
-	if (p->thread) {
-		EnterCriticalSection(&p->lock);
-		if (!p->signalled) {
-			char b = 0;
-			if (send(p->wake_tx, &b, 1, 0) == 1) {
-				p->signalled = true;
-			}
-		}
+	EnterCriticalSection(&p->lock);
+	bool pumped = p->thread != NULL;
+	if (pumped) {
+		iocp_pump_signal_locked(p);
 		WakeConditionVariable(&p->cv);
-		LeaveCriticalSection(&p->lock);
-	} else {
+	}
+	LeaveCriticalSection(&p->lock);
+	if (!pumped) {
 		(void) PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, NULL);
 	}
 }
@@ -1815,14 +1828,7 @@ static void iocp_poller_fire(ior_ctx_iocp *ctx, iocp_poller *p, uint32_t i, SHOR
 	more->cqe_more = true;
 	more->poll_parent = op;
 	more->poll_parent_gen = op->gen;
-	if (post_synthetic_completion(ctx, more, ERROR_SUCCESS, 0) < 0) {
-		// The port refused the packet (more is freed): end the poll with
-		// this readiness rather than lose the edge.
-		iocp_poller_remove(p, i);
-		op->work_res = mask;
-		post_armed_op(ctx, op, ERROR_SUCCESS);
-		return;
-	}
+	(void) post_synthetic_completion(ctx, more, ERROR_SUCCESS, 0);
 	op->poll_held = true;
 }
 
@@ -2901,8 +2907,9 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 			case IOR_OP_LINK_TIMEOUT:
 				// A paired link timeout is armed via its guarded op, never issued
-				// directly. Reaching here means it was unpaired - treat as a plain
-				// timeout so it still completes with -ETIME.
+				// directly, and submit fails one with nothing to guard
+				// (iocp_scan_staged), so this is not reached; were it, it would
+				// still complete, as a plain timeout.
 				ret = arm_timer(ctx, op);
 				break;
 
@@ -3566,12 +3573,7 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 		 * followed by a late byte. Coalescing to one byte per wake cycle is
 		 * what keeps the pump off the send() syscall under load.
 		 */
-		if (!p->signalled) {
-			char b = 0;
-			if (send(p->wake_tx, &b, 1, 0) == 1) {
-				p->signalled = true;
-			}
-		}
+		iocp_pump_signal_locked(p);
 		WakeConditionVariable(&p->cv);
 		LeaveCriticalSection(&p->lock);
 	}
@@ -3656,12 +3658,21 @@ static int iocp_pump_ensure(ior_ctx_iocp *ctx)
 	p->signalled = false;
 	p->wake_rx = rx;
 	p->wake_tx = tx;
-	p->thread = CreateThread(NULL, 0, iocp_pump_thread_main, ctx, 0, NULL);
-	if (!p->thread) {
+	HANDLE thread = CreateThread(NULL, 0, iocp_pump_thread_main, ctx, 0, NULL);
+	if (!thread) {
 		p->wake_rx = INVALID_SOCKET;
 		p->wake_tx = INVALID_SOCKET;
 		goto fail;
 	}
+	// Published under the lock iocp_backlog_push decides under: a completion
+	// the port refused before now is in the backlog, not the port, and its
+	// wake packet went to the port, where the pump drops it as stray.
+	EnterCriticalSection(&p->lock);
+	p->thread = thread;
+	if (atomic_load(&ctx->backlog_count)) {
+		iocp_pump_signal_locked(p);
+	}
+	LeaveCriticalSection(&p->lock);
 	return 0;
 
 fail:
