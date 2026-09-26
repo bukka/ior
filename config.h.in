@@ -25,7 +25,6 @@
 
 /* Build options */
 #cmakedefine IOR_FORCE_PIPE
-#cmakedefine IOR_FORCE_THREADS
 
 /* Logging support */
 #cmakedefine IOR_HAVE_LOG

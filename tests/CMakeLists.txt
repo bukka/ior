@@ -138,6 +138,19 @@ if(IOR_HAVE_URING)
     set_tests_properties(test_uring_backend PROPERTIES TIMEOUT 30)
 endif()
 
+# AUTO falling back to the thread backend (both Linux backends built)
+if(IOR_HAVE_URING AND IOR_HAVE_THREADS)
+    add_executable(test_backend_fallback test_backend_fallback.c)
+    target_include_directories(test_backend_fallback PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(test_backend_fallback PRIVATE test_utils ior cmocka::cmocka)
+    apply_sanitizers(test_backend_fallback)
+    add_test(NAME test_backend_fallback COMMAND test_backend_fallback)
+    set_tests_properties(test_backend_fallback PROPERTIES TIMEOUT 30)
+endif()
+
 # IOCP backend tests (only if available, Windows)
 if(IOR_HAVE_IOCP)
     add_executable(test_iocp_backend test_iocp_backend.c)

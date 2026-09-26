@@ -8,7 +8,7 @@ on:
 
 jobs:
   linux-uring:
-    name: Linux io_uring
+    name: Linux io_uring only (IOR_WITH_THREADS=OFF)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -19,7 +19,7 @@ jobs:
           sudo apt-get install -y liburing-dev libcmocka-dev
       
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIOR_WITH_THREADS=OFF
       
       - name: Build
         run: cmake --build build
@@ -44,7 +44,7 @@ jobs:
           sudo apt-get install -y libcmocka-dev
       
       - name: Configure (force threads)
-        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIOR_FORCE_THREADS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIOR_WITH_URING=OFF
 
       - name: Build
         run: cmake --build build
@@ -52,11 +52,11 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  # Both Linux backends in one library: CTest runs every common test on each
-  # (the second time under IOR_BACKEND=threads), then the installed header and
-  # ior.pc are used by a consumer as php-src would.
+  # Default Linux build, both backends in one library: CTest runs every common
+  # test on each (the second time under IOR_BACKEND=threads), then the
+  # installed header and ior.pc are used by a consumer as php-src would.
   linux-both:
-    name: Linux io_uring + threads (IOR_WITH_THREADS)
+    name: Linux io_uring + threads
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -67,7 +67,7 @@ jobs:
           sudo apt-get install -y liburing-dev libcmocka-dev pkg-config
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DIOR_WITH_THREADS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
       - name: Build
         run: cmake --build build
@@ -146,7 +146,7 @@ jobs:
           sudo apt-get install -y libcmocka-dev
       
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_FORCE_THREADS=ON -DIOR_ENABLE_ASAN=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_WITH_URING=OFF -DIOR_ENABLE_ASAN=ON
       
       - name: Build
         run: cmake --build build
@@ -168,7 +168,7 @@ jobs:
           sudo apt-get install -y libcmocka-dev
       
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_FORCE_THREADS=ON -DIOR_ENABLE_TSAN=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DIOR_WITH_URING=OFF -DIOR_ENABLE_TSAN=ON
       
       - name: Build
         run: cmake --build build

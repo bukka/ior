@@ -8,12 +8,13 @@ IOR picks an I/O backend automatically:
 
 | Platform | Backend |
 |----------|---------|
-| Linux    | io_uring if liburing is present, else thread backend |
+| Linux    | io_uring (kernel 5.19+, liburing 2.2+), falling back to the thread backend |
 | macOS / FreeBSD | thread backend |
 | Windows  | IOCP |
 
-On Linux you can force the thread backend (`-DIOR_FORCE_THREADS=ON`). On Windows
-only IOCP is compiled.
+On Linux both backends are built by default; `-DIOR_WITH_URING=OFF` builds only
+the thread backend and `-DIOR_WITH_THREADS=OFF` only io_uring. On Windows only
+IOCP is compiled.
 
 ## Quick start
 
@@ -49,9 +50,8 @@ ctest --preset windows-msvc
 
 ### Linux
 
-Defaults to io_uring when liburing is found, thread backend otherwise. No special
-steps. On kernels older than 5.1 (no io_uring), force the thread backend with
-`-DIOR_FORCE_THREADS=ON`.
+Builds io_uring when liburing 2.2+ is found, plus the thread backend. The
+kernel is checked at run time, so the build host's kernel does not matter.
 
 ### macOS
 
@@ -151,9 +151,8 @@ Set with `-D<OPTION>=<VALUE>`.
 | `CMAKE_BUILD_TYPE` | RelWithDebInfo | Build type (single-config generators) |
 | `CMAKE_INSTALL_PREFIX` | /usr/local | Install directory |
 | `IOR_BUILD_TESTS` | ON | Build the test suite |
-| `IOR_WITH_URING` | ON | Look for liburing (Linux only) |
-| `IOR_FORCE_THREADS` | OFF | Use the thread backend even if io_uring works |
-| `IOR_WITH_THREADS` | OFF | Build the thread backend next to io_uring (Linux); pick one at run time with `IOR_BACKEND` |
+| `IOR_WITH_URING` | ON | Build the io_uring backend if liburing 2.2+ is found (Linux only) |
+| `IOR_WITH_THREADS` | ON | Build the thread backend; on Linux OFF gives an io_uring-only build |
 | `IOR_FORCE_PIPE` | OFF | Force pipe instead of eventfd (testing) |
 | `IOR_FORCE_POLL` | OFF | Force poll() readiness poller instead of epoll/kqueue (testing) |
 | `IOR_ENABLE_LOG` | OFF | Enable the logging system |
@@ -162,14 +161,18 @@ Set with `-D<OPTION>=<VALUE>`.
 | `IOR_ENABLE_UBSAN` | OFF | UndefinedBehaviorSanitizer (GCC/Clang only) |
 | `IOR_ENABLE_TSAN` | OFF | ThreadSanitizer (GCC/Clang only) |
 
-`IOR_WITH_URING=OFF` never looks for liburing; `IOR_FORCE_THREADS=ON` ignores a
-working io_uring. Both yield the thread backend on Linux and have no effect on
-Windows/macOS.
+`IOR_WITH_URING=OFF` never looks for liburing. Both options have no effect on
+Windows (IOCP only) or macOS/BSD (thread backend only); turning both off on
+Linux is a configure error.
 
-A build normally carries one backend. `IOR_WITH_THREADS=ON` builds the thread
-backend alongside io_uring on Linux, so one binary can run either: io_uring is
-the default, and the `IOR_BACKEND` environment variable (`io_uring`, `threads`,
-`iocp`) picks the other for every context created with `IOR_BACKEND_AUTO`. A
+With both Linux backends built, a context created with `IOR_BACKEND_AUTO` uses
+io_uring and falls back to the thread backend when io_uring is unusable: a
+kernel older than 5.19 or without io_uring (`-ENOSYS`), io_uring disabled by
+the `kernel.io_uring_disabled` sysctl or a seccomp profile such as Docker's
+default (`-EPERM`), or the memlock limit (`-ENOMEM`). `ior_get_backend_type()`
+tells which one a context got. The `IOR_BACKEND` environment variable
+(`io_uring`, `threads`, `iocp`) picks a backend for every `IOR_BACKEND_AUTO`
+context instead; like an explicit `ior_params.backend`, it never falls back. A
 name that is unknown or not built in fails `ior_queue_init()` with `-ENOSYS`.
 With both backends built, CTest runs every common test twice, the second time
 under `IOR_BACKEND=threads`.
@@ -192,7 +195,7 @@ generators.
 **Examples:**
 ```bash
 # Debug + TRACE logging + thread backend
-cmake -B build -DIOR_FORCE_THREADS=ON -DCMAKE_BUILD_TYPE=Debug \
+cmake -B build -DIOR_WITH_URING=OFF -DCMAKE_BUILD_TYPE=Debug \
                -DIOR_ENABLE_LOG=ON -DIOR_LOG_LEVEL=0
 cmake --build build
 IOR_LOG_FILE=./debug.log ./build/tests/test_read_write   # or stderr if unset

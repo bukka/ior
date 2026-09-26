@@ -113,9 +113,8 @@ endfunction()
 # Build options
 option(IOR_BUILD_TESTS "Build test programs" ON)
 option(IOR_BUILD_BENCH "Build the ior_bench benchmark tool" ON)
-option(IOR_WITH_URING "Enable io_uring support on Linux (requires liburing)" ON)
-option(IOR_FORCE_THREADS "Force thread backend even if io_uring available (testing)" OFF)
-option(IOR_WITH_THREADS "Build the thread backend alongside io_uring on Linux, selectable at run time with IOR_BACKEND=threads" OFF)
+option(IOR_WITH_URING "Build the io_uring backend on Linux if liburing 2.2+ is found" ON)
+option(IOR_WITH_THREADS "Build the thread backend (on Linux the run-time fallback when io_uring is unusable)" ON)
 option(IOR_FORCE_PIPE "Force pipe for thread event notification (testing)" OFF)
 option(IOR_FORCE_POLL "Force poll() for the readiness poller even if epoll/kqueue is available (testing)" OFF)
 option(IOR_ENABLE_LOG "Enable logging system" OFF)
@@ -173,7 +172,6 @@ endif()
 
 # Verify atomics actually work
 include(CheckCSourceCompiles)
-include(CheckCSourceRuns)
 
 check_c_source_compiles("
     #include <stdatomic.h>
@@ -294,7 +292,7 @@ endif()
 set(IOR_HAVE_URING FALSE)
 set(IOR_URING_VERSION "unknown")
 
-if(IOR_PLATFORM_LINUX AND IOR_WITH_URING AND NOT IOR_FORCE_THREADS)
+if(IOR_PLATFORM_LINUX AND IOR_WITH_URING)
     find_package(PkgConfig)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(LIBURING liburing)
@@ -323,10 +321,9 @@ if(IOR_PLATFORM_LINUX AND IOR_WITH_URING AND NOT IOR_FORCE_THREADS)
                 # Work ops (IOR_OP_WORK) and cancel by descriptor
                 # (ior_prep_cancel_fd) are mandatory API features; on the
                 # io_uring backend they need IORING_OP_MSG_RING and
-                # IORING_ASYNC_CANCEL_FD. That needs liburing 2.2+ (compile
-                # check) and kernel 5.19+ (run check against the build host's
-                # kernel). Without either, the io_uring backend is disabled
-                # entirely and the threads backend is built instead.
+                # IORING_ASYNC_CANCEL_FD, so liburing 2.2+. The kernel (5.19+)
+                # is checked at run time: the backend refuses an older one and
+                # IOR_BACKEND_AUTO falls back to the thread backend.
                 check_c_source_compiles("
                     #include <liburing.h>
                     int main(void) {
@@ -338,55 +335,9 @@ if(IOR_PLATFORM_LINUX AND IOR_WITH_URING AND NOT IOR_FORCE_THREADS)
                 " HAVE_URING_MSG_RING)
 
                 if(HAVE_URING_MSG_RING)
-                    if(CMAKE_CROSSCOMPILING)
-                        # Cannot run a probe; assume the target kernel is 5.19+.
-                        # Build with IOR_FORCE_THREADS=ON to target older kernels.
-                        set(HAVE_URING_MSG_RING_KERNEL TRUE)
-                        message(STATUS "cross-compiling: assuming kernel 5.19+ (msg_ring, cancel_fd)")
-                    else()
-                        check_c_source_runs("
-                            #include <liburing.h>
-                            int main(void) {
-                                struct io_uring ring;
-                                struct io_uring_params p = { 0 };
-                                int ok = 0;
-                                if (io_uring_queue_init_params(4, &ring, &p) < 0)
-                                    return 1;
-                                if (p.features & IORING_FEAT_CQE_SKIP) {
-                                    struct io_uring_probe *pr = io_uring_get_probe_ring(&ring);
-                                    if (pr) {
-                                        ok = io_uring_opcode_supported(pr, IORING_OP_MSG_RING);
-                                        io_uring_free_probe(pr);
-                                    }
-                                }
-                                /* Cancel by fd (5.19+): an older kernel rejects the
-                                 * flag with -EINVAL; a supporting one reports the
-                                 * (absent) match with -ENOENT or the fd with -EBADF. */
-                                if (ok) {
-                                    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-                                    struct io_uring_cqe *cqe;
-                                    ok = 0;
-                                    if (sqe) {
-                                        io_uring_prep_cancel_fd(sqe, 0, 0);
-                                        if (io_uring_submit(&ring) == 1
-                                                && io_uring_wait_cqe(&ring, &cqe) == 0) {
-                                            ok = cqe->res != -EINVAL;
-                                            io_uring_cqe_seen(&ring, cqe);
-                                        }
-                                    }
-                                }
-                                io_uring_queue_exit(&ring);
-                                return ok ? 0 : 1;
-                            }
-                        " HAVE_URING_MSG_RING_KERNEL)
-                    endif()
-                endif()
-
-                if(HAVE_URING_MSG_RING AND HAVE_URING_MSG_RING_KERNEL)
                     set(IOR_HAVE_URING TRUE)
                 else()
-                    message(STATUS "io_uring lacks msg_ring/cancel_fd support (needs liburing 2.2+ "
-                        "and kernel 5.19+) - using threads backend")
+                    message(STATUS "liburing lacks msg_ring/cancel_fd (needs 2.2+) - io_uring disabled")
                 endif()
             else()
                 message(WARNING "liburing found but doesn't compile/link properly - disabling")
@@ -402,10 +353,8 @@ if(IOR_PLATFORM_LINUX AND IOR_WITH_URING AND NOT IOR_FORCE_THREADS)
     endif()
 
     if(NOT IOR_HAVE_URING)
-        message(STATUS "io_uring support disabled - will use thread backend")
+        message(STATUS "io_uring support disabled")
     endif()
-elseif(IOR_FORCE_THREADS)
-    message(STATUS "Forcing thread backend (IOR_FORCE_THREADS=ON)")
 endif()
 
 # Check for eventfd (only if we might need threads)
@@ -480,13 +429,16 @@ endif()
 # Determine if thread backend is needed
 set(IOR_HAVE_THREADS FALSE)
 
+# Built unless disabled; elsewhere than Linux it is the only POSIX backend.
 if(NOT IOR_PLATFORM_WINDOWS)
-    if(NOT IOR_HAVE_URING OR IOR_FORCE_THREADS OR IOR_WITH_THREADS)
+    if(IOR_WITH_THREADS OR NOT IOR_PLATFORM_LINUX)
         set(IOR_HAVE_THREADS TRUE)
+    elseif(NOT IOR_HAVE_URING)
+        message(FATAL_ERROR "IOR_WITH_THREADS=OFF needs the io_uring backend, which is not available")
     endif()
 endif()
 if(IOR_HAVE_URING AND IOR_HAVE_THREADS)
-    message(STATUS "Both backends built; io_uring is the default, IOR_BACKEND=threads selects the other")
+    message(STATUS "Both backends built; io_uring is the default with the thread backend as the fallback")
 endif()
 
 if(IOR_HAVE_THREADS)
@@ -586,7 +538,7 @@ message(STATUS "  splice:      ${IOR_HAVE_SPLICE}")
 message(STATUS "")
 message(STATUS "Build Options:")
 message(STATUS "  Tests:         ${IOR_BUILD_TESTS}")
-message(STATUS "  Force threads: ${IOR_FORCE_THREADS}")
+message(STATUS "  With io_uring: ${IOR_WITH_URING}")
 message(STATUS "  With threads:  ${IOR_WITH_THREADS}")
 message(STATUS "  Force pipe:    ${IOR_FORCE_PIPE}")
 message(STATUS "")

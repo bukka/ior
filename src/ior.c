@@ -9,10 +9,12 @@
  * The backend for IOR_BACKEND_AUTO: the one IOR_BACKEND names in the
  * environment, if set (a name that is unknown or not built in fails init
  * with -ENOSYS rather than being ignored), else the best one built in.
+ * Only the latter may fall back (see ior_queue_init_params).
  */
-static ior_backend_type detect_backend(void)
+static ior_backend_type detect_backend(int *may_fall_back)
 {
 	const char *env = getenv("IOR_BACKEND");
+	*may_fall_back = 0;
 	if (env && *env) {
 		if (strcmp(env, "io_uring") == 0 || strcmp(env, "uring") == 0) {
 			return IOR_BACKEND_IOURING;
@@ -25,6 +27,7 @@ static ior_backend_type detect_backend(void)
 		}
 		return IOR_BACKEND_AUTO;
 	}
+	*may_fall_back = 1;
 #ifdef IOR_HAVE_URING
 	return IOR_BACKEND_IOURING;
 #elif defined(IOR_HAVE_IOCP)
@@ -71,8 +74,9 @@ int ior_queue_init_params(unsigned entries, ior_ctx **ctx_out, ior_params *param
 	}
 
 	ior_backend_type backend = used.backend;
+	int may_fall_back = 0;
 	if (backend == IOR_BACKEND_AUTO) {
-		backend = detect_backend();
+		backend = detect_backend(&may_fall_back);
 	}
 
 	const ior_backend_ops *ops = get_backend_ops(backend);
@@ -89,6 +93,20 @@ int ior_queue_init_params(unsigned entries, ior_ctx **ctx_out, ior_params *param
 	ctx->ops = ops;
 
 	int ret = ops->init(&ctx->backend_ctx, &used);
+#if defined(IOR_HAVE_URING) && defined(IOR_HAVE_THREADS)
+	/*
+	 * io_uring unusable here: kernel too old or without it (-ENOSYS),
+	 * disabled by sysctl or seccomp (-EPERM), or memlock limit (-ENOMEM).
+	 */
+	if (may_fall_back && backend == IOR_BACKEND_IOURING
+			&& (ret == -ENOSYS || ret == -EPERM || ret == -ENOMEM)) {
+		ctx->backend = IOR_BACKEND_THREADS;
+		ctx->ops = &ior_threads_ops;
+		ret = ctx->ops->init(&ctx->backend_ctx, &used);
+	}
+#else
+	(void) may_fall_back;
+#endif
 	if (ret < 0) {
 		free(ctx);
 		return ret;

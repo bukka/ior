@@ -70,7 +70,7 @@
       "binaryDir": "${sourceDir}/build-threads",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "IOR_FORCE_THREADS": "ON",
+        "IOR_WITH_URING": "OFF",
         "IOR_ENABLE_LOG": "ON",
         "IOR_LOG_LEVEL": "0"
       }
