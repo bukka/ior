@@ -120,9 +120,12 @@ static void ior_poller_complete_list(ior_threads_poller *poller, ior_poller_req 
 }
 
 /*
- * Lock held. A multishot request on a regular file ends at once with its
- * mask: the file is always ready and has no edges to wait for (poll() would
- * report it at every call), matching epoll's refusal and io_uring.
+ * Lock held. A request cancelled before it got here completes now: the
+ * wakeup its cancel sent may have been consumed by a pass that resolved only
+ * the active list, and polled it would wait for readiness that may never
+ * come. A multishot request on a regular file ends at once with its mask: the
+ * file is always ready and has no edges to wait for (poll() would report it
+ * at every call), matching epoll's refusal and io_uring.
  */
 static void ior_poller_ingest_incoming(ior_threads_poller *poller, ior_poller_req **done)
 {
@@ -133,7 +136,9 @@ static void ior_poller_ingest_incoming(ior_threads_poller *poller, ior_poller_re
 	while (r) {
 		ior_poller_req *next = r->next;
 		struct stat st;
-		if (r->multi && !r->cancelled && fstat(r->fd, &st) == 0 && S_ISREG(st.st_mode)) {
+		if (r->cancelled) {
+			ior_poller_stage(done, r, -ECANCELED, 1);
+		} else if (r->multi && fstat(r->fd, &st) == 0 && S_ISREG(st.st_mode)) {
 			uint32_t ready = r->mask & (IOR_POLL_IN | IOR_POLL_OUT);
 			ior_poller_stage(done, r, ready ? (int) ready : -EINVAL, 1);
 		} else {
