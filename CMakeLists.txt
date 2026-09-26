@@ -288,6 +288,24 @@ if(NOT IOR_PLATFORM_WINDOWS)
     endif()
 endif()
 
+# Check for sigqueue (POSIX.1b; macOS lacks it): ior_sigrequeue() puts a
+# queued signal back with its value where there is no rt_sigqueueinfo
+set(IOR_HAVE_SIGQUEUE FALSE)
+if(NOT IOR_PLATFORM_WINDOWS)
+    check_c_source_compiles("
+        #include <signal.h>
+        #include <unistd.h>
+        int main(void) {
+            union sigval v;
+            v.sival_int = 0;
+            return sigqueue(getpid(), 0, v) < 0;
+        }
+    " HAVE_SIGQUEUE)
+    if(HAVE_SIGQUEUE)
+        set(IOR_HAVE_SIGQUEUE TRUE)
+    endif()
+endif()
+
 # Check for liburing on Linux
 set(IOR_HAVE_URING FALSE)
 set(IOR_HAVE_URING_WAITID FALSE)

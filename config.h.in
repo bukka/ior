@@ -23,6 +23,7 @@
 #cmakedefine IOR_HAVE_PIDFD_OPEN
 #cmakedefine IOR_HAVE_URING_WAITID
 #cmakedefine IOR_HAVE_SIGTIMEDWAIT
+#cmakedefine IOR_HAVE_SIGQUEUE
 
 /* Build options */
 #cmakedefine IOR_FORCE_PIPE

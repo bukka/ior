@@ -4,6 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+#endif
 
 /*
  * The backend for IOR_BACKEND_AUTO: the one IOR_BACKEND names in the
@@ -372,6 +379,45 @@ int ior_sigismember(const ior_sigset_t *set, int signo)
 	return ret < 0 ? -EINVAL : ret;
 #endif
 }
+
+#ifndef _WIN32
+int ior_sigrequeue(const ior_siginfo_t *info)
+{
+	if (!info || info->si_signo <= 0 || info->si_signo >= NSIG) {
+		return -EINVAL;
+	}
+	pid_t self = getpid();
+#if defined(__linux__) && defined(SYS_rt_sigqueueinfo)
+	siginfo_t copy = *info;
+	if (syscall(SYS_rt_sigqueueinfo, self, copy.si_signo, &copy) == 0) {
+		return 0;
+	}
+	if (errno != EPERM) {
+		return -errno;
+	}
+	/* Only the main thread may queue a kernel's or kill()'s si_code. */
+	copy.si_code = SI_QUEUE;
+	return syscall(SYS_rt_sigqueueinfo, self, copy.si_signo, &copy) == 0 ? 0 : -errno;
+#else
+#ifdef IOR_HAVE_SIGQUEUE
+	if (info->si_code == SI_QUEUE) {
+		return sigqueue(self, info->si_signo, info->si_value) == 0 ? 0 : -errno;
+	}
+#endif
+	return kill(self, info->si_signo) == 0 ? 0 : -errno;
+#endif
+}
+#else
+int ior_sigrequeue(const ior_siginfo_t *info)
+{
+#ifdef IOR_HAVE_IOCP
+	return ior_iocp_sigrequeue(info);
+#else
+	(void) info;
+	return -ENOTSUP;
+#endif
+}
+#endif
 
 /* Does the set name at least one signal? A wait on none would never end. */
 static int ior_sigset_has_any(const ior_sigset_t *set)

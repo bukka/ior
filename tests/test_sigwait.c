@@ -563,6 +563,120 @@ static void test_sigwait_bad_args(void **state)
 	ior_prep_nop(s->ctx, sqe);
 }
 
+/*
+ * A signal an op took and the caller put back is taken by the next wait,
+ * with the same details: the second op is pending when it goes back, which
+ * on Windows is what receives it (with no taker it would be raised).
+ */
+static void test_sigrequeue(void **state)
+{
+	sw_state *s = (sw_state *) *state;
+	int32_t res[MAX_TAG];
+	ior_sigset_t set;
+	ior_siginfo_t info;
+	ior_siginfo_t info2;
+
+	one_signal_set(&set, SIG_A);
+	submit_sigwait(s, &set, &info, TAG_SIG, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	send_signal(SIG_A);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_took(res[(uintptr_t) TAG_SIG], &info, SIG_A);
+
+	submit_sigwait(s, &set, &info2, TAG_SIG2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	sleep_ms(50);
+	assert_return_code(ior_sigrequeue(&info), 0);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_took(res[(uintptr_t) TAG_SIG2], &info2, SIG_A);
+}
+
+#ifdef SIG_RT
+/* A queued signal goes back with its value. */
+static void test_sigrequeue_value(void **state)
+{
+	sw_state *s = (sw_state *) *state;
+	int32_t res[MAX_TAG];
+	ior_sigset_t set;
+	ior_siginfo_t info;
+	ior_siginfo_t info2;
+
+	one_signal_set(&set, SIG_RT);
+	submit_sigwait(s, &set, &info, TAG_SIG, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	union sigval v;
+	v.sival_int = 42;
+	assert_return_code(sigqueue(getpid(), SIG_RT, v), 0);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_SIG], SIG_RT);
+
+	assert_return_code(ior_sigrequeue(&info), 0);
+	submit_sigwait(s, &set, &info2, TAG_SIG2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_SIG2], SIG_RT);
+	assert_int_equal(info2.si_signo, SIG_RT);
+#if SIGWAIT_HAS_INFO
+	assert_int_equal(info2.si_code, SI_QUEUE);
+	assert_int_equal(info2.si_value.sival_int, 42);
+	assert_int_equal(info2.si_pid, getpid());
+#endif
+}
+#endif
+
+#ifdef __linux__
+static void *requeue_thread(void *arg)
+{
+	return (void *) (intptr_t) ior_sigrequeue((const ior_siginfo_t *) arg);
+}
+
+/*
+ * Put back from a thread other than the main one, kill()'s si_code goes back
+ * as SI_QUEUE (the kernel's rule), keeping who sent it.
+ */
+static void test_sigrequeue_other_thread(void **state)
+{
+	sw_state *s = (sw_state *) *state;
+	int32_t res[MAX_TAG];
+	ior_sigset_t set;
+	ior_siginfo_t info;
+	ior_siginfo_t info2;
+
+	one_signal_set(&set, SIG_A);
+	submit_sigwait(s, &set, &info, TAG_SIG, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	send_signal(SIG_A);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_took(res[(uintptr_t) TAG_SIG], &info, SIG_A);
+
+	pthread_t t;
+	void *ret;
+	assert_int_equal(pthread_create(&t, NULL, requeue_thread, &info), 0);
+	assert_int_equal(pthread_join(t, &ret), 0);
+	assert_int_equal((int) (intptr_t) ret, 0);
+
+	submit_sigwait(s, &set, &info2, TAG_SIG2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_SIG2], SIG_A);
+	assert_int_equal(info2.si_code, SI_QUEUE);
+	assert_int_equal(info2.si_pid, getpid());
+}
+#endif
+
+static void test_sigrequeue_bad_args(void **state)
+{
+	(void) state;
+	ior_siginfo_t info;
+	memset(&info, 0, sizeof(info));
+	assert_int_equal(ior_sigrequeue(NULL), -EINVAL);
+	assert_int_equal(ior_sigrequeue(&info), -EINVAL);
+#ifdef _WIN32
+	info.si_signo = SIGTERM;
+	assert_int_equal(ior_sigrequeue(&info), -EINVAL);
+#endif
+}
+
 #ifdef _WIN32
 // Only the console control signals can be waited for.
 static void test_sigwait_unsupported(void **state)
@@ -626,6 +740,14 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_sigwait_link_timeout, setup_sw, teardown_sw),
 		cmocka_unit_test_setup_teardown(test_sigwait_pending_at_exit, setup_sw, teardown_sw),
 		cmocka_unit_test_setup_teardown(test_sigwait_bad_args, setup_sw, teardown_sw),
+		cmocka_unit_test_setup_teardown(test_sigrequeue, setup_sw, teardown_sw),
+#ifdef SIG_RT
+		cmocka_unit_test_setup_teardown(test_sigrequeue_value, setup_sw, teardown_sw),
+#endif
+#ifdef __linux__
+		cmocka_unit_test_setup_teardown(test_sigrequeue_other_thread, setup_sw, teardown_sw),
+#endif
+		cmocka_unit_test_setup_teardown(test_sigrequeue_bad_args, setup_sw, teardown_sw),
 #ifdef _WIN32
 		cmocka_unit_test_setup_teardown(test_sigwait_unsupported, setup_sw, teardown_sw),
 #endif

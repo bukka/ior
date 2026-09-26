@@ -846,6 +846,10 @@ int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int
  *
  * @p set and @p info must stay valid until the completion arrives.
  *
+ * A completion that reports a signal took it: one the caller discards (a
+ * cancel that came too late, a caller gone) should put it back with
+ * ior_sigrequeue(), or the process never sees that signal.
+ *
  * @param ctx   I/O context.
  * @param sqe   Entry from ior_get_sqe().
  * @param set   Signals to wait for; built with ior_sigemptyset() and
@@ -872,6 +876,32 @@ int ior_sigaddset(ior_sigset_t *set, int signo);
  *  invalid signal. */
 int ior_sigismember(const ior_sigset_t *set, int signo);
 /** @} */
+
+/**
+ * Put back a signal an ior_prep_sigwait() op took, as if it had never been
+ * taken: for a completion the caller discards (its op was cancelled too late,
+ * or nobody waits for it any more), so the next wait for the signal still
+ * gets it rather than the process losing it.
+ *
+ * On POSIX the signal is queued to the process again and stays pending while
+ * it is blocked, as a SigWait needs it to be. On Linux @p info goes back as
+ * it is (rt_sigqueueinfo(2)); the kernel accepts a kernel's or kill()'s
+ * si_code only from the main thread, so from any other one it goes back as
+ * SI_QUEUE, keeping si_pid, si_uid and si_value. Elsewhere a queued signal
+ * goes back with its value (sigqueue(3)), and any other with kill(2). A
+ * real-time signal requeued queues behind any of its number that arrived
+ * since; a standard one that is pending again merges with it, as the kernel
+ * merges them.
+ *
+ * On Windows the console control event in si_code is offered to the pending
+ * sigwait ops of every context, as on its arrival; with no taker, raise()
+ * hands the signal to the CRT's signal() handler, or its default action.
+ *
+ * @param info  What the op reported (si_signo and, on Windows, si_code).
+ * @return 0, -EINVAL for a NULL @p info or an invalid signal, or the error of
+ *         queueing it (-EAGAIN when the process has too many pending).
+ */
+int ior_sigrequeue(const ior_siginfo_t *info);
 
 /**
  * Prepare a one-shot wait for fd readiness (like io_uring's POLL_ADD).
