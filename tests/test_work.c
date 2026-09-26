@@ -470,6 +470,69 @@ static void test_work_lt_race(void **state)
 	}
 }
 
+#define TAG_OTHER ((void *) 0x3)
+
+/*
+ * A link timeout reaped at its deadline frees its slot while the callback it
+ * guarded still runs. The op that reuses the slot (here a plain timeout) must
+ * be left alone when the callback returns: it completes at its own deadline.
+ */
+static void test_work_lt_slot_reuse(void **state)
+{
+	work_state *s = (work_state *) *state;
+	if (!work_supported(s->ctx)) {
+		return;
+	}
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	assert_return_code(ior_prep_work(s->ctx, w, work_ignore_token_fn, NULL), 0);
+	ior_sqe_set_data(s->ctx, w, TAG_OP);
+	ior_sqe_set_flags(s->ctx, w, IOR_SQE_IO_LINK);
+
+	ior_sqe *t = ior_get_sqe(s->ctx);
+	assert_non_null(t);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50ms
+	ior_prep_link_timeout(s->ctx, t, &ts, 0);
+	ior_sqe_set_data(s->ctx, t, TAG_TMO);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	ior_cqe *cqe = NULL;
+	int ret;
+	do {
+		ret = ior_wait_cqe(s->ctx, &cqe);
+	} while (ret == -EAGAIN || ret == -EINTR);
+	assert_return_code(ret, 0);
+	assert_ptr_equal(ior_cqe_get_data(s->ctx, cqe), TAG_TMO);
+	assert_int_equal(ior_cqe_get_res(s->ctx, cqe), -EALREADY);
+	ior_cqe_seen(s->ctx, cqe);
+
+	ior_sqe *o = ior_get_sqe(s->ctx);
+	assert_non_null(o);
+	ior_timespec ots = { .tv_sec = 0, .tv_nsec = 700000000 }; // 700ms
+	ior_prep_timeout(s->ctx, o, &ots, 0, 0);
+	ior_sqe_set_data(s->ctx, o, TAG_OTHER);
+	uint64_t start = test_monotonic_now_ns();
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	do {
+		ret = ior_wait_cqe(s->ctx, &cqe);
+	} while (ret == -EAGAIN || ret == -EINTR);
+	assert_return_code(ret, 0);
+	assert_ptr_equal(ior_cqe_get_data(s->ctx, cqe), TAG_OP);
+	assert_int_equal(ior_cqe_get_res(s->ctx, cqe), 5);
+	ior_cqe_seen(s->ctx, cqe);
+
+	do {
+		ret = ior_wait_cqe(s->ctx, &cqe);
+	} while (ret == -EAGAIN || ret == -EINTR);
+	assert_return_code(ret, 0);
+	assert_ptr_equal(ior_cqe_get_data(s->ctx, cqe), TAG_OTHER);
+	assert_int_equal(ior_cqe_get_res(s->ctx, cqe), -ETIME);
+	ior_cqe_seen(s->ctx, cqe);
+	assert_true(test_monotonic_now_ns() - start >= 650000000ULL);
+}
+
 // ===== Cancel-before-start =====
 
 #define WORK_SAT_N 32 // matches the backend's worker-pool cap
@@ -601,6 +664,7 @@ int main(void)
 		cmocka_unit_test_setup_teardown(
 				test_work_lt_returns_at_deadline, setup_work, teardown_work),
 		cmocka_unit_test_setup_teardown(test_work_lt_race, setup_work, teardown_work),
+		cmocka_unit_test_setup_teardown(test_work_lt_slot_reuse, setup_work, teardown_work),
 		cmocka_unit_test_setup_teardown(test_work_lt_cancels_queued, setup_work, teardown_work),
 		cmocka_unit_test(test_work_queue_exit_runs_all),
 	};
