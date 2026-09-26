@@ -548,11 +548,10 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	return pool;
 }
 
-void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
+uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 {
-	(void) count;
 	if (!pool) {
-		return;
+		return 0;
 	}
 
 	ior_ctx_threads *ctx = pool->ctx;
@@ -569,6 +568,10 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 	 * A standalone cancel (no link or drain involvement) runs on this thread
 	 * once the batch is dispatched, like io_uring executes it at submit: it
 	 * then sees the ops submitted just before it.
+	 *
+	 * An entry io_uring would refuse to take fails its whole chain, as there:
+	 * it completes with its own error and the rest with -ECANCELED. Submission
+	 * stops after it unless it links on, and what follows stays staged.
 	 */
 	uint32_t consumed = atomic_load_explicit(&ctx->sq_ring.consumed, memory_order_relaxed);
 	uint32_t cached = atomic_load_explicit(&ctx->sq_ring.cached_tail, memory_order_acquire);
@@ -576,19 +579,37 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 
 	ior_worker_pool_job *first = NULL;
 	ior_worker_pool_job *last = NULL;
+	ior_worker_pool_job *before_head = NULL; // last before the chain head was queued
 	uint32_t njobs = 0;
 	ior_work *prev = NULL;
 	int prev_link = 0;
+	ior_work *head = NULL; // head of the chain being built
+	int chain_failed = 0;
+	ior_work *failed = NULL; // failed chains, linked by next through their heads
+	ior_work **failed_tail = &failed;
 	ior_work *cancels = NULL;
 	ior_work *cancels_tail = NULL;
-	for (uint32_t p = consumed; p != cached; p++) {
+	uint32_t p = consumed;
+	while (p != cached) {
 		ior_work *w = ior_threads_pool_work_alloc(pool);
 		w->sqe = sqes[p & ctx->sq_ring.mask];
+		p++;
+		uint8_t opcode = w->sqe.threads.opcode;
 		/* The caller's timespec is promised only until submit returns, as
 		 * on io_uring: take a copy now, before the timer is armed. */
-		if ((w->sqe.threads.opcode == IOR_OP_TIMER || w->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT)
-				&& w->sqe.threads.addr) {
+		const ior_timespec *ts = NULL;
+		if ((opcode == IOR_OP_TIMER || opcode == IOR_OP_LINK_TIMEOUT) && w->sqe.threads.addr) {
 			w->sqe.threads.ts = *(const ior_timespec *) (uintptr_t) w->sqe.threads.addr;
+			ts = &w->sqe.threads.ts;
+		}
+		w->fail_res = 0;
+		if (opcode == IOR_OP_TIMER) {
+			w->fail_res = ior_timeout_check(ts, w->sqe.threads.timeout_flags);
+		} else if (opcode == IOR_OP_LINK_TIMEOUT) {
+			w->fail_res = ior_link_timeout_check(ts, w->sqe.threads.timeout_flags, prev_link,
+					prev_link && prev->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT);
+		} else if (opcode == IOR_OP_ACCEPT) {
+			w->fail_res = ior_accept_check(w->sqe.threads.rw_flags);
 		}
 		w->seq = pool->next_seq++;
 		w->chain = NULL;
@@ -599,7 +620,7 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		w->rw_plain = IOR_RW_NOWAIT;
 		w->connecting = 0;
 		w->pidfd = -1;
-		if (w->sqe.threads.opcode == IOR_OP_WORK || w->sqe.threads.opcode == IOR_OP_SIGWAIT) {
+		if (opcode == IOR_OP_WORK || opcode == IOR_OP_SIGWAIT) {
 			atomic_init(&w->token.cancelled, 0);
 			w->token.shutdown = &pool->wp->shutdown;
 		}
@@ -608,29 +629,57 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 		if (prev_link) {
 			atomic_store_explicit(&w->state, IOR_WORK_LINKED, memory_order_release);
 			prev->chain = w;
-		} else if (w->sqe.threads.opcode == IOR_OP_ASYNC_CANCEL
-				&& !(flags & (IOR_SQE_IO_LINK | IOR_SQE_IO_DRAIN))) {
-			atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
-			w->next = NULL;
-			if (cancels_tail) {
-				cancels_tail->next = w;
-			} else {
-				cancels = w;
-			}
-			cancels_tail = w;
 		} else {
-			atomic_store_explicit(&w->state, IOR_WORK_QUEUED, memory_order_release);
-			w->job.next = NULL;
-			if (last) {
-				last->next = &w->job;
+			head = w;
+			chain_failed = 0;
+			if (w->fail_res == 0 && opcode == IOR_OP_ASYNC_CANCEL
+					&& !(flags & (IOR_SQE_IO_LINK | IOR_SQE_IO_DRAIN))) {
+				atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
+				w->next = NULL;
+				if (cancels_tail) {
+					cancels_tail->next = w;
+				} else {
+					cancels = w;
+				}
+				cancels_tail = w;
 			} else {
-				first = &w->job;
+				atomic_store_explicit(&w->state, IOR_WORK_QUEUED, memory_order_release);
+				w->job.next = NULL;
+				before_head = last;
+				if (last) {
+					last->next = &w->job;
+				} else {
+					first = &w->job;
+				}
+				last = &w->job;
+				njobs++;
 			}
-			last = &w->job;
-			njobs++;
+		}
+		if (w->fail_res < 0 && !chain_failed) {
+			// Take the chain back off the queue; it completes below. Until
+			// then it is hidden from a cancel running on a worker, as
+			// io_uring never exposes an entry it refused.
+			chain_failed = 1;
+			atomic_store_explicit(&head->state, IOR_WORK_LINKED, memory_order_release);
+			last = before_head;
+			if (last) {
+				last->next = NULL;
+			} else {
+				first = NULL;
+			}
+			njobs--;
 		}
 		prev = w;
 		prev_link = has_link;
+		if (chain_failed && (!has_link || p == cached)) {
+			head->next = NULL;
+			*failed_tail = head;
+			failed_tail = &head->next;
+			chain_failed = 0;
+			if (w->fail_res < 0 && !has_link) {
+				break;
+			}
+		}
 	}
 
 	pthread_mutex_unlock(&pool->work_lock);
@@ -640,18 +689,34 @@ void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count)
 	}
 
 	// Staging slots are now free for reuse by get_sqe.
-	ior_threads_ring_consume(&ctx->sq_ring);
+	ior_threads_ring_consume_to(&ctx->sq_ring, p);
 
+	// Failed chains complete before the cancels run, as io_uring posts them.
+	// Their ops stay LINKED until then, so no cancel finds them.
 	uint64_t done = 0;
+	while (failed) {
+		ior_work *w = failed;
+		failed = w->next;
+		for (ior_work *next; w; w = next) {
+			next = w->chain;
+			ior_threads_pool_finish_res(pool, w, w->fail_res < 0 ? w->fail_res : -ECANCELED);
+			done++;
+		}
+	}
 	while (cancels) {
 		ior_work *c = cancels;
 		cancels = c->next;
-		ior_threads_pool_finish_res(pool, c, ior_threads_pool_cancel(pool, c));
+		int32_t res = ior_fixed_file_bad(c->sqe.threads.opcode, c->sqe.threads.flags,
+							  c->sqe.threads.cancel_flags)
+				? -EBADF
+				: ior_threads_pool_cancel(pool, c);
+		ior_threads_pool_finish_res(pool, c, res);
 		done++;
 	}
 	if (done) {
 		atomic_fetch_add(&pool->tasks_completed, done);
 	}
+	return p - consumed;
 }
 
 void ior_threads_pool_destroy(ior_threads_pool *pool)
@@ -882,7 +947,7 @@ static const ior_timespec *ior_threads_pool_ts(const ior_work *w)
 
 static int ior_threads_pool_ts_valid(const ior_timespec *ts)
 {
-	return ts && ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000L;
+	return ts && ts->tv_sec >= 0 && ts->tv_nsec >= 0;
 }
 
 // Absolute monotonic deadline of a link timeout, 0 for none (NULL timespec).
@@ -1143,6 +1208,16 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		// DRAIN: wait until every earlier-submitted op has completed.
 		if ((w->sqe.threads.flags & IOR_SQE_IO_DRAIN) && ior_threads_pool_drain_wait(pool, w) < 0) {
 			ior_threads_pool_finish_res(pool, w, -ECANCELED);
+			count++;
+			if (has_link) {
+				cancel = 1;
+			}
+			w = next;
+			continue;
+		}
+
+		if (ior_fixed_file_bad(opcode, w->sqe.threads.flags, w->sqe.threads.cancel_flags)) {
+			ior_threads_pool_finish_res(pool, w, -EBADF);
 			count++;
 			if (has_link) {
 				cancel = 1;

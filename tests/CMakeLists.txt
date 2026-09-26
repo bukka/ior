@@ -162,4 +162,36 @@ if(IOR_HAVE_IOCP)
     apply_sanitizers(test_iocp_backend)
     add_test(NAME test_iocp_backend COMMAND test_iocp_backend)
     set_tests_properties(test_iocp_backend PROPERTIES TIMEOUT 30)
+
+    # The same programs on a library whose port refuses completion packets
+    # (see iocp_fault.c), so the path that keeps them is exercised. Each
+    # links its own copy of test_utils.c: test_utils brings the real ior.
+    add_library(ior_iocp_fault STATIC
+        ${CMAKE_SOURCE_DIR}/src/ior.c
+        ${CMAKE_SOURCE_DIR}/src/ior_log.c
+        iocp_fault.c
+    )
+    target_include_directories(ior_iocp_fault PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}
+    )
+    target_link_libraries(ior_iocp_fault PUBLIC ws2_32)
+    apply_sanitizers(ior_iocp_fault)
+
+    foreach(test test_basic test_timeout test_link_timeout test_work test_poll
+            test_notify test_waitpid test_iocp_backend)
+        add_executable(${test}_pqcs_fault ${test}.c test_utils.c)
+        target_include_directories(${test}_pqcs_fault PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_BINARY_DIR}
+        )
+        target_link_libraries(${test}_pqcs_fault PRIVATE ior_iocp_fault cmocka::cmocka)
+        apply_sanitizers(${test}_pqcs_fault)
+        add_test(NAME ${test}_pqcs_fault COMMAND ${test}_pqcs_fault)
+        set_tests_properties(${test}_pqcs_fault PROPERTIES
+            TIMEOUT 30
+            ENVIRONMENT "IOR_FAULT_PQCS_RATE=100"
+        )
+    endforeach()
 endif()

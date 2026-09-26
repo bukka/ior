@@ -17,6 +17,7 @@
 #include <sys/signalfd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <time.h>
 #ifdef IOR_HAVE_PIDFD_OPEN
 #include <sys/syscall.h>
 #endif
@@ -43,6 +44,15 @@ typedef struct ior_ctx_uring {
 	_Atomic int shutdown; // lets running callbacks observe teardown via token
 	pthread_mutex_t poster_lock; // serializes msg_ring posters
 	struct io_uring poster; // side ring, valid when wp != NULL
+	/*
+	 * Completions the kernel has not taken yet (see ior_uring_post_cqe),
+	 * under poster_lock. post_queued counts those on the list, post_live
+	 * those not yet confirmed delivered, on the list or in the poster ring.
+	 */
+	struct ior_uring_post *post_head;
+	struct ior_uring_post *post_tail;
+	_Atomic uint32_t post_queued;
+	_Atomic uint32_t post_live;
 	/*
 	 * Released by every msg_ring post and acquired by every reap: what a
 	 * worker wrote before posting (a callback's output, a wait status) is
@@ -77,6 +87,14 @@ typedef struct ior_ctx_uring {
 	_Atomic uint32_t waits_live_count;
 
 	int notify_fd; // eventfd registered with the ring; -1 until requested
+
+	/*
+	 * Per SQ slot, set by ior_uring_scan_staged(): the entry is in a chain the
+	 * kernel will fail, so no userspace work may be done for it.
+	 */
+	uint8_t *sq_failed;
+	int sq_any_failed; // some byte of sq_failed is set, for this submit only
+	int sq_needs_scan; // an entry submit checks may be staged (prep_checked)
 } ior_ctx_uring;
 
 struct ior_uring_wait {
@@ -170,39 +188,172 @@ static void ior_uring_job_release(ior_uring_job *job)
 }
 
 /*
+ * A completion on its way to the main ring. It is kept until the poster
+ * ring's CQE for its MSG_RING says it arrived, so none is lost when the
+ * kernel refuses one (the target's CQ full with no memory for overflow, or
+ * the poster's submit failing): it is queued again and retried.
+ */
+typedef struct ior_uring_post {
+	uint64_t user_data;
+	int32_t res;
+	struct ior_uring_post *next;
+} ior_uring_post;
+
+// Settle the posts the kernel has answered; a refused one goes back to the front.
+static void ior_uring_poster_reap_locked(ior_ctx_uring *ctx)
+{
+	ior_uring_post *retry = NULL;
+	ior_uring_post *retry_tail = NULL;
+	struct io_uring_cqe *cqe;
+	while (io_uring_peek_cqe(&ctx->poster, &cqe) == 0) {
+		ior_uring_post *post = (ior_uring_post *) (uintptr_t) cqe->user_data;
+		int32_t res = cqe->res;
+		io_uring_cqe_seen(&ctx->poster, cqe);
+		if (!post) {
+			IOR_LOG_ERROR("msg_ring post failed: res=%d, lost", res);
+			continue;
+		}
+		if (res >= 0) {
+			free(post);
+			atomic_fetch_sub(&ctx->post_live, 1);
+			continue;
+		}
+		IOR_LOG_ERROR("msg_ring post failed: res=%d, retrying", res);
+		post->next = NULL;
+		if (retry_tail) {
+			retry_tail->next = post;
+		} else {
+			retry = post;
+		}
+		retry_tail = post;
+		atomic_fetch_add(&ctx->post_queued, 1);
+	}
+	if (retry) {
+		retry_tail->next = ctx->post_head;
+		if (!ctx->post_head) {
+			ctx->post_tail = retry_tail;
+		}
+		ctx->post_head = retry;
+	}
+}
+
+// Hand the queued posts to the kernel, in order, and settle what it answered.
+static void ior_uring_poster_flush_locked(ior_ctx_uring *ctx)
+{
+	ior_uring_poster_reap_locked(ctx);
+	while (ctx->post_head) {
+		struct io_uring_sqe *s = io_uring_get_sqe(&ctx->poster);
+		if (!s) {
+			break; // a failed submit left entries staged; they go first
+		}
+		ior_uring_post *post = ctx->post_head;
+		ctx->post_head = post->next;
+		if (!ctx->post_head) {
+			ctx->post_tail = NULL;
+		}
+		atomic_fetch_sub(&ctx->post_queued, 1);
+		io_uring_prep_msg_ring(s, ctx->ring.ring_fd, (unsigned int) post->res, post->user_data, 0);
+		io_uring_sqe_set_data(s, post);
+	}
+	int ret = io_uring_submit(&ctx->poster);
+	if (ret < 0) {
+		IOR_LOG_ERROR("msg_ring submit failed: %d, retrying", ret);
+	}
+	// A MSG_RING is delivered inline, so its CQE is normally here already.
+	ior_uring_poster_reap_locked(ctx);
+}
+
+/*
  * Inject a completion into the main ring's CQ via the poster ring. Runs on
- * worker/timer threads under poster_lock. The msg_ring op's own completion on
- * the poster ring is skipped on success; failures are drained and logged (the
- * target CQE is then lost, but modern kernels buffer CQ overflow, so this is
- * not expected in practice).
+ * worker/timer threads (and the submitter, for cancels) under poster_lock.
  */
 static void ior_uring_post_cqe(ior_ctx_uring *ctx, uint64_t user_data, int32_t res)
 {
-	pthread_mutex_lock(&ctx->poster_lock);
+	ior_uring_post *post = malloc(sizeof(*post));
 
-	struct io_uring_sqe *s = io_uring_get_sqe(&ctx->poster);
-	if (!s) {
-		// Cannot happen: each poster SQE is submitted while the lock is held.
-		IOR_LOG_ERROR("poster ring full");
+	pthread_mutex_lock(&ctx->poster_lock);
+	atomic_fetch_add_explicit(&ctx->posted, 1, memory_order_release);
+	if (!post) {
+		// Nothing to keep it in: one attempt, as a last resort.
+		IOR_LOG_ERROR("no memory to keep a completion, posting it once");
+		struct io_uring_sqe *s = io_uring_get_sqe(&ctx->poster);
+		if (s) {
+			io_uring_prep_msg_ring(s, ctx->ring.ring_fd, (unsigned int) res, user_data, 0);
+			s->flags |= IOSQE_CQE_SKIP_SUCCESS;
+			io_uring_sqe_set_data(s, NULL);
+		}
+		(void) io_uring_submit(&ctx->poster);
 		pthread_mutex_unlock(&ctx->poster_lock);
 		return;
 	}
-	io_uring_prep_msg_ring(s, ctx->ring.ring_fd, (unsigned int) res, user_data, 0);
-	s->flags |= IOSQE_CQE_SKIP_SUCCESS;
-
-	atomic_fetch_add_explicit(&ctx->posted, 1, memory_order_release);
-	int ret = io_uring_submit(&ctx->poster);
-	if (ret < 0) {
-		IOR_LOG_ERROR("msg_ring submit failed: %d", -errno);
+	post->user_data = user_data;
+	post->res = res;
+	post->next = NULL;
+	if (ctx->post_tail) {
+		ctx->post_tail->next = post;
+	} else {
+		ctx->post_head = post;
 	}
-
-	struct io_uring_cqe *cqe;
-	while (io_uring_peek_cqe(&ctx->poster, &cqe) == 0) {
-		IOR_LOG_ERROR("msg_ring post failed: res=%d", cqe->res);
-		io_uring_cqe_seen(&ctx->poster, cqe);
-	}
-
+	ctx->post_tail = post;
+	atomic_fetch_add(&ctx->post_queued, 1);
+	atomic_fetch_add(&ctx->post_live, 1);
+	ior_uring_poster_flush_locked(ctx);
 	pthread_mutex_unlock(&ctx->poster_lock);
+}
+
+// From the reaping side: retry posts the kernel refused, if there are any.
+static void ior_uring_poster_retry(ior_ctx_uring *ctx)
+{
+	if (atomic_load_explicit(&ctx->post_live, memory_order_relaxed) == 0) {
+		return;
+	}
+	pthread_mutex_lock(&ctx->poster_lock);
+	ior_uring_poster_flush_locked(ctx);
+	pthread_mutex_unlock(&ctx->poster_lock);
+}
+
+#define IOR_URING_POST_RETRY_NS 10000000ULL
+
+static uint64_t ior_uring_now_ns(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t) now.tv_sec * 1000000000ULL + (uint64_t) now.tv_nsec;
+}
+
+/*
+ * Wait for wait_nr completions, no longer than ts (NULL: no limit). While a
+ * refused post is queued, wait in slices and retry it between them: the
+ * completion waited for may be that one.
+ */
+static int ior_uring_wait_cqes(
+		ior_ctx_uring *ctx, struct io_uring_cqe **cqe, unsigned wait_nr, const ior_timespec *ts)
+{
+	uint64_t deadline = ts ? ior_uring_now_ns() + ior_timespec_ns(ts) : 0;
+	for (;;) {
+		ior_uring_poster_retry(ctx);
+		int queued = atomic_load(&ctx->post_queued) != 0;
+		if (!ts && !queued) {
+			return io_uring_wait_cqes(&ctx->ring, cqe, wait_nr, NULL, NULL);
+		}
+		uint64_t rem = 0;
+		if (ts) {
+			uint64_t now = ior_uring_now_ns();
+			rem = deadline > now ? deadline - now : 0;
+		}
+		uint64_t span = ts ? rem : UINT64_MAX;
+		if (queued && span > IOR_URING_POST_RETRY_NS) {
+			span = IOR_URING_POST_RETRY_NS;
+		}
+		struct __kernel_timespec kts = {
+			.tv_sec = (long long) (span / 1000000000ULL),
+			.tv_nsec = (long long) (span % 1000000000ULL),
+		};
+		int ret = io_uring_wait_cqes(&ctx->ring, cqe, wait_nr, &kts, NULL);
+		if (ret != -ETIME || (ts && span == rem)) {
+			return ret;
+		}
+	}
 }
 
 // Executes one work job on a pool worker thread.
@@ -291,19 +442,100 @@ static int ior_uring_work_ensure(ior_ctx_uring *ctx)
  * attached and key the kernel op by the record instead, so its completion is
  * recognised whatever user data the caller uses elsewhere.
  */
-static void ior_uring_dispatch_waits(ior_ctx_uring *ctx)
+static unsigned ior_uring_timeout_flags_from(unsigned uflags);
+
+// Absolute position of a staged, unflushed SQE, from its slot in sqes[].
+static unsigned ior_uring_sq_pos(ior_ctx_uring *ctx, const struct io_uring_sqe *s)
+{
+	struct io_uring_sq *sq = &ctx->ring.sq;
+	unsigned mask = sq->ring_entries - 1;
+	unsigned idx = (unsigned) (s - sq->sqes);
+	return sq->sqe_head + ((idx - (sq->sqe_head & mask)) & mask);
+}
+
+/*
+ * Find where the kernel will stop taking the staged entries: right after one
+ * that fails the checks it makes on taking it, unless that one links on. The
+ * entries of a chain holding such an entry are flagged in sq_failed, as the
+ * kernel fails them all. Returns the position to stop at.
+ */
+static unsigned ior_uring_scan_staged(ior_ctx_uring *ctx)
+{
+	struct io_uring_sq *sq = &ctx->ring.sq;
+	if (!ctx->sq_needs_scan) {
+		return sq->sqe_tail; // nothing staged that could fail the checks
+	}
+	unsigned mask = sq->ring_entries - 1;
+	unsigned chain_start = sq->sqe_head;
+	int in_chain = 0;
+	int prev_lt = 0;
+	int chain_failed = 0;
+
+	for (unsigned pos = sq->sqe_head; pos != sq->sqe_tail; pos++) {
+		const struct io_uring_sqe *s = &sq->sqes[pos & mask];
+		if (!in_chain) {
+			chain_start = pos;
+			chain_failed = 0;
+		}
+		int ret = 0;
+		if (s->opcode == IORING_OP_TIMEOUT || s->opcode == IORING_OP_LINK_TIMEOUT) {
+			const ior_timespec *ts = (const ior_timespec *) (uintptr_t) s->addr;
+			unsigned flags = ior_uring_timeout_flags_from(s->timeout_flags);
+			ret = s->opcode == IORING_OP_TIMEOUT
+					? ior_timeout_check(ts, flags)
+					: ior_link_timeout_check(ts, flags, in_chain, prev_lt);
+		} else if (s->opcode == IORING_OP_ACCEPT) {
+			ret = ior_accept_check(s->accept_flags);
+		}
+		int link = (s->flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) != 0;
+		if (ret < 0) {
+			chain_failed = 1;
+		}
+		if (chain_failed && (!link || pos + 1 == sq->sqe_tail)) {
+			for (unsigned q = chain_start; q != pos + 1; q++) {
+				ctx->sq_failed[q & mask] = 1;
+			}
+			ctx->sq_any_failed = 1;
+			chain_failed = 0;
+			if (ret < 0 && !link) {
+				return pos + 1; // what is left stays staged: scanned again next time
+			}
+		}
+		prev_lt = s->opcode == IORING_OP_LINK_TIMEOUT;
+		in_chain = link;
+	}
+	ctx->sq_needs_scan = 0;
+	return sq->sqe_tail;
+}
+
+static void ior_uring_backend_prep_checked(void *backend_ctx)
+{
+	((ior_ctx_uring *) backend_ctx)->sq_needs_scan = 1;
+}
+
+static void ior_uring_dispatch_waits(ior_ctx_uring *ctx, unsigned bound)
 {
 	ior_uring_wait *wait = ctx->waits_pending;
 	if (!wait) {
 		return;
 	}
 	ctx->waits_pending = NULL;
+	unsigned head = ctx->ring.sq.sqe_head;
 
 	pthread_mutex_lock(&ctx->jobs_lock);
 	while (wait) {
 		ior_uring_wait *next = wait->next;
+		if (ior_uring_sq_pos(ctx, wait->ksqe) - head >= bound - head) {
+			// Not taken by this submit: stays prepped for the next one.
+			wait->next = ctx->waits_pending;
+			ctx->waits_pending = wait;
+			wait = next;
+			continue;
+		}
 		wait->user_data = wait->ksqe->user_data;
 		wait->ksqe->user_data = (uint64_t) (uintptr_t) wait;
+		// The pidfd or signalfd is ior's own, never a registered file.
+		wait->ksqe->flags &= (uint8_t) ~IOSQE_FIXED_FILE;
 		wait->ksqe = NULL;
 
 		ior_uring_wait **head = ior_uring_wait_bucket(ctx, (uint64_t) (uintptr_t) wait);
@@ -459,7 +691,8 @@ static void ior_uring_reaped(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, uns
 }
 
 /*
- * Hand all prepped work jobs to the pool. Called from submit paths before
+ * Hand the prepped work jobs this submit takes (those before bound, not in a
+ * failed chain) to the pool. Called from submit paths before
  * io_uring_submit() flushes the SQ, while each job's placeholder NOP is still
  * staged: the user may have attached user_data or flags after prep_work, so
  * they are harvested here, and a LINK_TIMEOUT prepped right behind a linked
@@ -467,11 +700,9 @@ static void ior_uring_reaped(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, uns
  * completing NOP) and rewritten into another skipped NOP; its deadline is
  * handled by the pool's timer thread instead.
  */
-static unsigned ior_uring_timeout_flags_from(unsigned uflags);
-
-static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
+static void ior_uring_dispatch_pending(ior_ctx_uring *ctx, unsigned bound)
 {
-	ior_uring_dispatch_waits(ctx);
+	ior_uring_dispatch_waits(ctx, bound);
 
 	ior_uring_job *job = ctx->pending_head;
 	if (!job) {
@@ -487,7 +718,27 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 	ior_worker_pool_job *last = NULL;
 	uint32_t count = 0;
 
-	for (; job; job = job->next_pending) {
+	ior_uring_job *next;
+	for (; job; job = next) {
+		next = job->next_pending;
+		unsigned at = ior_uring_sq_pos(ctx, job->ksqe);
+		if (at - sq->sqe_head >= bound - sq->sqe_head) {
+			// Not taken by this submit: stays prepped for the next one.
+			job->next_pending = NULL;
+			if (ctx->pending_tail) {
+				ctx->pending_tail->next_pending = job;
+			} else {
+				ctx->pending_head = job;
+			}
+			ctx->pending_tail = job;
+			continue;
+		}
+		if (ctx->sq_any_failed && ctx->sq_failed[at & mask]) {
+			/* The kernel fails the placeholder NOP with the rest of its
+			 * chain, and that is the op's completion: never run it. */
+			free(job);
+			continue;
+		}
 		job->user_data = job->ksqe->user_data;
 		int had_link = (job->ksqe->flags & (IOSQE_IO_LINK | IOSQE_IO_HARDLINK)) != 0;
 
@@ -515,8 +766,7 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 
 					struct __kernel_timespec *kts
 							= (struct __kernel_timespec *) (uintptr_t) next->addr;
-					if (kts && kts->tv_sec >= 0 && kts->tv_nsec >= 0
-							&& kts->tv_nsec < 1000000000LL) {
+					if (kts && kts->tv_sec >= 0 && kts->tv_nsec >= 0) {
 						/* Same layout as ior_timespec; the pool's timer runs on
 						 * CLOCK_MONOTONIC, so a deadline on another clock is
 						 * converted here, at submit. */
@@ -564,7 +814,9 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx)
 		count++;
 	}
 
-	ior_worker_pool_submit(ctx->wp, first, last, count);
+	if (count) {
+		ior_worker_pool_submit(ctx->wp, first, last, count);
+	}
 }
 
 /*
@@ -613,14 +865,15 @@ static int ior_uring_cancel_job_locked(ior_ctx_uring *ctx, ior_uring_job *job, i
  * through the poster ring. Cancels by fd never match a job. Runs on the
  * submitter thread while the SQ is still staged.
  */
-static void ior_uring_intercept_cancels(ior_ctx_uring *ctx)
+static void ior_uring_intercept_cancels(ior_ctx_uring *ctx, unsigned bound)
 {
 	struct io_uring_sq *sq = &ctx->ring.sq;
 	unsigned mask = sq->ring_entries - 1;
 
-	for (unsigned pos = sq->sqe_head; pos != sq->sqe_tail; pos++) {
+	for (unsigned pos = sq->sqe_head; pos != bound; pos++) {
 		struct io_uring_sqe *s = &sq->sqes[pos & mask];
-		if (s->opcode != IORING_OP_ASYNC_CANCEL) {
+		if (s->opcode != IORING_OP_ASYNC_CANCEL
+				|| (ctx->sq_any_failed && ctx->sq_failed[pos & mask])) {
 			continue;
 		}
 		if (s->cancel_flags & IORING_ASYNC_CANCEL_FD) {
@@ -770,6 +1023,15 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	}
 	ctx->features |= IOR_FEAT_WORK;
 
+	ctx->sq_failed = calloc(ctx->ring.sq.ring_entries, 1);
+	if (!ctx->sq_failed) {
+		io_uring_queue_exit(&ctx->ring);
+		pthread_mutex_destroy(&ctx->jobs_lock);
+		pthread_mutex_destroy(&ctx->poster_lock);
+		free(ctx);
+		return -ENOMEM;
+	}
+
 	ctx->sq_entries = uring_params.sq_entries;
 	ctx->cq_entries = uring_params.cq_entries;
 	params->sq_entries = ctx->sq_entries;
@@ -793,6 +1055,13 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 	atomic_store(&ctx->shutdown, 1);
 	if (ctx->wp) {
 		ior_worker_pool_destroy(ctx->wp);
+		// No poster is left: deliver what is queued, free the rest.
+		ior_uring_poster_flush_locked(ctx);
+		while (ctx->post_head) {
+			ior_uring_post *post = ctx->post_head;
+			ctx->post_head = post->next;
+			free(post);
+		}
 		io_uring_queue_exit(&ctx->poster);
 	}
 
@@ -830,6 +1099,7 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 	pthread_mutex_destroy(&ctx->jobs_lock);
 	pthread_mutex_destroy(&ctx->poster_lock);
 	io_uring_queue_exit(&ctx->ring);
+	free(ctx->sq_failed);
 	free(ctx);
 }
 
@@ -879,24 +1149,6 @@ static unsigned ior_uring_backend_cq_space_left(void *backend_ctx)
 	return ready < ctx->cq_entries ? ctx->cq_entries - ready : 0;
 }
 
-static int ior_uring_backend_submit(void *backend_ctx)
-{
-	if (!backend_ctx) {
-		return -EINVAL;
-	}
-
-	ior_ctx_uring *ctx = backend_ctx;
-	// Work jobs and pidfd/signalfd waits must be harvested while their
-	// placeholder SQEs are still staged; cancels then see the ops submitted
-	// just before them.
-	ior_uring_dispatch_pending(ctx);
-	if (ctx->wp || atomic_load(&ctx->waits_live_count)) {
-		ior_uring_intercept_cancels(ctx);
-	}
-	int ret = io_uring_submit(&ctx->ring);
-	return ret < 0 ? -errno : ret;
-}
-
 static int ior_uring_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 {
 	if (!backend_ctx) {
@@ -904,13 +1156,55 @@ static int ior_uring_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr
 	}
 
 	ior_ctx_uring *ctx = backend_ctx;
-	// See ior_uring_backend_submit.
-	ior_uring_dispatch_pending(ctx);
+	struct io_uring_sq *sq = &ctx->ring.sq;
+	unsigned tail = sq->sqe_tail;
+	unsigned bound = ior_uring_scan_staged(ctx);
+
+	// Work jobs and pidfd/signalfd waits must be harvested while their
+	// placeholder SQEs are still staged; cancels then see the ops submitted
+	// just before them.
+	ior_uring_dispatch_pending(ctx, bound);
 	if (ctx->wp || atomic_load(&ctx->waits_live_count)) {
-		ior_uring_intercept_cancels(ctx);
+		ior_uring_intercept_cancels(ctx, bound);
 	}
-	int ret = io_uring_submit_and_wait(&ctx->ring, wait_nr);
-	return ret < 0 ? -errno : ret;
+
+	/*
+	 * Publish only what the kernel will take, so it cannot run past entries
+	 * whose userspace side was held back. With entries left over it would
+	 * have stopped short and not waited; the bound makes that explicit.
+	 */
+	if (bound != tail) {
+		wait_nr = 0;
+	}
+	if (wait_nr) {
+		ior_uring_poster_retry(ctx);
+	}
+	int slow = wait_nr && atomic_load(&ctx->post_queued);
+	unsigned head = sq->sqe_head;
+	sq->sqe_tail = bound;
+	int ret = io_uring_submit_and_wait(&ctx->ring, slow ? 0 : wait_nr);
+	sq->sqe_tail = tail;
+	if (ctx->sq_any_failed) {
+		// Marks are only set on a failed chain; drop them with it.
+		for (unsigned q = head; q != bound; q++) {
+			ctx->sq_failed[q & (sq->ring_entries - 1)] = 0;
+		}
+		ctx->sq_any_failed = 0;
+	}
+	if (slow && ret >= 0) {
+		// A refused post is queued: wait in slices that retry it.
+		struct io_uring_cqe *cqe;
+		int waited = ior_uring_wait_cqes(ctx, &cqe, wait_nr, NULL);
+		if (waited < 0 && ret == 0) {
+			return waited;
+		}
+	}
+	return ret;
+}
+
+static int ior_uring_backend_submit(void *backend_ctx)
+{
+	return ior_uring_backend_submit_and_wait(backend_ctx, 0);
 }
 
 static int ior_uring_backend_peek_cqe(void *backend_ctx, ior_cqe **cqe_out)
@@ -921,6 +1215,7 @@ static int ior_uring_backend_peek_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe *cqe;
+	ior_uring_poster_retry(ctx);
 	int ret = io_uring_peek_cqe(&ctx->ring, &cqe);
 
 	if (ret < 0) {
@@ -940,7 +1235,10 @@ static int ior_uring_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe *cqe;
-	int ret = io_uring_wait_cqe(&ctx->ring, &cqe);
+	// The inline peek of io_uring_wait_cqe unless a post is held back.
+	int ret = atomic_load_explicit(&ctx->post_live, memory_order_relaxed)
+			? ior_uring_wait_cqes(ctx, &cqe, 1, NULL)
+			: io_uring_wait_cqe(&ctx->ring, &cqe);
 
 	if (ret < 0) {
 		return ret;
@@ -961,7 +1259,17 @@ static int ior_uring_backend_wait_cqe_timeout(
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe *cqe;
 
-	int ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, (struct __kernel_timespec *) timeout);
+	int ret;
+	if (timeout && !atomic_load_explicit(&ctx->post_live, memory_order_relaxed)) {
+		uint64_t ns = ior_timespec_ns(timeout);
+		struct __kernel_timespec kts = {
+			.tv_sec = (long long) (ns / 1000000000ULL),
+			.tv_nsec = (long long) (ns % 1000000000ULL),
+		};
+		ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, &kts);
+	} else {
+		ret = ior_uring_wait_cqes(ctx, &cqe, 1, timeout);
+	}
 
 	if (ret < 0) {
 		return ret;
@@ -990,6 +1298,7 @@ static unsigned ior_uring_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cq
 
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe **uring_cqes = (struct io_uring_cqe **) cqes;
+	ior_uring_poster_retry(ctx);
 	unsigned n = io_uring_peek_batch_cqe(&ctx->ring, uring_cqes, max);
 	if (n) {
 		ior_uring_reaped(ctx, uring_cqes, n);
@@ -1456,6 +1765,7 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_poll_add = ior_uring_backend_prep_poll_add,
 	.prep_poll_multishot = ior_uring_backend_prep_poll_multishot,
 	.prep_accept = ior_uring_backend_prep_accept,
+	.prep_checked = ior_uring_backend_prep_checked,
 	.prep_connect = ior_uring_backend_prep_connect,
 	.prep_cancel = ior_uring_backend_prep_cancel,
 	.prep_cancel_fd = ior_uring_backend_prep_cancel_fd,

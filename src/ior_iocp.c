@@ -161,6 +161,11 @@ typedef struct ior_iocp_op {
 
 	// Flags for completion handling
 	bool is_synthetic; // True if synthetic completion
+	// Non-zero when submit failed the op's chain (see iocp_scan_staged): the
+	// op's own error, or -ECANCELED for the rest of the chain. Never issued.
+	int32_t submit_res;
+	uint32_t accept_flags; // IOR_ACCEPT_*, checked at submit as io_uring does
+	struct ior_iocp_op *backlog_next; // on ctx->backlog, see iocp_backlog_push
 
 	// IOR_OP_WORK: user callback executed on the private Win32 threadpool. The
 	// callback's return value (work_res) becomes the CQE result; the token lets
@@ -335,6 +340,17 @@ typedef struct ior_ctx_iocp {
 	uint32_t sq_head;
 	uint32_t sq_tail;
 	uint32_t sq_mask;
+
+	/*
+	 * Completions PostQueuedCompletionStatus could not queue (out of
+	 * nonpaged pool). The packet drives links, link timeouts and drains, so
+	 * it is kept here and taken by the next dequeue instead of being lost.
+	 * Zero-initialized SRWLOCK, counted in active_count like a queued packet.
+	 */
+	SRWLOCK backlog_lock;
+	struct ior_iocp_op *backlog_head;
+	struct ior_iocp_op *backlog_tail;
+	_Atomic uint32_t backlog_count;
 	uint32_t sq_size;
 
 	// Ready queue for completed operations
@@ -690,6 +706,8 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->bytes_transferred = 0;
 	op->error_code = 0;
 	op->is_synthetic = false;
+	op->submit_res = 0;
+	op->backlog_next = NULL;
 
 	op->work_fn = NULL;
 	op->work_arg = NULL;
@@ -835,6 +853,72 @@ static bool drain_satisfied(ior_ctx_iocp *ctx, const ior_iocp_op *op)
 
 /* ================= IO issue / completion plumbing ================= */
 
+/*
+ * Make the notify descriptor readable unless a byte is already outstanding
+ * (see iocp_pump_thread_main). pump.lock must be held.
+ */
+static void iocp_pump_signal_locked(iocp_pump *p)
+{
+	if (!p->signalled) {
+		char b = 0;
+		if (send(p->wake_tx, &b, 1, 0) == 1) {
+			p->signalled = true;
+		}
+	}
+}
+
+/*
+ * Keep a completion the port refused (see backlog_head) and wake a consumer
+ * that may be blocked: the pump's condition variable and wake byte, or a
+ * stray NULL packet, which a direct dequeue takes as a spurious wakeup.
+ * Whether the pump runs is decided under its lock, which iocp_pump_ensure
+ * takes to publish the thread, so a pump started meanwhile signals for it.
+ */
+static void iocp_backlog_push(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	IOR_LOG_ERROR("PostQueuedCompletionStatus failed (%lu), completion kept", GetLastError());
+	op->backlog_next = NULL;
+	AcquireSRWLockExclusive(&ctx->backlog_lock);
+	if (ctx->backlog_tail) {
+		ctx->backlog_tail->backlog_next = op;
+	} else {
+		ctx->backlog_head = op;
+	}
+	ctx->backlog_tail = op;
+	atomic_fetch_add(&ctx->backlog_count, 1);
+	ReleaseSRWLockExclusive(&ctx->backlog_lock);
+
+	iocp_pump *p = &ctx->pump;
+	EnterCriticalSection(&p->lock);
+	bool pumped = p->thread != NULL;
+	if (pumped) {
+		iocp_pump_signal_locked(p);
+		WakeConditionVariable(&p->cv);
+	}
+	LeaveCriticalSection(&p->lock);
+	if (!pumped) {
+		(void) PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, NULL);
+	}
+}
+
+static ior_iocp_op *iocp_backlog_pop(ior_ctx_iocp *ctx)
+{
+	if (atomic_load(&ctx->backlog_count) == 0) {
+		return NULL;
+	}
+	AcquireSRWLockExclusive(&ctx->backlog_lock);
+	ior_iocp_op *op = ctx->backlog_head;
+	if (op) {
+		ctx->backlog_head = op->backlog_next;
+		if (!ctx->backlog_head) {
+			ctx->backlog_tail = NULL;
+		}
+		atomic_fetch_sub(&ctx->backlog_count, 1);
+	}
+	ReleaseSRWLockExclusive(&ctx->backlog_lock);
+	return op;
+}
+
 static int post_synthetic_completion(
 		ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code, DWORD bytes_transferred)
 {
@@ -845,23 +929,17 @@ static int post_synthetic_completion(
 
 	MemoryBarrier();
 
-	BOOL result
-			= PostQueuedCompletionStatus(ctx->iocp_handle, bytes_transferred, 0, &op->overlapped);
-
-	if (!result) {
-		free_op(ctx, op);
-		return -EIO;
-	}
-
 	atomic_fetch_add(&ctx->active_count, 1);
+	if (!PostQueuedCompletionStatus(ctx->iocp_handle, bytes_transferred, 0, &op->overlapped)) {
+		iocp_backlog_push(ctx, op);
+	}
 	return 0;
 }
 
 /*
  * Post a completion for an op whose active_count was already reserved (armed
  * timers, link timeouts, work ops). Unlike post_synthetic_completion it
- * does not increment active_count; on PQCS failure it undoes the reservation and
- * frees the op. Must be called without timers.lock held.
+ * does not increment active_count. Must be called without timers.lock held.
  */
 static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 {
@@ -873,8 +951,7 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 	MemoryBarrier();
 
 	if (!PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, &op->overlapped)) {
-		atomic_fetch_sub(&ctx->active_count, 1);
-		free_op(ctx, op);
+		iocp_backlog_push(ctx, op);
 	}
 }
 
@@ -1751,14 +1828,7 @@ static void iocp_poller_fire(ior_ctx_iocp *ctx, iocp_poller *p, uint32_t i, SHOR
 	more->cqe_more = true;
 	more->poll_parent = op;
 	more->poll_parent_gen = op->gen;
-	if (post_synthetic_completion(ctx, more, ERROR_SUCCESS, 0) < 0) {
-		// The port refused the packet (more is freed): end the poll with
-		// this readiness rather than lose the edge.
-		iocp_poller_remove(p, i);
-		op->work_res = mask;
-		post_armed_op(ctx, op, ERROR_SUCCESS);
-		return;
-	}
+	(void) post_synthetic_completion(ctx, more, ERROR_SUCCESS, 0);
 	op->poll_held = true;
 }
 
@@ -1994,7 +2064,9 @@ static void op_to_cqe(ior_iocp_op *op)
 	op->cqe.iocp.user_data = op->user_data;
 	op->cqe.iocp.flags = op->cqe_more ? IOR_CQE_F_MORE : 0;
 
-	if (op->error_code != ERROR_SUCCESS) {
+	if (op->submit_res) {
+		op->cqe.iocp.res = op->submit_res;
+	} else if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
 	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL
 			|| op->opcode == IOR_OP_ASYNC_CANCEL || op->opcode == IOR_OP_WAITPID
@@ -2080,7 +2152,7 @@ static uint64_t boottime_now_ns(void)
  */
 static uint64_t qpc_deadline_from_timespec(const ior_timespec *ts, uint32_t flags)
 {
-	uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	uint64_t ns = ior_timespec_ns(ts);
 
 	if (!(flags & IOR_TIMEOUT_ABS)) {
 		return qpc_now_ns() + ns;
@@ -2298,14 +2370,11 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 		MemoryBarrier();
 
 		LeaveCriticalSection(&tm->lock);
-		BOOL ok = PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, &op->overlapped);
-		EnterCriticalSection(&tm->lock);
-
-		if (!ok) {
-			// timer arming already accounted for active_count; undo it if we can't publish
-			atomic_fetch_sub(&ctx->active_count, 1);
-			free_op(ctx, op);
+		if (!PostQueuedCompletionStatus(ctx->iocp_handle, 0, 0, &op->overlapped)) {
+			// Timer arming already accounted for active_count.
+			iocp_backlog_push(ctx, op);
 		}
+		EnterCriticalSection(&tm->lock);
 	}
 
 	LeaveCriticalSection(&tm->lock);
@@ -2318,8 +2387,7 @@ static int arm_timer(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_PARAMETER, 0);
 	}
 
-	if (op->timeout_ts->tv_sec < 0 || op->timeout_ts->tv_nsec < 0
-			|| op->timeout_ts->tv_nsec >= 1000000000L) {
+	if (op->timeout_ts->tv_sec < 0 || op->timeout_ts->tv_nsec < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_PARAMETER, 0);
 	}
 
@@ -2769,79 +2837,99 @@ static int start_link_next(ior_ctx_iocp *ctx, ior_iocp_op *next)
 static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	int ret;
-	switch (op->opcode) {
-		case IOR_OP_NOP:
-			return post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+	if (ior_fixed_file_bad(op->opcode, op->sqe_flags, op->cancel_flags)) {
+		op->submit_res = -EBADF; // never issued, like a failed chain's ops
+		ret = post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+	} else {
+		switch (op->opcode) {
+			case IOR_OP_NOP:
+				ret = post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+				break;
 
-		case IOR_OP_READ:
-			ret = issue_read(ctx, op);
-			break;
+			case IOR_OP_READ:
+				ret = issue_read(ctx, op);
+				break;
 
-		case IOR_OP_WRITE:
-			ret = issue_write(ctx, op);
-			break;
+			case IOR_OP_WRITE:
+				ret = issue_write(ctx, op);
+				break;
 
-		case IOR_OP_SPLICE:
-			return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+			case IOR_OP_SPLICE:
+				ret = post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+				break;
 
-		case IOR_OP_SEND:
-			ret = issue_send(ctx, op);
-			break;
+			case IOR_OP_SEND:
+				ret = issue_send(ctx, op);
+				break;
 
-		case IOR_OP_RECV:
-			ret = issue_recv(ctx, op);
-			break;
+			case IOR_OP_RECV:
+				ret = issue_recv(ctx, op);
+				break;
 
-		case IOR_OP_ACCEPT:
-			ret = issue_accept(ctx, op);
-			break;
+			case IOR_OP_ACCEPT:
+				ret = issue_accept(ctx, op);
+				break;
 
-		case IOR_OP_CONNECT:
-			ret = issue_connect(ctx, op);
-			break;
+			case IOR_OP_CONNECT:
+				ret = issue_connect(ctx, op);
+				break;
 
-		case IOR_OP_WORK:
-			// Falls through to the link-timeout arming below: a guarded work
-			// op's deadline is watched by the timer thread while the callback
-			// runs on the threadpool.
-			ret = issue_work(ctx, op);
-			break;
+			case IOR_OP_WORK:
+				// Falls through to the link-timeout arming below: a guarded work
+				// op's deadline is watched by the timer thread while the callback
+				// runs on the threadpool.
+				ret = issue_work(ctx, op);
+				break;
 
-		case IOR_OP_POLL:
-			// Like WORK, a guarded poll's deadline is watched by the timer
-			// thread, which flags the token and wakes the poller.
-			ret = issue_poll(ctx, op);
-			break;
+			case IOR_OP_POLL:
+				// Like WORK, a guarded poll's deadline is watched by the timer
+				// thread, which flags the token and wakes the poller.
+				ret = issue_poll(ctx, op);
+				break;
 
-		case IOR_OP_WAITPID:
-			// The timer thread withdraws a guarded wait at its deadline.
-			ret = issue_waitpid(ctx, op);
-			break;
+			case IOR_OP_WAITPID:
+				// The timer thread withdraws a guarded wait at its deadline.
+				ret = issue_waitpid(ctx, op);
+				break;
 
-		case IOR_OP_SIGWAIT:
-			// Likewise withdrawn from the control handler's list.
-			ret = issue_sigwait(ctx, op);
-			break;
+			case IOR_OP_SIGWAIT:
+				// Likewise withdrawn from the control handler's list.
+				ret = issue_sigwait(ctx, op);
+				break;
 
-		case IOR_OP_TIMER:
-			return arm_timer(ctx, op);
+			case IOR_OP_TIMER:
+				ret = arm_timer(ctx, op);
+				break;
 
-		case IOR_OP_ASYNC_CANCEL:
-			return issue_cancel(ctx, op);
+			case IOR_OP_ASYNC_CANCEL:
+				ret = issue_cancel(ctx, op);
+				break;
 
-		case IOR_OP_LINK_TIMEOUT:
-			// A paired link timeout is armed via its guarded op, never issued
-			// directly. Reaching here means it was unpaired - treat as a plain
-			// timeout so it still completes with -ETIME.
-			return arm_timer(ctx, op);
+			case IOR_OP_LINK_TIMEOUT:
+				// A paired link timeout is armed via its guarded op, never issued
+				// directly, and submit fails one with nothing to guard
+				// (iocp_scan_staged), so this is not reached; were it, it would
+				// still complete, as a plain timeout.
+				ret = arm_timer(ctx, op);
+				break;
 
-		default:
-			return post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+			default:
+				ret = post_synthetic_completion(ctx, op, ERROR_NOT_SUPPORTED, 0);
+				break;
+		}
 	}
 
-	// The guarded op is now in flight; arm its link-timeout watchdog.
-	if (ret == 0 && op->link_timeout) {
-		arm_link_timeout(ctx, op);
+	if (op->link_timeout) {
+		if (atomic_load(&op->state) == IOCP_OP_DONE) {
+			// Done while being issued: as on io_uring, its link timeout is
+			// cancelled rather than armed.
+			ior_iocp_op *lt = op->link_timeout;
+			op->link_timeout = NULL;
+			(void) post_synthetic_completion(ctx, lt, ERROR_OPERATION_ABORTED, 0);
+		} else if (ret == 0) {
+			// The guarded op is now in flight; arm its link-timeout watchdog.
+			arm_link_timeout(ctx, op);
+		}
 	}
 	return ret;
 }
@@ -3146,6 +3234,13 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	 * or we'll spin forever.
 	 */
 	while (atomic_load(&ctx->active_count) > 0) {
+		ior_iocp_op *kept = iocp_backlog_pop(ctx);
+		if (kept) {
+			atomic_fetch_sub(&ctx->active_count, 1);
+			free_op(ctx, kept);
+			continue;
+		}
+
 		DWORD bytes = 0;
 		ULONG_PTR key = 0;
 		LPOVERLAPPED overlapped = NULL;
@@ -3256,6 +3351,58 @@ static unsigned ior_iocp_backend_cq_space_left(void *backend_ctx)
 	return left;
 }
 
+/*
+ * Find where io_uring would stop taking the staged entries: right after one
+ * that fails the checks it makes on taking it, unless that one links on.
+ * Every op of a chain holding such an entry gets submit_res: its own error,
+ * or -ECANCELED for the rest, as io_uring fails the whole chain. Returns the
+ * position to stop at.
+ */
+static uint32_t iocp_scan_staged(ior_ctx_iocp *ctx)
+{
+	uint32_t chain_start = ctx->sq_head;
+	bool in_chain = false;
+	bool prev_lt = false;
+	bool chain_failed = false;
+
+	for (uint32_t pos = ctx->sq_head; pos != ctx->sq_tail; pos++) {
+		ior_iocp_op *op = ctx->sq_array[pos & ctx->sq_mask];
+		op->submit_res = 0;
+		if (!in_chain) {
+			chain_start = pos;
+			chain_failed = false;
+		}
+		int ret = 0;
+		if (op->opcode == IOR_OP_TIMER) {
+			ret = ior_timeout_check(op->timeout_ts, op->timeout_flags);
+		} else if (op->opcode == IOR_OP_LINK_TIMEOUT) {
+			ret = ior_link_timeout_check(op->timeout_ts, op->timeout_flags, in_chain, prev_lt);
+		} else if (op->opcode == IOR_OP_ACCEPT) {
+			ret = ior_accept_check(op->accept_flags);
+		}
+		bool link = (op->sqe_flags & IOR_SQE_IO_LINK) != 0;
+		if (ret < 0) {
+			op->submit_res = ret;
+			chain_failed = true;
+		}
+		if (chain_failed && (!link || pos + 1 == ctx->sq_tail)) {
+			for (uint32_t q = chain_start; q != pos + 1; q++) {
+				ior_iocp_op *m = ctx->sq_array[q & ctx->sq_mask];
+				if (!m->submit_res) {
+					m->submit_res = -ECANCELED;
+				}
+			}
+			chain_failed = false;
+			if (ret < 0 && !link) {
+				return pos + 1;
+			}
+		}
+		prev_lt = op->opcode == IOR_OP_LINK_TIMEOUT;
+		in_chain = link;
+	}
+	return ctx->sq_tail;
+}
+
 static int ior_iocp_backend_submit(void *backend_ctx)
 {
 	if (!backend_ctx) {
@@ -3268,8 +3415,9 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 	int last_error = 0;
 
 	ior_iocp_op *prev = NULL;
+	uint32_t bound = iocp_scan_staged(ctx);
 
-	while (ctx->sq_head != ctx->sq_tail) {
+	while (ctx->sq_head != bound) {
 		ior_iocp_op *op = ctx->sq_array[ctx->sq_head & ctx->sq_mask];
 		ctx->sq_head++;
 
@@ -3279,6 +3427,14 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		if ((op->opcode == IOR_OP_TIMER || op->opcode == IOR_OP_LINK_TIMEOUT) && op->timeout_ts) {
 			op->timeout_val = *op->timeout_ts;
 			op->timeout_ts = &op->timeout_val;
+		}
+
+		// In a failed chain: completes with submit_res, never issued.
+		if (op->submit_res) {
+			(void) post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+			submitted++;
+			prev = NULL;
+			continue;
 		}
 
 		// A link timeout already paired with its guarded op is armed when that
@@ -3417,12 +3573,7 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 		 * followed by a late byte. Coalescing to one byte per wake cycle is
 		 * what keeps the pump off the send() syscall under load.
 		 */
-		if (!p->signalled) {
-			char b = 0;
-			if (send(p->wake_tx, &b, 1, 0) == 1) {
-				p->signalled = true;
-			}
-		}
+		iocp_pump_signal_locked(p);
 		WakeConditionVariable(&p->cv);
 		LeaveCriticalSection(&p->lock);
 	}
@@ -3431,7 +3582,8 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 
 /*
  * Take one packet from staging, waiting up to timeout_ms for one to arrive
- * (0 = poll, INFINITE = forever). Returns 0, -EAGAIN (timeout 0, none) or
+ * (0 = poll, INFINITE = forever). Returns 0, -EAGAIN (timeout 0, none, or a
+ * kept completion is waiting in the backlog) or
  * -ETIMEDOUT.
  */
 static int iocp_pump_pop(ior_ctx_iocp *ctx, DWORD timeout_ms, pump_entry *out)
@@ -3440,6 +3592,11 @@ static int iocp_pump_pop(ior_ctx_iocp *ctx, DWORD timeout_ms, pump_entry *out)
 
 	EnterCriticalSection(&p->lock);
 	while (p->count == 0) {
+		if (atomic_load(&ctx->backlog_count)) {
+			// The caller's next dequeue takes it (see iocp_backlog_push).
+			LeaveCriticalSection(&p->lock);
+			return -EAGAIN;
+		}
 		if (timeout_ms == 0) {
 			LeaveCriticalSection(&p->lock);
 			return -EAGAIN;
@@ -3501,12 +3658,21 @@ static int iocp_pump_ensure(ior_ctx_iocp *ctx)
 	p->signalled = false;
 	p->wake_rx = rx;
 	p->wake_tx = tx;
-	p->thread = CreateThread(NULL, 0, iocp_pump_thread_main, ctx, 0, NULL);
-	if (!p->thread) {
+	HANDLE thread = CreateThread(NULL, 0, iocp_pump_thread_main, ctx, 0, NULL);
+	if (!thread) {
 		p->wake_rx = INVALID_SOCKET;
 		p->wake_tx = INVALID_SOCKET;
 		goto fail;
 	}
+	// Published under the lock iocp_backlog_push decides under: a completion
+	// the port refused before now is in the backlog, not the port, and its
+	// wake packet went to the port, where the pump drops it as stray.
+	EnterCriticalSection(&p->lock);
+	p->thread = thread;
+	if (atomic_load(&ctx->backlog_count)) {
+		iocp_pump_signal_locked(p);
+	}
+	LeaveCriticalSection(&p->lock);
 	return 0;
 
 fail:
@@ -3567,7 +3733,14 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	BOOL ok;
 	DWORD gle;
 
-	if (ctx->pump.thread) {
+	ior_iocp_op *kept = iocp_backlog_pop(ctx);
+	if (kept) {
+		// A synthetic completion the port refused: its result is in the op.
+		overlapped = &kept->overlapped;
+		bytes_transferred = kept->bytes_transferred;
+		gle = ERROR_SUCCESS;
+		ok = TRUE;
+	} else if (ctx->pump.thread) {
 		// The pump owns the port: take the packet it staged.
 		pump_entry e;
 		int ret = iocp_pump_pop(ctx, timeout_ms, &e);
@@ -3640,7 +3813,7 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		atomic_fetch_add(&ctx->completed_cnt, 1);
 	}
 
-	if (op->opcode == IOR_OP_ACCEPT || op->opcode == IOR_OP_CONNECT) {
+	if ((op->opcode == IOR_OP_ACCEPT || op->opcode == IOR_OP_CONNECT) && !op->submit_res) {
 		finish_socket_op(ctx, op);
 	}
 	op_to_cqe(op);
@@ -3707,7 +3880,8 @@ static int ior_iocp_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 		return submitted;
 	}
 
-	if (wait_nr == 0) {
+	// Submit stopped at a bad entry: io_uring then returns without waiting.
+	if (wait_nr == 0 || ctx->sq_head != ctx->sq_tail) {
 		return submitted;
 	}
 
@@ -3796,16 +3970,13 @@ static int ior_iocp_backend_wait_cqe_timeout(
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	// Validate the timeout and turn it into an absolute deadline so spurious
-	// (stray-packet) wakeups can resume the wait without extending it.
+	// Turn the timeout into an absolute deadline so spurious (stray-packet)
+	// wakeups can resume the wait without extending it. As on io_uring, a
+	// negative one has already expired and a tv_nsec past a second adds up.
 	int has_deadline = 0;
 	uint64_t deadline_ns = 0;
 	if (timeout) {
-		if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
-			return -EINVAL;
-		}
-		deadline_ns = qpc_now_ns() + (uint64_t) timeout->tv_sec * 1000000000ULL
-				+ (uint64_t) timeout->tv_nsec;
+		deadline_ns = qpc_now_ns() + ior_timespec_ns(timeout);
 		has_deadline = 1;
 	}
 
@@ -4082,7 +4253,8 @@ static void ior_iocp_backend_prep_accept(
 	op->fd = fd;
 	op->sa = addr;
 	op->sa_len = addrlen;
-	(void) flags; // an accepted socket is overlapped like any other
+	// Only checked at submit: an accepted socket is overlapped like any other.
+	op->accept_flags = flags;
 }
 
 static void ior_iocp_backend_prep_connect(

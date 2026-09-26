@@ -240,6 +240,9 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
 {
 	if (ctx && sqe) {
 		ctx->ops->prep_timeout(sqe, ts, count, flags);
+		if (ctx->ops->prep_checked) {
+			ctx->ops->prep_checked(ctx->backend_ctx);
+		}
 	}
 }
 
@@ -247,6 +250,9 @@ void ior_prep_link_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigne
 {
 	if (ctx && sqe) {
 		ctx->ops->prep_link_timeout(sqe, ts, flags);
+		if (ctx->ops->prep_checked) {
+			ctx->ops->prep_checked(ctx->backend_ctx);
+		}
 	}
 }
 
@@ -285,6 +291,9 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
 {
 	if (ctx && sqe) {
 		ctx->ops->prep_accept(sqe, fd, addr, addrlen, flags);
+		if (ctx->ops->prep_checked) {
+			ctx->ops->prep_checked(ctx->backend_ctx);
+		}
 	}
 }
 
