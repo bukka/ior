@@ -1312,6 +1312,54 @@ static void ior_uring_backend_destroy(void *backend_ctx)
 	free(ctx);
 }
 
+/*
+ * ior_queue_forget(): in a forked child, which shares the ring with the
+ * parent but has none of its threads. Only the child's descriptors and
+ * mappings go: io_uring_queue_exit() unmaps and closes and issues nothing
+ * to the ring (ior never registers its ring fd), and the eventfd is closed
+ * but not unregistered, which would unregister it for the parent. Wait
+ * records are changed by the caller's threads under jobs_lock: held at the
+ * fork, they were being changed, and their descriptors are left. Jobs,
+ * posts and the worker pool were the pool's threads' and are left too.
+ */
+static void ior_uring_backend_forget(void *backend_ctx)
+{
+	ior_ctx_uring *ctx = backend_ctx;
+
+	if (pthread_mutex_trylock(&ctx->jobs_lock) == 0) {
+		ior_uring_wait *wait = ctx->waits_pending;
+		while (wait) {
+			ior_uring_wait *next = wait->next;
+			if (wait->fd >= 0) {
+				close(wait->fd);
+			}
+			free(wait);
+			wait = next;
+		}
+		for (size_t b = 0; b < sizeof(ctx->waits_live) / sizeof(ctx->waits_live[0]); b++) {
+			wait = ctx->waits_live[b];
+			while (wait) {
+				ior_uring_wait *next = wait->next;
+				if (wait->fd >= 0) {
+					close(wait->fd);
+				}
+				free(wait);
+				wait = next;
+			}
+		}
+		pthread_mutex_unlock(&ctx->jobs_lock);
+	}
+	if (ctx->notify_fd >= 0) {
+		close(ctx->notify_fd);
+	}
+	if (ctx->wp) {
+		io_uring_queue_exit(&ctx->poster);
+	}
+	io_uring_queue_exit(&ctx->ring);
+	free(ctx->sq_failed);
+	free(ctx);
+}
+
 static int ior_uring_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 {
 	if (!backend_ctx) {
@@ -1977,6 +2025,7 @@ static uint32_t ior_uring_backend_get_features(void *backend_ctx)
 const ior_backend_ops ior_uring_ops = {
 	.init = ior_uring_backend_init,
 	.destroy = ior_uring_backend_destroy,
+	.forget = ior_uring_backend_forget,
 	.get_sqe = ior_uring_backend_get_sqe,
 	.submit = ior_uring_backend_submit,
 	.submit_and_wait = ior_uring_backend_submit_and_wait,

@@ -419,6 +419,11 @@ int ior_threads_poller_cancel(ior_threads_poller *poller, void *req)
 	return 0;
 }
 
+void ior_threads_poller_forget(ior_threads_poller *poller)
+{
+	ior_threads_event_destroy(&poller->event);
+}
+
 void ior_threads_poller_destroy(ior_threads_poller *poller)
 {
 	if (!poller) {

@@ -601,6 +601,22 @@ int ior_threads_poller_cancel(ior_threads_poller *poller, void *req)
 	return 0;
 }
 
+void ior_threads_poller_forget(ior_threads_poller *poller)
+{
+	// A multishot node owns a dup of its descriptor.
+	if (pthread_mutex_trylock(&poller->lock) == 0) {
+		for (ior_poller_fd_node *node = poller->fds; node; node = node->next) {
+			if (node->multi && !node->proc) {
+				close(node->fd);
+			}
+		}
+		pthread_mutex_unlock(&poller->lock);
+	}
+	ior_threads_event_destroy(&poller->event);
+	/* A kqueue is not inherited: the child has no descriptor to close, and
+	 * the number may be one of its own by now. */
+}
+
 void ior_threads_poller_destroy(ior_threads_poller *poller)
 {
 	if (!poller) {

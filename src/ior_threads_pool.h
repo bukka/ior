@@ -222,6 +222,7 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool);
 
 // Shutdown pool and wait for all threads to finish
 void ior_threads_pool_destroy(ior_threads_pool *pool);
+void ior_threads_pool_forget(ior_threads_pool *pool);
 
 /*
  * Promise a CQ slot (see cq_pending): 0, or -EBUSY when every slot is

@@ -388,10 +388,12 @@ static int ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 		res = -ECANCELED;
 	}
 
-	// The poller has dropped its registration: the pidfd has served.
+	// The poller has dropped its registration: the pidfd has served. Cleared
+	// before it is closed, so a fork never sees a number that is not ours.
 	if (w->pidfd >= 0) {
-		close(w->pidfd);
+		int pidfd = w->pidfd;
 		w->pidfd = -1;
+		close(pidfd);
 	}
 
 	/*
@@ -511,6 +513,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	}
 	for (uint32_t i = 0; i < pool->work_cap; i++) {
 		atomic_init(&pool->work_items[i].state, IOR_WORK_FREE);
+		pool->work_items[i].pidfd = -1;
 		pool->work_items[i].next = pool->work_free;
 		pool->work_free = &pool->work_items[i];
 	}
@@ -747,6 +750,29 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 		atomic_fetch_add(&pool->tasks_completed, done);
 	}
 	return p - consumed;
+}
+
+/*
+ * ior_queue_forget() in a forked child: close the pool's descriptors (the
+ * pidfds of parked process waits, the poller's) and nothing else. The
+ * pool, its worker pool and its locks were its threads', which the child
+ * does not have, and are left.
+ */
+void ior_threads_pool_forget(ior_threads_pool *pool)
+{
+	if (!pool) {
+		return;
+	}
+	for (uint32_t i = 0; i < pool->work_cap; i++) {
+		int pidfd = pool->work_items[i].pidfd;
+		if (pidfd >= 0) {
+			close(pidfd);
+		}
+	}
+	ior_threads_poller *poller = atomic_load_explicit(&pool->poller, memory_order_acquire);
+	if (poller) {
+		ior_threads_poller_forget(poller);
+	}
 }
 
 void ior_threads_pool_destroy(ior_threads_pool *pool)
@@ -1282,8 +1308,8 @@ static int ior_threads_pool_watch_proc(ior_threads_pool *pool, ior_work *w, ior_
 	w->pidfd = pidfd;
 	int ret = ior_threads_pool_hand_to_poller(pool, w, lt, pidfd, IOR_POLL_IN);
 	if (ret < 0) {
-		close(pidfd);
 		w->pidfd = -1;
+		close(pidfd);
 	}
 	return ret;
 #else
