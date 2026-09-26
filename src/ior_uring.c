@@ -93,6 +93,8 @@ typedef struct ior_ctx_uring {
 	 * kernel will fail, so no userspace work may be done for it.
 	 */
 	uint8_t *sq_failed;
+	int sq_any_failed; // some byte of sq_failed is set, for this submit only
+	int sq_needs_scan; // an entry submit checks may be staged (prep_checked)
 } ior_ctx_uring;
 
 struct ior_uring_wait {
@@ -460,6 +462,9 @@ static unsigned ior_uring_sq_pos(ior_ctx_uring *ctx, const struct io_uring_sqe *
 static unsigned ior_uring_scan_staged(ior_ctx_uring *ctx)
 {
 	struct io_uring_sq *sq = &ctx->ring.sq;
+	if (!ctx->sq_needs_scan) {
+		return sq->sqe_tail; // nothing staged that could fail the checks
+	}
 	unsigned mask = sq->ring_entries - 1;
 	unsigned chain_start = sq->sqe_head;
 	int in_chain = 0;
@@ -468,7 +473,6 @@ static unsigned ior_uring_scan_staged(ior_ctx_uring *ctx)
 
 	for (unsigned pos = sq->sqe_head; pos != sq->sqe_tail; pos++) {
 		const struct io_uring_sqe *s = &sq->sqes[pos & mask];
-		ctx->sq_failed[pos & mask] = 0;
 		if (!in_chain) {
 			chain_start = pos;
 			chain_failed = 0;
@@ -491,15 +495,22 @@ static unsigned ior_uring_scan_staged(ior_ctx_uring *ctx)
 			for (unsigned q = chain_start; q != pos + 1; q++) {
 				ctx->sq_failed[q & mask] = 1;
 			}
+			ctx->sq_any_failed = 1;
 			chain_failed = 0;
 			if (ret < 0 && !link) {
-				return pos + 1;
+				return pos + 1; // what is left stays staged: scanned again next time
 			}
 		}
 		prev_lt = s->opcode == IORING_OP_LINK_TIMEOUT;
 		in_chain = link;
 	}
+	ctx->sq_needs_scan = 0;
 	return sq->sqe_tail;
+}
+
+static void ior_uring_backend_prep_checked(void *backend_ctx)
+{
+	((ior_ctx_uring *) backend_ctx)->sq_needs_scan = 1;
 }
 
 static void ior_uring_dispatch_waits(ior_ctx_uring *ctx, unsigned bound)
@@ -722,7 +733,7 @@ static void ior_uring_dispatch_pending(ior_ctx_uring *ctx, unsigned bound)
 			ctx->pending_tail = job;
 			continue;
 		}
-		if (ctx->sq_failed[at & mask]) {
+		if (ctx->sq_any_failed && ctx->sq_failed[at & mask]) {
 			/* The kernel fails the placeholder NOP with the rest of its
 			 * chain, and that is the op's completion: never run it. */
 			free(job);
@@ -861,7 +872,8 @@ static void ior_uring_intercept_cancels(ior_ctx_uring *ctx, unsigned bound)
 
 	for (unsigned pos = sq->sqe_head; pos != bound; pos++) {
 		struct io_uring_sqe *s = &sq->sqes[pos & mask];
-		if (s->opcode != IORING_OP_ASYNC_CANCEL || ctx->sq_failed[pos & mask]) {
+		if (s->opcode != IORING_OP_ASYNC_CANCEL
+				|| (ctx->sq_any_failed && ctx->sq_failed[pos & mask])) {
 			continue;
 		}
 		if (s->cancel_flags & IORING_ASYNC_CANCEL_FD) {
@@ -1168,9 +1180,17 @@ static int ior_uring_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr
 		ior_uring_poster_retry(ctx);
 	}
 	int slow = wait_nr && atomic_load(&ctx->post_queued);
+	unsigned head = sq->sqe_head;
 	sq->sqe_tail = bound;
 	int ret = io_uring_submit_and_wait(&ctx->ring, slow ? 0 : wait_nr);
 	sq->sqe_tail = tail;
+	if (ctx->sq_any_failed) {
+		// Marks are only set on a failed chain; drop them with it.
+		for (unsigned q = head; q != bound; q++) {
+			ctx->sq_failed[q & (sq->ring_entries - 1)] = 0;
+		}
+		ctx->sq_any_failed = 0;
+	}
 	if (slow && ret >= 0) {
 		// A refused post is queued: wait in slices that retry it.
 		struct io_uring_cqe *cqe;
@@ -1215,7 +1235,10 @@ static int ior_uring_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe *cqe;
-	int ret = ior_uring_wait_cqes(ctx, &cqe, 1, NULL);
+	// The inline peek of io_uring_wait_cqe unless a post is held back.
+	int ret = atomic_load_explicit(&ctx->post_live, memory_order_relaxed)
+			? ior_uring_wait_cqes(ctx, &cqe, 1, NULL)
+			: io_uring_wait_cqe(&ctx->ring, &cqe);
 
 	if (ret < 0) {
 		return ret;
@@ -1236,7 +1259,17 @@ static int ior_uring_backend_wait_cqe_timeout(
 	ior_ctx_uring *ctx = backend_ctx;
 	struct io_uring_cqe *cqe;
 
-	int ret = ior_uring_wait_cqes(ctx, &cqe, 1, timeout);
+	int ret;
+	if (timeout && !atomic_load_explicit(&ctx->post_live, memory_order_relaxed)) {
+		uint64_t ns = ior_timespec_ns(timeout);
+		struct __kernel_timespec kts = {
+			.tv_sec = (long long) (ns / 1000000000ULL),
+			.tv_nsec = (long long) (ns % 1000000000ULL),
+		};
+		ret = io_uring_wait_cqe_timeout(&ctx->ring, &cqe, &kts);
+	} else {
+		ret = ior_uring_wait_cqes(ctx, &cqe, 1, timeout);
+	}
 
 	if (ret < 0) {
 		return ret;
@@ -1732,6 +1765,7 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_poll_add = ior_uring_backend_prep_poll_add,
 	.prep_poll_multishot = ior_uring_backend_prep_poll_multishot,
 	.prep_accept = ior_uring_backend_prep_accept,
+	.prep_checked = ior_uring_backend_prep_checked,
 	.prep_connect = ior_uring_backend_prep_connect,
 	.prep_cancel = ior_uring_backend_prep_cancel,
 	.prep_cancel_fd = ior_uring_backend_prep_cancel_fd,

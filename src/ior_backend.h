@@ -202,6 +202,9 @@ typedef struct ior_backend_ops {
 	/* Optional (NULL = work ops unsupported). Takes backend_ctx because some
 	 * backends record per-op state beyond the SQE (e.g. io_uring's job list). */
 	int (*prep_work)(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg);
+	/* Optional: an entry of a kind submit checks (timeout, link timeout,
+	 * accept) was prepped. Lets io_uring skip its scan when none was. */
+	void (*prep_checked)(void *backend_ctx);
 	void (*sqe_set_data)(ior_sqe *sqe, void *data);
 	void (*sqe_set_flags)(ior_sqe *sqe, uint8_t flags);
 
