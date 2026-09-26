@@ -42,6 +42,12 @@ static int ior_threads_pool_timer_valid(const ior_work *work);
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
 static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res);
 static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self);
+static uint64_t ior_threads_pool_lt_deadline(const ior_work *lt);
+static int ior_threads_pool_lt_guards(uint8_t opcode);
+static void ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *w, ior_work *lt);
+static int32_t ior_threads_pool_lt_arb_settle_locked(struct ior_threads_pool_lt_arb *arb);
+static void ior_threads_pool_lt_arb_drop(
+		ior_threads_pool *pool, struct ior_threads_pool_lt_arb *arb);
 #ifndef IOR_HAVE_SPLICE
 static ssize_t ior_threads_pool_emulate_splice(
 		int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags);
@@ -608,6 +614,11 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 		} else if (opcode == IOR_OP_LINK_TIMEOUT) {
 			w->fail_res = ior_link_timeout_check(ts, w->sqe.threads.timeout_flags, prev_link,
 					prev_link && prev->sqe.threads.opcode == IOR_OP_LINK_TIMEOUT);
+			// A chain head's deadline runs from submit, as on io_uring.
+			if (w->fail_res == 0 && prev_link && prev == head
+					&& !(head->sqe.threads.flags & IOR_SQE_IO_DRAIN)) {
+				head->deadline_ns = ior_threads_pool_lt_deadline(w);
+			}
 		} else if (opcode == IOR_OP_ACCEPT) {
 			w->fail_res = ior_accept_check(w->sqe.threads.rw_flags);
 		}
@@ -615,6 +626,7 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 		w->chain = NULL;
 		w->cur_token = NULL;
 		w->deadline_ns = 0;
+		w->arb = NULL;
 		w->ready = 0;
 		w->fdmode = 0;
 		w->rw_plain = IOR_RW_NOWAIT;
@@ -679,6 +691,16 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 			if (w->fail_res < 0 && !has_link) {
 				break;
 			}
+		}
+	}
+
+	/* A head that may hold its worker gets its link timeout armed now: the
+	 * timer takes it off the FIFO if the deadline passes before a worker
+	 * is free. */
+	for (ior_worker_pool_job *j = first; j; j = j->next) {
+		ior_work *h = (ior_work *) ((char *) j - offsetof(ior_work, job));
+		if (h->deadline_ns && ior_threads_pool_lt_guards(h->sqe.threads.opcode)) {
+			ior_threads_pool_lt_arb_arm(pool, h, h->chain);
 		}
 	}
 
@@ -979,8 +1001,22 @@ static int ior_threads_pool_hand_to_poller(
 		return -ENOMEM;
 	}
 
+	/* A process wait armed against holding its worker hands its deadline
+	 * to the poller, unless the timer claimed the op first. */
+	struct ior_threads_pool_lt_arb *arb = NULL;
+	int ret = 0;
 	pthread_mutex_lock(&pool->work_lock);
-	int ret = ior_threads_pool_enter(w, IOR_WORK_POLLING);
+	if (w->arb) {
+		if (ior_threads_pool_lt_arb_settle_locked(w->arb) == -ECANCELED) {
+			arb = w->arb;
+			w->arb = NULL;
+		} else {
+			ret = -ECANCELED;
+		}
+	}
+	if (ret == 0) {
+		ret = ior_threads_pool_enter(w, IOR_WORK_POLLING);
+	}
 	if (ret == 0) {
 		w->ready = 0;
 		ret = ior_threads_poller_add(poller, fd, mask, w->deadline_ns, w);
@@ -990,20 +1026,36 @@ static int ior_threads_pool_hand_to_poller(
 		}
 	}
 	pthread_mutex_unlock(&pool->work_lock);
+	ior_threads_pool_lt_arb_drop(pool, arb);
 	return ret;
 }
 
 /*
- * Arbitration node for a work op guarded by a link timeout. Heap-allocated and
- * shared between the worker running the callback and the timer thread: `state`
- * decides how the link timeout resolves, the embedded token lets the callback
- * observe a fired deadline, and the refcount (worker + timer) keeps the node
- * alive until whichever side finishes last - the timer always fires or is
- * dropped eventually, even if the pair completed long before.
+ * Arbitration node for an op that may hold its worker (a work callback, a
+ * signal wait, a blocking process wait) guarded by a link timeout.
+ * Heap-allocated and shared between the worker and the timer thread: `state`
+ * decides who completes the link timeout and how, the embedded token lets a
+ * callback observe a fired deadline, and the refcount (worker + timer) keeps
+ * the node alive until whichever side finishes last - the timer always fires
+ * or is dropped eventually, even if the pair completed long before.
+ *
+ * A chain head is armed at submit, so its deadline runs while it waits in the
+ * FIFO, as on io_uring; the timer then takes a chain still queued off the
+ * FIFO and completes it. Any other op is armed when its worker reaches it.
  */
+enum {
+	IOR_LT_ARMED = 0, // unresolved: the timer may still act on w
+	IOR_LT_WORKER, // the op got there first: the worker posts -ECANCELED
+	IOR_LT_FIRED, // stopped at the deadline: the worker posts -ETIME
+	IOR_LT_POSTED, // the timer completed the link timeout itself
+};
+
 typedef struct ior_threads_pool_lt_arb {
 	struct ior_work_token token;
-	_Atomic int state; /* 0 = armed, 1 = callback finished first, 2 = timer fired first */
+	ior_work *w; // the guarded op, valid under work_lock while ARMED
+	ior_work *lt;
+	int stoppable; // the op ends once its token is flagged (a signal wait)
+	_Atomic int state; // IOR_LT_*
 	_Atomic int refs;
 } ior_threads_pool_lt_arb;
 
@@ -1014,17 +1066,70 @@ static void ior_threads_pool_lt_arb_release(ior_threads_pool_lt_arb *arb)
 	}
 }
 
-// Timer-thread side: flag the token and claim the "fired first" outcome. Late
-// firings (callback already resolved the pair) only touch the private node.
+static int ior_threads_pool_lt_guards(uint8_t opcode)
+{
+	return opcode == IOR_OP_WORK || opcode == IOR_OP_SIGWAIT || opcode == IOR_OP_WAITPID;
+}
+
+/*
+ * Timer side. Under work_lock, and while the worker has not resolved the
+ * pair, w is still in flight (its finish takes work_lock), so its state says
+ * what the deadline does: a chain still in the FIFO is taken off and
+ * completed here, an op not started yet is claimed so it completes as
+ * cancelled, and one that holds its worker gets its token flagged and, as a
+ * link timeout on a running io_uring request, the link timeout completes now
+ * with the cancel's -EALREADY while the op completes when it returns.
+ */
 static void ior_threads_pool_lt_fired(void *owner, void *arg)
 {
-	(void) owner;
+	ior_threads_pool *pool = owner;
 	ior_threads_pool_lt_arb *arb = arg;
+	ior_work *taken = NULL;
+	int post_lt = 0;
 
-	atomic_store_explicit(&arb->token.cancelled, 1, memory_order_release);
-	int expected = 0;
-	atomic_compare_exchange_strong(&arb->state, &expected, 2);
+	pthread_mutex_lock(&pool->work_lock);
+	ior_work *w = arb->w;
+	while (atomic_load_explicit(&arb->state, memory_order_acquire) == IOR_LT_ARMED) {
+		int state = atomic_load_explicit(&w->state, memory_order_acquire);
+		int expected = IOR_LT_ARMED;
+		if (state == IOR_WORK_QUEUED && ior_worker_pool_cancel_job(pool->wp, &w->job) == 0) {
+			for (ior_work *m = w; m; m = m->chain) {
+				atomic_store_explicit(&m->state, IOR_WORK_CANCELLED, memory_order_release);
+			}
+			atomic_store(&arb->state, IOR_LT_POSTED);
+			taken = w;
+			break;
+		}
+		if (state == IOR_WORK_QUEUED || state == IOR_WORK_LINKED || state == IOR_WORK_TRYING) {
+			// Popped but not started, or a probe that may not park now.
+			if (atomic_compare_exchange_strong(&w->state, &state, IOR_WORK_CANCELLED)) {
+				atomic_compare_exchange_strong(&arb->state, &expected, IOR_LT_FIRED);
+				break;
+			}
+			continue;
+		}
+		if (state == IOR_WORK_RUNNING) {
+			// A signal wait ends at its next slice; the worker reports it.
+			atomic_store_explicit(&arb->token.cancelled, 1, memory_order_release);
+			int to = arb->stoppable ? IOR_LT_FIRED : IOR_LT_POSTED;
+			post_lt = atomic_compare_exchange_strong(&arb->state, &expected, to) && !arb->stoppable;
+		}
+		// Anything else (claimed by a cancel) resolves as the op ends.
+		break;
+	}
+	pthread_mutex_unlock(&pool->work_lock);
 
+	if (taken) {
+		ior_work *rest = arb->lt->chain;
+		ior_threads_pool_finish_res(pool, taken, -ECANCELED);
+		ior_threads_pool_finish_res(pool, arb->lt, -ETIME);
+		uint64_t count = 2 + ior_threads_pool_cancel_chain(pool, rest);
+		atomic_fetch_add(&pool->tasks_completed, count);
+		ior_threads_pool_lt_arb_release(arb); // the worker's, which never came
+	} else if (post_lt) {
+		ior_threads_pool_finish_res(pool, arb->lt, -EALREADY);
+		atomic_fetch_add(&pool->tasks_completed, 1);
+	}
 	ior_threads_pool_lt_arb_release(arb);
 }
 
@@ -1036,27 +1141,31 @@ static void ior_threads_pool_lt_dropped(void *owner, void *arg)
 }
 
 /*
- * Arm the deadline of a link timeout guarding a work op. The callback cannot
- * be poll-gated or killed, so the deadline only flags the token so it can
- * return early; returns the arbitration node (this worker's ref), or NULL
- * when there is no valid deadline (NULL/invalid ts, alloc failure), in which
- * case the pair degrades to "op finished first", like an unbounded poll gate.
+ * Arm the deadline of the link timeout lt guarding w, leaving w->arb (this
+ * worker's ref) and the token its callback observes. w->arb stays NULL when
+ * there is no valid deadline (NULL/invalid ts, alloc failure): the pair then
+ * degrades to "op finished first", like an unbounded poll gate. Called under
+ * work_lock at submit, or by the worker that reached w.
  */
-static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *lt)
+static void ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *w, ior_work *lt)
 {
+	w->cur_token = w->sqe.threads.opcode == IOR_OP_WAITPID ? NULL : &w->token;
 	const ior_timespec *ts = ior_threads_pool_ts(lt);
 	if (!ior_threads_pool_ts_valid(ts)) {
-		return NULL;
+		return;
 	}
 
 	ior_threads_pool_lt_arb *arb = calloc(1, sizeof(*arb));
 	if (!arb) {
-		return NULL;
+		return;
 	}
 	atomic_init(&arb->token.cancelled, 0);
 	arb->token.shutdown = &pool->wp->shutdown;
-	atomic_init(&arb->state, 0);
-	atomic_init(&arb->refs, 2); // this worker + the timer thread
+	arb->w = w;
+	arb->lt = lt;
+	arb->stoppable = w->sqe.threads.opcode == IOR_OP_SIGWAIT;
+	atomic_init(&arb->state, IOR_LT_ARMED);
+	atomic_init(&arb->refs, 2); // the worker + the timer thread
 
 	uint64_t deadline_ns = ior_worker_pool_deadline_ns(ts, lt->sqe.threads.timeout_flags);
 
@@ -1064,9 +1173,81 @@ static ior_threads_pool_lt_arb *ior_threads_pool_lt_arb_arm(ior_threads_pool *po
 				pool->wp, deadline_ns, ior_threads_pool_lt_fired, ior_threads_pool_lt_dropped, arb)
 			< 0) {
 		free(arb);
-		return NULL;
+		return;
 	}
-	return arb;
+	w->arb = arb;
+	if (w->cur_token) {
+		w->cur_token = &arb->token;
+	}
+}
+
+/*
+ * Settle who completes the link timeout. Returns the result the worker posts
+ * it with (-ECANCELED, or -ETIME after a deadline that stopped the op), or 0
+ * when the timer posted it already. Idempotent. Under work_lock, as the timer
+ * claims the op and records the deadline in one critical section: settled in
+ * between, an op the timer stopped would look finished first.
+ */
+static int32_t ior_threads_pool_lt_arb_settle_locked(ior_threads_pool_lt_arb *arb)
+{
+	if (!arb) {
+		return -ECANCELED;
+	}
+	int expected = IOR_LT_ARMED;
+	if (atomic_compare_exchange_strong(&arb->state, &expected, IOR_LT_WORKER)) {
+		return -ECANCELED;
+	}
+	switch (expected) {
+		case IOR_LT_WORKER:
+			return -ECANCELED;
+		case IOR_LT_FIRED:
+			return -ETIME;
+		default:
+			return 0;
+	}
+}
+
+static int32_t ior_threads_pool_lt_arb_settle(ior_threads_pool *pool, ior_threads_pool_lt_arb *arb)
+{
+	if (!arb) {
+		return -ECANCELED;
+	}
+	pthread_mutex_lock(&pool->work_lock);
+	int32_t res = ior_threads_pool_lt_arb_settle_locked(arb);
+	pthread_mutex_unlock(&pool->work_lock);
+	return res;
+}
+
+// Drop the worker's ref once w is retired: until then a cancel may still flag
+// the token through w->cur_token.
+static void ior_threads_pool_lt_arb_done(ior_threads_pool_lt_arb *arb)
+{
+	if (arb) {
+		ior_threads_pool_lt_arb_release(arb);
+	}
+}
+
+// Drop a settled node taken off its op: the timer's ref too, if it can still
+// be disarmed (a firing timer finds it settled and drops its own).
+static void ior_threads_pool_lt_arb_drop(ior_threads_pool *pool, ior_threads_pool_lt_arb *arb)
+{
+	if (!arb) {
+		return;
+	}
+	if (ior_worker_pool_cancel_timer(pool->wp, arb) == 0) {
+		ior_threads_pool_lt_arb_release(arb);
+	}
+	ior_threads_pool_lt_arb_release(arb);
+}
+
+// Complete the link timeout of a guarded op as settled (nothing if posted).
+static uint64_t ior_threads_pool_lt_finish(ior_threads_pool *pool, ior_work *lt, int32_t res)
+{
+	if (res == 0) {
+		return 0;
+	}
+	ior_threads_pool_finish_res(pool, lt, res);
+	return 1;
 }
 
 /*
@@ -1142,37 +1323,6 @@ static int32_t ior_threads_pool_waitpid(
 		r = waitpid(pid, status, options);
 	} while (r < 0 && errno == EINTR);
 	return r < 0 ? -errno : r;
-}
-
-/*
- * Run a work op guarded by a link timeout whose deadline `arb` (may be NULL)
- * was armed by ior_threads_pool_lt_arb_arm. Resolution (matching io_uring):
- *   - callback finishes first: work res = callback's return, LT = -ECANCELED;
- *   - deadline fires while the callback runs: work res = callback's return
- *     (posted when it returns), LT = -ETIME.
- * Returns non-zero if the deadline fired. The worker's arb ref is not
- * dropped here.
- */
-static int ior_threads_pool_process_work_timed(ior_threads_pool *pool, ior_work *w, ior_work *lt,
-		ior_threads_pool_lt_arb *arb, ior_cqe *gcqe, ior_cqe *lcqe)
-{
-	ior_threads_pool_process_single_sqe(pool, w, gcqe, w->cur_token);
-
-	int fired = 0;
-	if (arb) {
-		int expected = 0;
-		if (!atomic_compare_exchange_strong(&arb->state, &expected, 1)) {
-			fired = 1; // timer thread claimed the deadline while the callback ran
-		}
-		// The caller drops the worker's ref once w is retired: until then a
-		// cancel may still flag the token through w->cur_token.
-	}
-
-	memset(lcqe, 0, sizeof(*lcqe));
-	lcqe->threads.user_data = lt->sqe.threads.user_data;
-	lcqe->threads.res = fired ? -ETIME : -ECANCELED;
-
-	return fired;
 }
 
 /*
@@ -1277,6 +1427,10 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 
 		// A process wait: probe, park on the poller, or hold this worker.
 		if (opcode == IOR_OP_WAITPID) {
+			// Resumed by the poller: the deadline was handed over to it.
+			if (lt && !w->arb && !w->ready) {
+				ior_threads_pool_lt_arb_arm(pool, w, lt);
+			}
 			int32_t res;
 			int parked = 0;
 			if (ior_threads_pool_enter(w, IOR_WORK_TRYING) < 0) {
@@ -1288,11 +1442,13 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 					return;
 				}
 			}
+			ior_threads_pool_lt_arb *arb = w->arb;
+			int32_t lt_res = lt ? ior_threads_pool_lt_arb_settle(pool, arb) : 0;
 			ior_threads_pool_finish_res(pool, w, res);
 			count++;
+			ior_threads_pool_lt_arb_done(arb);
 			if (lt) {
-				ior_threads_pool_finish_res(pool, lt, -ECANCELED);
-				count++;
+				count += ior_threads_pool_lt_finish(pool, lt, lt_res);
 			}
 			if (has_link && res < 0) {
 				cancel = 1;
@@ -1372,35 +1528,33 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 
 		/*
 		 * A guarded work op cannot be poll-gated: the callback runs on this
-		 * worker while the timer thread arbitrates the deadline and flags
-		 * the token so the callback can bail out. A signal wait is the same
-		 * shape: its worker checks the token between slices.
+		 * worker while the timer thread arbitrates the deadline, flags the
+		 * token so the callback can bail out and completes the link timeout
+		 * itself (see ior_threads_pool_lt_fired). A signal wait is the same
+		 * shape, except that it stops at its next slice once flagged.
 		 */
 		if (lt && (opcode == IOR_OP_WORK || opcode == IOR_OP_SIGWAIT)) {
-			ior_cqe gcqe, lcqe;
-			ior_threads_pool_lt_arb *arb = ior_threads_pool_lt_arb_arm(pool, lt);
-			// An async cancel flags this token (w stays RUNNING, and this
+			if (!w->arb) {
+				ior_threads_pool_lt_arb_arm(pool, w, lt);
+			}
+			ior_threads_pool_lt_arb *arb = w->arb;
+			ior_cqe gcqe;
+			// An async cancel flags w->cur_token (w stays RUNNING, and this
 			// worker holds arb, until the callback returns).
-			w->cur_token = arb ? &arb->token : &w->token;
 			if (ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0) {
 				memset(&gcqe, 0, sizeof(gcqe));
 				gcqe.threads.user_data = w->sqe.threads.user_data;
 				gcqe.threads.res = -ECANCELED;
-				memset(&lcqe, 0, sizeof(lcqe));
-				lcqe.threads.user_data = lt->sqe.threads.user_data;
-				lcqe.threads.res = -ECANCELED;
 			} else {
-				ior_threads_pool_process_work_timed(pool, w, lt, arb, &gcqe, &lcqe);
+				ior_threads_pool_process_single_sqe(pool, w, &gcqe, w->cur_token);
 			}
+			int32_t lt_res = ior_threads_pool_lt_arb_settle(pool, arb);
 			int failed = gcqe.threads.res < 0;
 			ior_threads_pool_finish_op(pool, w, &gcqe);
-			if (arb) {
-				// Only now: a cancel dereferences w->cur_token under work_lock
-				// while w is RUNNING, and finish_op took that lock to retire w.
-				ior_threads_pool_lt_arb_release(arb);
-			}
-			ior_threads_pool_finish_op(pool, lt, &lcqe);
-			count += 2;
+			// Only now: a cancel dereferences w->cur_token under work_lock
+			// while w is RUNNING, and finish_op took that lock to retire w.
+			ior_threads_pool_lt_arb_done(arb);
+			count += 1 + ior_threads_pool_lt_finish(pool, lt, lt_res);
 
 			if (failed) {
 				cancel = 1; // a failed linked op breaks the chain
@@ -1904,9 +2058,15 @@ static int ior_threads_pool_cancel_one(ior_threads_pool *pool, ior_work *w, ior_
 		switch (state) {
 			case IOR_WORK_QUEUED:
 				if (ior_worker_pool_cancel_job(pool->wp, &w->job) == 0) {
-					// The chain is ours now: no worker will touch it.
+					// The chain is ours now: no worker will touch it, and
+					// its link timeout completes as cancelled with it.
 					for (ior_work *m = w; m; m = m->chain) {
 						atomic_store_explicit(&m->state, IOR_WORK_CANCELLED, memory_order_release);
+					}
+					if (w->arb) {
+						(void) ior_threads_pool_lt_arb_settle_locked(w->arb);
+						ior_threads_pool_lt_arb_drop(pool, w->arb);
+						w->arb = NULL;
 					}
 					w->next = *done;
 					*done = w;

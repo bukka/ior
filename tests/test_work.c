@@ -51,8 +51,8 @@ static int work_supported(ior_ctx *ctx)
 	if (ior_get_features(ctx) & IOR_FEAT_WORK) {
 		return 1;
 	}
-	print_message("IOR_FEAT_WORK not supported by backend %s - skipping\n",
-			ior_get_backend_name(ctx));
+	print_message(
+			"IOR_FEAT_WORK not supported by backend %s - skipping\n", ior_get_backend_name(ctx));
 	return 0;
 }
 
@@ -329,8 +329,9 @@ static int32_t work_cancellable_fn(ior_work_token *token, void *arg)
 
 /*
  * Deadline fires while the callback runs: the callback cannot be killed, but
- * the token is flagged so it can return early; the link timeout reports -ETIME
- * and the work op reports whatever the callback returned after bailing out.
+ * the token is flagged so it can return early; the link timeout reports
+ * -EALREADY and the work op reports whatever the callback returned after
+ * bailing out.
  */
 static void test_work_lt_fires_while_running(void **state)
 {
@@ -358,10 +359,118 @@ static void test_work_lt_fires_while_running(void **state)
 	reap_pair(s->ctx, &res_op, &res_tmo);
 
 	assert_int_equal(res_op, -ECANCELED); // callback observed the token
-	assert_true(res_tmo == -ETIME || res_tmo == -ETIMEDOUT);
+	assert_int_equal(res_tmo, -EALREADY);
 }
 
-// ===== Cancel-before-start (io_uring backend) =====
+static int32_t work_ignore_token_fn(ior_work_token *token, void *arg)
+{
+	(void) token;
+	(void) arg;
+	work_msleep(400);
+	return 5;
+}
+
+/*
+ * A callback that never looks at its token still gives the caller control
+ * back at the deadline: the link timeout completes then, with -EALREADY, and
+ * the work op only once the callback returned, with its result.
+ */
+static void test_work_lt_returns_at_deadline(void **state)
+{
+	work_state *s = (work_state *) *state;
+	if (!work_supported(s->ctx)) {
+		return;
+	}
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	assert_return_code(ior_prep_work(s->ctx, w, work_ignore_token_fn, NULL), 0);
+	ior_sqe_set_data(s->ctx, w, TAG_OP);
+	ior_sqe_set_flags(s->ctx, w, IOR_SQE_IO_LINK);
+
+	ior_sqe *t = ior_get_sqe(s->ctx);
+	assert_non_null(t);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50ms
+	ior_prep_link_timeout(s->ctx, t, &ts, 0);
+	ior_sqe_set_data(s->ctx, t, TAG_TMO);
+
+	uint64_t start = test_monotonic_now_ns();
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	ior_cqe *cqe = NULL;
+	int ret;
+	do {
+		ret = ior_wait_cqe(s->ctx, &cqe);
+	} while (ret == -EAGAIN || ret == -EINTR);
+	assert_return_code(ret, 0);
+	assert_ptr_equal(ior_cqe_get_data(s->ctx, cqe), TAG_TMO);
+	assert_int_equal(ior_cqe_get_res(s->ctx, cqe), -EALREADY);
+	ior_cqe_seen(s->ctx, cqe);
+	assert_true(test_monotonic_now_ns() - start < 300000000ULL);
+
+	do {
+		ret = ior_wait_cqe(s->ctx, &cqe);
+	} while (ret == -EAGAIN || ret == -EINTR);
+	assert_return_code(ret, 0);
+	assert_ptr_equal(ior_cqe_get_data(s->ctx, cqe), TAG_OP);
+	assert_int_equal(ior_cqe_get_res(s->ctx, cqe), 5);
+	ior_cqe_seen(s->ctx, cqe);
+	assert_true(test_monotonic_now_ns() - start >= 350000000ULL);
+}
+
+static int32_t work_short_fn(ior_work_token *token, void *arg)
+{
+	(void) token;
+	atomic_fetch_add((_Atomic int *) arg, 1);
+	work_msleep(1);
+	return 3;
+}
+
+/*
+ * Deadlines around the start and the end of a short callback: each pair
+ * resolves one of the three ways, and a callback that never ran is never
+ * reported as run.
+ */
+static void test_work_lt_race(void **state)
+{
+	work_state *s = (work_state *) *state;
+	if (!work_supported(s->ctx)) {
+		return;
+	}
+
+	for (int round = 0; round < 200; round++) {
+		_Atomic int ran;
+		atomic_init(&ran, 0);
+
+		ior_sqe *w = ior_get_sqe(s->ctx);
+		assert_non_null(w);
+		assert_return_code(ior_prep_work(s->ctx, w, work_short_fn, &ran), 0);
+		ior_sqe_set_data(s->ctx, w, TAG_OP);
+		ior_sqe_set_flags(s->ctx, w, IOR_SQE_IO_LINK);
+
+		ior_sqe *t = ior_get_sqe(s->ctx);
+		assert_non_null(t);
+		ior_timespec ts = { .tv_sec = 0, .tv_nsec = (round % 10) * 150000L };
+		ior_prep_link_timeout(s->ctx, t, &ts, 0);
+		ior_sqe_set_data(s->ctx, t, TAG_TMO);
+		assert_true(ior_submit(s->ctx) >= 0);
+
+		int32_t res_op = 0, res_tmo = 0;
+		reap_pair(s->ctx, &res_op, &res_tmo);
+		if (res_tmo == -ETIME) {
+			assert_int_equal(res_op, -ECANCELED);
+			assert_int_equal(atomic_load(&ran), 0);
+		} else {
+			if (res_tmo != -ECANCELED) {
+				assert_int_equal(res_tmo, -EALREADY);
+			}
+			assert_int_equal(res_op, 3);
+			assert_int_equal(atomic_load(&ran), 1);
+		}
+	}
+}
+
+// ===== Cancel-before-start =====
 
 #define WORK_SAT_N 32 // matches the backend's worker-pool cap
 
@@ -384,8 +493,7 @@ static int32_t work_never_fn(ior_work_token *token, void *arg)
  * A link timeout that fires while the work op is still queued behind a
  * saturated pool kills it: the callback never runs and the op completes with
  * -ECANCELED (io_uring arms linked timeouts at submit, so queue-wait counts
- * against the deadline). Backend-specific: the threads backend arms the
- * deadline only when a worker claims the pair, so the row does not occur there.
+ * against the deadline).
  */
 static void test_work_lt_cancels_queued(void **state)
 {
@@ -393,11 +501,6 @@ static void test_work_lt_cancels_queued(void **state)
 	if (!work_supported(s->ctx)) {
 		return;
 	}
-	if (ior_get_backend_type(s->ctx) != IOR_BACKEND_IOURING) {
-		print_message("queued-cancel semantics are io_uring-specific - skipping\n");
-		return;
-	}
-
 	ior_ctx *ctx = NULL;
 	int ret = ior_queue_init(2 * WORK_SAT_N + 8, &ctx);
 	assert_return_code(ret, 0);
@@ -493,7 +596,11 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_work_invalid_args, setup_work, teardown_work),
 		cmocka_unit_test_setup_teardown(test_work_many, setup_work, teardown_work),
 		cmocka_unit_test_setup_teardown(test_work_lt_op_first, setup_work, teardown_work),
-		cmocka_unit_test_setup_teardown(test_work_lt_fires_while_running, setup_work, teardown_work),
+		cmocka_unit_test_setup_teardown(
+				test_work_lt_fires_while_running, setup_work, teardown_work),
+		cmocka_unit_test_setup_teardown(
+				test_work_lt_returns_at_deadline, setup_work, teardown_work),
+		cmocka_unit_test_setup_teardown(test_work_lt_race, setup_work, teardown_work),
 		cmocka_unit_test_setup_teardown(test_work_lt_cancels_queued, setup_work, teardown_work),
 		cmocka_unit_test(test_work_queue_exit_runs_all),
 	};

@@ -295,7 +295,8 @@ void ior_prep_poll_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t p
 // status in *status (the exit code on Windows), or -ECHILD. A wait for one
 // child with no options occupies no thread and is cancellable; -1, a
 // process group, WUNTRACED/WCONTINUED block a worker until waitpid returns
-// (a cancel then reports -EALREADY). Windows takes only pid > 0.
+// (a cancel then reports -EALREADY, as does a link timeout at its deadline).
+// Windows takes only pid > 0.
 int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status,
                      int options);
 

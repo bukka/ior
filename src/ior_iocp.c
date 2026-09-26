@@ -2319,12 +2319,16 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			 * completion arrives through the normal IOCP path - and post this
 			 * link timeout as -ETIME.
 			 *
-			 * A guarded work op cannot be cancelled: its callback runs to
-			 * completion on the threadpool and posts its real result. Flag its
-			 * token instead so the callback can bail out early. The store
-			 * happens under timers.lock, which the completion path also takes
-			 * to resolve the pair before the op can be reaped and recycled, so
-			 * the guarded op is guaranteed alive here.
+			 * A guarded work op still queued on the threadpool is claimed so
+			 * its callback never runs, and completes as cancelled. A running
+			 * one cannot be stopped: its token is flagged so the callback can
+			 * bail out early, and as io_uring's link timeout on a running
+			 * request this one completes now with the cancel's -EALREADY,
+			 * the work op with its real result once the callback returns.
+			 * The claim and the store happen under timers.lock, which the
+			 * completion path also takes to resolve the pair before the op
+			 * can be reaped and recycled, so the guarded op is guaranteed
+			 * alive here.
 			 */
 			ior_iocp_op *guarded = op->guarded;
 			// Work and poll ops have no OVERLAPPED I/O to cancel: flag their
@@ -2336,6 +2340,15 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			bool is_poll = guarded->opcode == IOR_OP_POLL;
 			bool is_wait = guarded->opcode == IOR_OP_WAITPID;
 			bool is_sigwait = guarded->opcode == IOR_OP_SIGWAIT;
+			bool work_queued = false;
+			if (guarded->opcode == IOR_OP_WORK) {
+				int expected = IOCP_OP_WORK;
+				work_queued
+						= atomic_compare_exchange_strong(&guarded->state, &expected, IOCP_OP_DONE);
+				if (!work_queued && expected == IOCP_OP_WORK_RUNNING) {
+					op->submit_res = -EALREADY;
+				}
+			}
 			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
 			} else if (!is_wait && !is_sigwait) {
@@ -2356,6 +2369,13 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			}
 			if (is_sigwait) {
 				(void) iocp_sigwait_abort(ctx, guarded);
+			}
+			if (work_queued) {
+				// As a cancel of a queued callback (see iocp_cancel_one).
+				WaitForThreadpoolWorkCallbacks(guarded->tp_work, TRUE);
+				CloseThreadpoolWork(guarded->tp_work);
+				guarded->tp_work = NULL;
+				post_armed_op(ctx, guarded, ERROR_OPERATION_ABORTED);
 			}
 			post_armed_op(ctx, op, ERROR_TIMEOUT);
 			EnterCriticalSection(&tm->lock);
