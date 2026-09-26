@@ -1163,7 +1163,11 @@ static void ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *w, ior
 	arb->token.shutdown = &pool->wp->shutdown;
 	arb->w = w;
 	arb->lt = lt;
+#ifdef IOR_HAVE_SIGTIMEDWAIT
 	arb->stoppable = w->sqe.threads.opcode == IOR_OP_SIGWAIT;
+#else
+	arb->stoppable = 0; // sigwait(3) ends only for a signal
+#endif
 	atomic_init(&arb->state, IOR_LT_ARMED);
 	atomic_init(&arb->refs, 2); // the worker + the timer thread
 
@@ -1531,7 +1535,8 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		 * worker while the timer thread arbitrates the deadline, flags the
 		 * token so the callback can bail out and completes the link timeout
 		 * itself (see ior_threads_pool_lt_fired). A signal wait is the same
-		 * shape, except that it stops at its next slice once flagged.
+		 * shape, except that it stops at its next slice once flagged where
+		 * it waits in sigtimedwait(2) slices.
 		 */
 		if (lt && (opcode == IOR_OP_WORK || opcode == IOR_OP_SIGWAIT)) {
 			if (!w->arb) {

@@ -656,7 +656,8 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *   - if the guarded op finishes first, it reports its normal result and this
  *     link timeout completes with res == -ECANCELED;
  *   - if @p ts elapses while the guarded op runs and cannot be stopped (a
- *     work callback, a process wait that holds a worker thread), this link
+ *     work callback, a process wait that holds a worker thread, a signal
+ *     wait blocked in sigwait(3) where there is no sigtimedwait), this link
  *     timeout completes at the deadline with res == -EALREADY, as io_uring's
  *     does for a running request, and the guarded op completes with its own
  *     result once it ends. Its memory stays in use until then.
@@ -828,7 +829,9 @@ int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int
  * ior_queue_exit(); every pending op occupies a worker for as long as it
  * waits. Where the platform has no sigtimedwait (macOS) the worker blocks in
  * sigwait(3) until a signal from the set arrives, uncancellable, filling
- * only si_signo in @p info, and ior_queue_exit() waits for it.
+ * only si_signo in @p info, and ior_queue_exit() waits for it: a cancel then
+ * reports -EALREADY, as does a link timeout at its deadline, and the op
+ * completes with the signal (see ior_prep_link_timeout()).
  *
  * Windows knows console control events only: @p set may name SIGINT
  * (Ctrl+C) and SIGBREAK (Ctrl+Break, and the close, logoff and shutdown
