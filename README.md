@@ -203,6 +203,11 @@ int ior_queue_init_params(unsigned entries, ior_ctx **ctx_out, ior_params *param
 
 // Cleanup and destroy queue
 void ior_queue_exit(ior_ctx *ctx);
+
+// In a forked child: close the inherited copies of the context's descriptors
+// (ring, notification, poller, per-op pidfds and signalfds) and drop it,
+// without touching the ring the parent still uses (-ENOTSUP on IOCP)
+int ior_queue_forget(ior_ctx *ctx);
 ```
 
 ### Submission

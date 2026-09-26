@@ -83,4 +83,11 @@ int ior_threads_poller_cancel(ior_threads_poller *poller, void *req);
  */
 void ior_threads_poller_destroy(ior_threads_poller *poller);
 
+/*
+ * In a forked child, which has no poller thread: close the child's copies of
+ * the poller's descriptors and leave the rest. The per-descriptor lists are
+ * walked only if no thread held the poller's lock at the fork.
+ */
+void ior_threads_poller_forget(ior_threads_poller *poller);
+
 #endif /* IOR_THREADS_POLLER_H */

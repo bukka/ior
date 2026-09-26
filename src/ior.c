@@ -146,6 +146,19 @@ void ior_queue_exit(ior_ctx *ctx)
 	free(ctx);
 }
 
+int ior_queue_forget(ior_ctx *ctx)
+{
+	if (!ctx) {
+		return -EINVAL;
+	}
+	if (!ctx->ops->forget) {
+		return -ENOTSUP;
+	}
+	ctx->ops->forget(ctx->backend_ctx);
+	free(ctx);
+	return 0;
+}
+
 /* Submission operations - just call through vtable */
 ior_sqe *ior_get_sqe(ior_ctx *ctx)
 {

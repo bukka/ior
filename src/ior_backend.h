@@ -160,6 +160,8 @@ typedef struct ior_backend_ops {
 	/* Initialization and cleanup */
 	int (*init)(void **backend_ctx, ior_params *params);
 	void (*destroy)(void *backend_ctx);
+	/* Optional (NULL = no fork): ior_queue_forget() in a forked child. */
+	void (*forget)(void *backend_ctx);
 
 	/* Submission queue operations. get_sqe: 0, -ENOSPC (submission queue
 	 * full), -EBUSY (no completion slot free). */

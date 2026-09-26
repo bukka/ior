@@ -69,10 +69,10 @@ foreach(test ${TESTS})
     endif()
 endforeach()
 
-# POSIX only: signal delivery (every ior thread must block signals) and
-# descriptor blocking mode (the checks read O_NONBLOCK)
+# POSIX only: signal delivery (every ior thread must block signals),
+# descriptor blocking mode (the checks read O_NONBLOCK) and fork
 if(NOT WIN32)
-    foreach(test test_signals test_fd_mode)
+    foreach(test test_signals test_fd_mode test_fork)
         add_executable(${test} ${test}.c)
         target_include_directories(${test} PRIVATE
             ${CMAKE_SOURCE_DIR}/include

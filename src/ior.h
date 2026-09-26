@@ -408,6 +408,38 @@ int ior_queue_init(unsigned entries, ior_ctx **ctx_out);
  */
 void ior_queue_exit(ior_ctx *ctx);
 
+/**
+ * Drop an I/O context inherited through fork(2), in the child.
+ *
+ * A child gets a copy of every descriptor the parent's context holds (the
+ * io_uring rings, the notification descriptor, the thread backend's poller,
+ * the pidfds and signalfds of waits in flight) but none of its threads, and
+ * the ring itself stays the parent's. This closes the child's copies of those
+ * descriptors and unmaps its rings without touching what the parent still
+ * uses: nothing is submitted, cancelled or unregistered, no operation
+ * completes, and the parent's operations go on in the parent. It never
+ * blocks on a lock one of the parent's threads may have held at the fork,
+ * ior's own threads included, and leaves open the descriptors such a thread
+ * was creating or changing at that moment: on the thread backend the
+ * multishot polls' dup(2)s when the fork lands while the poller thread
+ * reports readiness, and the poller's own descriptors when it lands while
+ * a worker is still creating the poller for the first poll; on io_uring
+ * the pidfds and signalfds of pending waits when it lands while a worker or
+ * timer thread retires a work job. Memory is released as far as the child
+ * can do so safely; what ior's threads were using is left, the child's own
+ * copy, which the parent does not see.
+ *
+ * Call it in the child before any other ior call on @p ctx, which is invalid
+ * afterwards; ior_queue_exit() would wait for threads that do not exist
+ * there. No other thread of the parent should be inside an ior call on
+ * @p ctx during the fork.
+ *
+ * @param ctx  Context inherited from the parent.
+ * @return 0, -EINVAL for a NULL @p ctx, or -ENOTSUP where there is no fork
+ *         (IOCP), @p ctx then left as it is.
+ */
+int ior_queue_forget(ior_ctx *ctx);
+
 /* Submission */
 
 /**

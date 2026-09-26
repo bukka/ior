@@ -133,6 +133,22 @@ static void ior_threads_backend_destroy(void *backend_ctx)
 	free(ctx);
 }
 
+/*
+ * ior_queue_forget(): in a forked child, which has none of the pool's
+ * threads. Their locks may have been held at the fork, so nothing that
+ * takes one is called: the ring buffers are freed as they are.
+ */
+static void ior_threads_backend_forget(void *backend_ctx)
+{
+	ior_ctx_threads *ctx = backend_ctx;
+
+	ior_threads_pool_forget(ctx->pool);
+	ior_threads_event_destroy(&ctx->event);
+	free(ctx->cq_ring.entries);
+	free(ctx->sq_ring.entries);
+	free(ctx);
+}
+
 static int ior_threads_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 {
 	if (!backend_ctx) {
@@ -637,6 +653,7 @@ static uint32_t ior_threads_backend_get_features(void *backend_ctx)
 const ior_backend_ops ior_threads_ops = {
 	.init = ior_threads_backend_init,
 	.destroy = ior_threads_backend_destroy,
+	.forget = ior_threads_backend_forget,
 	.get_sqe = ior_threads_backend_get_sqe,
 	.submit = ior_threads_backend_submit,
 	.submit_and_wait = ior_threads_backend_submit_and_wait,
