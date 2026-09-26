@@ -24,6 +24,7 @@
 #include <string.h>
 #include <errno.h>
 #include <windows.h>
+#include <winternl.h>
 #include <assert.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -402,6 +403,9 @@ typedef struct ior_ctx_iocp {
 	struct ior_ctx_iocp *sig_next;
 	bool sig_registered;
 
+	// On the process-wide list of live contexts (see iocp_handle_held_elsewhere).
+	struct ior_ctx_iocp *live_next;
+
 	uint32_t flags;
 	uint32_t features;
 } ior_ctx_iocp;
@@ -425,6 +429,8 @@ static int win_error_to_errno(DWORD err)
 			return -ENOMEM;
 		case ERROR_TIMEOUT:
 			return -ETIME; // io_uring timeout semantics
+		case ERROR_BUSY:
+			return -EBUSY;
 		case ERROR_IO_PENDING:
 			return 0;
 		case ERROR_HANDLE_EOF:
@@ -956,6 +962,108 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 }
 
 /*
+ * Every live context, so one can tell whether a handle it is refused belongs
+ * to another. A context joins once it is set up and leaves only after its
+ * teardown has drained the port: until then a handle moved away from it
+ * could still complete a request of its own on the new port.
+ */
+static SRWLOCK g_ctx_lock = SRWLOCK_INIT;
+static ior_ctx_iocp *g_ctxs;
+
+static void iocp_ctx_register(ior_ctx_iocp *ctx)
+{
+	AcquireSRWLockExclusive(&g_ctx_lock);
+	ctx->live_next = g_ctxs;
+	g_ctxs = ctx;
+	ReleaseSRWLockExclusive(&g_ctx_lock);
+}
+
+static void iocp_ctx_unregister(ior_ctx_iocp *ctx)
+{
+	AcquireSRWLockExclusive(&g_ctx_lock);
+	for (ior_ctx_iocp **pp = &g_ctxs; *pp; pp = &(*pp)->live_next) {
+		if (*pp == ctx) {
+			*pp = ctx->live_next;
+			break;
+		}
+	}
+	ctx->live_next = NULL;
+	ReleaseSRWLockExclusive(&g_ctx_lock);
+}
+
+/* Whether another live context has used h. Called with no handle set lock
+ * held, so two contexts looking at each other cannot deadlock. */
+static bool iocp_handle_held_elsewhere(ior_ctx_iocp *self, HANDLE h)
+{
+	bool held = false;
+	AcquireSRWLockShared(&g_ctx_lock);
+	for (ior_ctx_iocp *ctx = g_ctxs; ctx && !held; ctx = ctx->live_next) {
+		if (ctx == self) {
+			continue;
+		}
+		EnterCriticalSection(&ctx->handles.lock);
+		held = handle_set_find_locked(&ctx->handles, h) != NULL;
+		LeaveCriticalSection(&ctx->handles.lock);
+	}
+	ReleaseSRWLockShared(&g_ctx_lock);
+	return held;
+}
+
+/*
+ * NtSetInformationFile(FileReplaceCompletionInformation), Windows 8.1+:
+ * moves a handle to another completion port. From ntdll, as the SDK
+ * declares neither the call nor the class.
+ */
+typedef struct ior_file_completion_information {
+	HANDLE Port;
+	PVOID Key;
+} ior_file_completion_information;
+
+typedef NTSTATUS(NTAPI *ior_nt_set_information_file_fn)(
+		HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+
+#define IOR_FILE_REPLACE_COMPLETION_INFORMATION 61
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(status) (((NTSTATUS) (status)) >= 0)
+#endif
+
+static INIT_ONCE g_nt_set_info_once = INIT_ONCE_STATIC_INIT;
+static ior_nt_set_information_file_fn g_nt_set_info;
+
+static BOOL CALLBACK iocp_nt_set_info_resolve(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+	(void) once;
+	(void) param;
+	(void) context;
+	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	if (ntdll) {
+		g_nt_set_info = (ior_nt_set_information_file_fn) (void (*)(void)) GetProcAddress(
+				ntdll, "NtSetInformationFile");
+	}
+	return TRUE;
+}
+
+// Move h to ctx's port, away from whatever port it is tied to.
+static int iocp_take_over_handle(ior_ctx_iocp *ctx, HANDLE h)
+{
+	InitOnceExecuteOnce(&g_nt_set_info_once, iocp_nt_set_info_resolve, NULL, NULL);
+	if (!g_nt_set_info) {
+		return -EINVAL;
+	}
+	IO_STATUS_BLOCK iosb;
+	ior_file_completion_information info = { ctx->iocp_handle, (PVOID) h };
+	NTSTATUS status
+			= g_nt_set_info(h, &iosb, &info, sizeof(info), IOR_FILE_REPLACE_COMPLETION_INFORMATION);
+	return NT_SUCCESS(status) ? 0 : -EINVAL;
+}
+
+// The completion status of an op whose handle could not be tied to the port.
+static DWORD association_error(int ret)
+{
+	return ret == -EBUSY ? ERROR_BUSY : ERROR_INVALID_HANDLE;
+}
+
+/*
  * Associate h with the port before every issue. Also returns the handle's
  * current cancel generation in *gen, which the op about to be issued records.
  *
@@ -966,8 +1074,12 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
  * reach the port (a connect that never completes, a recv that never returns).
  * CreateIoCompletionPort on a handle that is already associated fails with
  * ERROR_INVALID_PARAMETER; the set of handles this context associated turns
- * that into "still ours, fine" against "bound to some other port, refuse".
- * When it succeeds for a value already in the set, the value names a new
+ * that into "still ours, fine" against "bound to some other port". A handle
+ * belongs to one port for as long as it is open, so one bound elsewhere is
+ * taken over (a context destroyed since, or a port that is not ior's), unless
+ * another live context has used it: that one may still have requests on it,
+ * whose completions would follow the handle to this port (-EBUSY). When it
+ * succeeds for a value already in the set, the value names a new
  * object and the entry's epoch moves on. The set only grows: entries are
  * reused across such recycling and freed at destroy, bounded by the process's
  * peak number of distinct handle values.
@@ -985,11 +1097,21 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen, 
 	HANDLE result = CreateIoCompletionPort(h, ctx->iocp_handle, (ULONG_PTR) h, 0);
 	if (result == NULL) {
 		DWORD err = GetLastError();
-		if (!(err == ERROR_INVALID_PARAMETER && entry)) {
+		if (err != ERROR_INVALID_PARAMETER) {
 			LeaveCriticalSection(&ctx->handles.lock);
 			return win_error_to_errno(err);
 		}
-		// Already associated, and by this context: the same object is still open.
+		if (!entry) {
+			// Tied to another port, or not a handle a port can take.
+			LeaveCriticalSection(&ctx->handles.lock);
+			int ret = iocp_handle_held_elsewhere(ctx, h) ? -EBUSY : iocp_take_over_handle(ctx, h);
+			if (ret < 0) {
+				return ret;
+			}
+			EnterCriticalSection(&ctx->handles.lock);
+			entry = handle_set_find_locked(&ctx->handles, h);
+		}
+		// Otherwise associated, and by this context: the same object is still open.
 	} else if (entry) {
 		entry->epoch++;
 	}
@@ -1061,7 +1183,7 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
-		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
 	}
 
 	// IOR_OFF_NONE: an overlapped handle keeps no file position, and ReadFile
@@ -1096,7 +1218,7 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
-		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
 	}
 
 	// IOR_OFF_NONE passes through: WriteFile takes an all-ones offset as
@@ -1139,7 +1261,7 @@ static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
-		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
 	}
 
 	op->wsabuf.buf = (CHAR *) op->buf;
@@ -1166,7 +1288,7 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
-		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
 	}
 
 	op->wsabuf.buf = (CHAR *) op->buf;
@@ -1217,7 +1339,7 @@ static int issue_accept(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
-		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
 	}
 
 	// A re-issue after a collateral abort starts over with a fresh socket.
@@ -1285,7 +1407,7 @@ static int issue_connect(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
 	if (ret < 0) {
-		return post_synthetic_completion(ctx, op, ERROR_INVALID_HANDLE, 0);
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
 	}
 	if (!op->sa) {
 		return post_synthetic_completion(ctx, op, ERROR_INVALID_PARAMETER, 0);
@@ -3152,6 +3274,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	params->cq_entries = ctx->ready.size;
 	params->features = ctx->features;
 
+	iocp_ctx_register(ctx);
 	*backend_ctx = ctx;
 	return 0;
 }
@@ -3353,6 +3476,8 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	}
 
 	ready_queue_destroy(&ctx->ready);
+	// Drained: its handles may go to another context now.
+	iocp_ctx_unregister(ctx);
 	handle_set_destroy(&ctx->handles);
 
 	if (ctx->sq_array) {

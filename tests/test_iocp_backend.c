@@ -10,6 +10,7 @@
  *   - timer completion via the dedicated timer thread
  *   - synchronous-completion accounting (cached reads)
  *   - teardown while operations are still in flight
+ *   - a handle moving between rings (one completion port per handle)
  *
  * The whole file compiles to an empty (passing) cmocka group on non-IOCP
  * builds, so it is harmless to register unconditionally in CMake - but the
@@ -355,6 +356,86 @@ static void test_sync_completion_accounting(void **state)
 }
 
 /* ===================================================================== */
+/* One completion port per handle                                        */
+/* ===================================================================== */
+
+// Read a few bytes of fd through ctx and return the result.
+static int32_t read_once(ior_ctx *ctx, ior_fd_t fd)
+{
+	char buf[8];
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_read(ctx, sqe, fd, buf, sizeof(buf), 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x300);
+	assert_true(ior_submit(ctx) >= 0);
+	ior_cqe *cqe = NULL;
+	assert_return_code(ior_wait_cqe(ctx, &cqe), 0);
+	assert_ptr_equal(ior_cqe_get_data(ctx, cqe), (void *) 0x300);
+	int32_t res = ior_cqe_get_res(ctx, cqe);
+	ior_cqe_seen(ctx, cqe);
+	return res;
+}
+
+/*
+ * A handle stays tied to the port of the first ring that used it; once that
+ * ring is destroyed, the next ring to use it takes it over.
+ */
+static void test_handle_moves_after_destroy(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(test_fd_is_valid(fd));
+
+	ior_ctx *other = NULL;
+	assert_return_code(ior_queue_init(32, &other), 0);
+	assert_true(read_once(other, fd) >= 0);
+	ior_queue_exit(other);
+
+	assert_true(read_once(s->ctx, fd) >= 0);
+	assert_true(read_once(s->ctx, fd) >= 0);
+	test_close_fd(fd);
+}
+
+/*
+ * While the first ring lives, it may still have requests on the handle, so
+ * another ring is refused with -EBUSY; it gets the handle once the first is
+ * destroyed.
+ */
+static void test_handle_busy_in_live_ring(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(test_fd_is_valid(fd));
+
+	ior_ctx *other = NULL;
+	assert_return_code(ior_queue_init(32, &other), 0);
+	assert_true(read_once(other, fd) >= 0);
+
+	assert_int_equal(read_once(s->ctx, fd), -EBUSY);
+	assert_true(read_once(other, fd) >= 0); // still the first ring's
+
+	ior_queue_exit(other);
+	assert_true(read_once(s->ctx, fd) >= 0);
+	test_close_fd(fd);
+}
+
+// A handle tied to a completion port that is not ior's is taken over.
+static void test_handle_from_foreign_port(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(test_fd_is_valid(fd));
+
+	HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	assert_non_null(port);
+	assert_non_null(CreateIoCompletionPort((HANDLE) fd, port, 0, 0));
+
+	assert_true(read_once(s->ctx, fd) >= 0);
+	CloseHandle(port);
+	test_close_fd(fd);
+}
+
+/* ===================================================================== */
 /* Teardown with operations still in flight                              */
 /* ===================================================================== */
 
@@ -404,6 +485,9 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_timer_heap_order, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_sync_completion_accounting, iocp_setup, iocp_teardown),
 		cmocka_unit_test(test_teardown_inflight),
+		cmocka_unit_test_setup_teardown(test_handle_moves_after_destroy, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_handle_busy_in_live_ring, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_handle_from_foreign_port, iocp_setup, iocp_teardown),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 #else
