@@ -418,11 +418,16 @@ void ior_queue_exit(ior_ctx *ctx);
  * descriptors and unmaps its rings without touching what the parent still
  * uses: nothing is submitted, cancelled or unregistered, no operation
  * completes, and the parent's operations go on in the parent. It never
- * blocks on a lock one of the parent's threads may have held at the fork:
- * descriptors kept in lists such a thread was changing at that moment are
- * left open. Memory is released as far as the child can do so safely; what
- * ior's threads were using is left, the child's own copy, which the parent
- * does not see.
+ * blocks on a lock one of the parent's threads may have held at the fork,
+ * ior's own threads included, and leaves open the descriptors such a thread
+ * was creating or changing at that moment: on the thread backend the
+ * multishot polls' dup(2)s when the fork lands while the poller thread
+ * reports readiness, and the poller's own descriptors when it lands while
+ * a worker is still creating the poller for the first poll; on io_uring
+ * the pidfds and signalfds of pending waits when it lands while a worker or
+ * timer thread retires a work job. Memory is released as far as the child
+ * can do so safely; what ior's threads were using is left, the child's own
+ * copy, which the parent does not see.
  *
  * Call it in the child before any other ior call on @p ctx, which is invalid
  * afterwards; ior_queue_exit() would wait for threads that do not exist

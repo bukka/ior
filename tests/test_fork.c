@@ -7,11 +7,16 @@
  * work ops, the poller with a multishot poll's dup, a pending signal wait's
  * signalfd and a pending process wait's pidfd. The child forgets the context
  * and must be left with exactly the descriptors it had before the context
- * existed; the parent's pending ops must still complete afterwards.
+ * existed; the parent's pending ops must still complete afterwards. Forked
+ * while the poller is busy, forget must not block, and may leave only the
+ * multishot polls' dups open.
  */
 #include "test_utils.h"
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -175,6 +180,136 @@ static void test_forget_after_fork(void **state)
 	close(p[1]);
 }
 
+#define BUSY_PIPES 8
+#define BUSY_FORKS 100
+
+typedef struct busy_state {
+	int p[BUSY_PIPES][2];
+	_Atomic int stop;
+} busy_state;
+
+// Keeps the multishot polls reporting, so the poller thread is often busy
+// (and holding its lock) when the test forks.
+static void *busy_writer(void *arg)
+{
+	busy_state *b = arg;
+	char buf[16];
+	while (!atomic_load(&b->stop)) {
+		for (int i = 0; i < BUSY_PIPES; i++) {
+			(void) write(b->p[i][1], "x", 1);
+			(void) read(b->p[i][0], buf, sizeof(buf));
+		}
+		usleep(1000);
+	}
+	return NULL;
+}
+
+// Whether fd is a descriptor of the read end of one of the watched pipes.
+static int is_busy_pipe(const busy_state *b, int fd)
+{
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		return 0;
+	}
+	for (int i = 0; i < BUSY_PIPES; i++) {
+		struct stat pst;
+		if (fstat(b->p[i][0], &pst) == 0 && pst.st_dev == st.st_dev && pst.st_ino == st.st_ino) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * A fork can land while the poller thread holds its lock, which it does
+ * whenever it reports an edge: forget must not block on it. It then leaves
+ * the multishot polls' dups open, but only those: everything else the
+ * context opened is closed either way.
+ */
+static void test_forget_busy_poller(void **state)
+{
+	(void) state;
+	busy_state b;
+	atomic_init(&b.stop, 0);
+
+	char base[MAX_FDS];
+	for (int i = 0; i < BUSY_PIPES; i++) {
+		assert_return_code(pipe(b.p[i]), 0);
+		assert_return_code(fcntl(b.p[i][0], F_SETFL, O_NONBLOCK), 0);
+	}
+	open_fds(base);
+
+	ior_ctx *ctx = NULL;
+	assert_return_code(ior_queue_init(256, &ctx), 0);
+	for (int i = 0; i < BUSY_PIPES; i++) {
+		ior_sqe *sqe = ior_get_sqe(ctx);
+		assert_non_null(sqe);
+		ior_prep_poll_multishot(ctx, sqe, b.p[i][0], IOR_POLL_IN);
+		ior_sqe_set_data(ctx, sqe, (void *) (uintptr_t) (0x10 + i));
+	}
+	assert_true(ior_submit(ctx) >= 0);
+
+	pthread_t writer;
+	assert_int_equal(pthread_create(&writer, NULL, busy_writer, &b), 0);
+
+	// A worker creates the poller when it takes the first poll: forked
+	// before it is published, the child cannot know its descriptors. Every
+	// poll having reported an edge, it is up.
+	int seen[BUSY_PIPES] = { 0 };
+	for (int left = BUSY_PIPES; left > 0;) {
+		ior_cqe *cqe = NULL;
+		ior_timespec to = { .tv_sec = 5, .tv_nsec = 0 };
+		int ret;
+		while ((ret = ior_wait_cqe_timeout(ctx, &cqe, &to)) == -EINTR) { }
+		assert_return_code(ret, 0);
+		int i = (int) ((uintptr_t) ior_cqe_get_data(ctx, cqe) - 0x10);
+		assert_true(i >= 0 && i < BUSY_PIPES);
+		if (!seen[i]) {
+			seen[i] = 1;
+			left--;
+		}
+		ior_cqe_seen(ctx, cqe);
+	}
+
+	for (int round = 0; round < BUSY_FORKS; round++) {
+		// Reap the edges, so the polls rarely end on a full completion queue.
+		ior_cqe *cqe = NULL;
+		while (ior_peek_cqe(ctx, &cqe) == 0) {
+			ior_cqe_seen(ctx, cqe);
+		}
+
+		pid_t pid = fork();
+		assert_true(pid >= 0);
+		if (pid == 0) {
+			alarm(5); // a forget that blocks ends the child with SIGALRM
+			if (ior_queue_forget(ctx) != 0) {
+				_exit(3);
+			}
+			char after[MAX_FDS];
+			open_fds(after);
+			for (int fd = 0; fd < MAX_FDS; fd++) {
+				if (after[fd] && !base[fd] && !is_busy_pipe(&b, fd)) {
+					fprintf(stderr, "fd %d left open after forget\n", fd);
+					_exit(4);
+				}
+			}
+			_exit(0);
+		}
+		int status;
+		assert_int_equal(waitpid(pid, &status, 0), pid);
+		assert_true(WIFEXITED(status));
+		assert_int_equal(WEXITSTATUS(status), 0);
+	}
+	atomic_store(&b.stop, 1);
+	assert_int_equal(pthread_join(writer, NULL), 0);
+
+	ior_queue_exit(ctx);
+	for (int i = 0; i < BUSY_PIPES; i++) {
+		close(b.p[i][0]);
+		close(b.p[i][1]);
+	}
+}
+
 static void test_forget_null(void **state)
 {
 	(void) state;
@@ -185,6 +320,7 @@ int main(void)
 {
 	const struct CMUnitTest tests[] = {
 		cmocka_unit_test(test_forget_after_fork),
+		cmocka_unit_test(test_forget_busy_poller),
 		cmocka_unit_test(test_forget_null),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
