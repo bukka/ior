@@ -372,8 +372,10 @@ uint32_t ior_get_features(ior_ctx *ctx);
 
 With `IOR_BACKEND_AUTO` the best backend built in is used, unless the
 `IOR_BACKEND` environment variable names one (`io_uring`, `threads`, `iocp`);
-a name that is unknown or not built in fails init with `-ENOSYS`. See
-[BUILD.md](BUILD.md) for building both Linux backends into one library.
+a name that is unknown or not built in fails init with `-ENOSYS`. On Linux
+both backends are built by default and AUTO falls back from io_uring to
+threads when io_uring is unusable (old kernel, sysctl, seccomp); an explicit
+choice never falls back. See [BUILD.md](BUILD.md).
 
 ### Queue Capacity
 ```c

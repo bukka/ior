@@ -731,19 +731,37 @@ static int ior_uring_backend_init(void **backend_ctx, ior_params *params)
 	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_POLL_ADD | IOR_FEAT_SPLICE;
 
 	/*
-	 * Work ops are mandatory and need CQE_SKIP (5.17) + MSG_RING (5.18).
-	 * Refuse init on an older runtime kernel rather than produce a context
-	 * without them.
+	 * Work ops need CQE_SKIP (5.17) + MSG_RING (5.18) and cancel by
+	 * descriptor needs ASYNC_CANCEL_FD (5.19). Refuse an older kernel with
+	 * -ENOSYS so AUTO falls back to the thread backend. This also implies
+	 * FEAT_EXT_ARG (5.11): liburing never injects internal timeout CQEs.
 	 */
-	int msg_ring_ok = 0;
+	int kernel_ok = 0;
 	if (uring_params.features & IORING_FEAT_CQE_SKIP) {
 		struct io_uring_probe *probe = io_uring_get_probe_ring(&ctx->ring);
 		if (probe) {
-			msg_ring_ok = io_uring_opcode_supported(probe, IORING_OP_MSG_RING);
+			kernel_ok = io_uring_opcode_supported(probe, IORING_OP_MSG_RING);
 			io_uring_free_probe(probe);
 		}
 	}
-	if (!msg_ring_ok) {
+	if (kernel_ok) {
+		/*
+		 * Before 5.19 the flag is rejected with -EINVAL; after it the empty
+		 * ring reports no match (-ENOENT).
+		 */
+		struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+		struct io_uring_cqe *cqe;
+		kernel_ok = 0;
+		if (sqe) {
+			io_uring_prep_cancel_fd(sqe, 0, 0);
+			if (io_uring_submit_and_wait(&ctx->ring, 1) == 1
+					&& io_uring_peek_cqe(&ctx->ring, &cqe) == 0) {
+				kernel_ok = cqe->res != -EINVAL;
+				io_uring_cqe_seen(&ctx->ring, cqe);
+			}
+		}
+	}
+	if (!kernel_ok) {
 		io_uring_queue_exit(&ctx->ring);
 		pthread_mutex_destroy(&ctx->jobs_lock);
 		pthread_mutex_destroy(&ctx->poster_lock);
