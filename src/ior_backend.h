@@ -5,6 +5,7 @@
 #include "ior.h"
 #include "ior_log.h"
 #include <stdatomic.h>
+#include <errno.h>
 
 /*
  * Work-op cancellation token, shared by all backends. Embedded in the
@@ -19,6 +20,33 @@ struct ior_work_token {
 
 /* Set in a cancel op's flags by prep_cancel_fd: match by fd, not user data. */
 #define IOR_CANCEL_BY_FD (1U << 0)
+
+/*
+ * IOR_SQE_FIXED_FILE on an op that takes a descriptor: io_uring looks it up
+ * in the registered file table, which ior never fills, so the op fails with
+ * -EBADF when it is issued. Ops without a descriptor ignore the flag.
+ */
+static inline int ior_fixed_file_bad(uint8_t opcode, uint8_t sqe_flags, uint32_t cancel_flags)
+{
+	if (!(sqe_flags & IOR_SQE_FIXED_FILE)) {
+		return 0;
+	}
+	switch (opcode) {
+		case IOR_OP_READ:
+		case IOR_OP_WRITE:
+		case IOR_OP_SPLICE:
+		case IOR_OP_ACCEPT:
+		case IOR_OP_CONNECT:
+		case IOR_OP_SEND:
+		case IOR_OP_RECV:
+		case IOR_OP_POLL:
+			return 1;
+		case IOR_OP_ASYNC_CANCEL:
+			return (cancel_flags & IOR_CANCEL_BY_FD) != 0;
+		default:
+			return 0;
+	}
+}
 
 /* Set in a poll op's len by prep_poll_multishot (io_uring's own encoding):
  * the poll persists, one completion per readiness edge. */
@@ -198,6 +226,75 @@ typedef struct ior_backend_ops {
 } ior_backend_ops;
 
 /* Main context structure */
+/*
+ * A relative timespec in ns, read as io_uring reads it: a tv_nsec of a second
+ * or more adds up, a negative total is already expired (0), and a huge one
+ * saturates (at about 146 years) instead of wrapping.
+ */
+static inline uint64_t ior_timespec_ns(const ior_timespec *ts)
+{
+	const int64_t half = INT64_MAX / 2;
+	const int64_t max_sec = half / 1000000000LL;
+	if (ts->tv_sec > max_sec) {
+		return (uint64_t) half;
+	}
+	if (ts->tv_sec < -max_sec) {
+		return 0;
+	}
+	int64_t ns = ts->tv_sec * 1000000000LL;
+	long long nsec = ts->tv_nsec;
+	if (nsec > half) {
+		nsec = half;
+	} else if (nsec < -half) {
+		nsec = -half;
+	}
+	ns += nsec;
+	if (ns > half) {
+		return (uint64_t) half;
+	}
+	return ns > 0 ? (uint64_t) ns : 0;
+}
+
+/*
+ * The accept flags io_uring takes; any other bit fails the entry (-EINVAL).
+ */
+static inline int ior_accept_check(unsigned flags)
+{
+	return (flags & ~(unsigned) (IOR_ACCEPT_NONBLOCK | IOR_ACCEPT_CLOEXEC)) ? -EINVAL : 0;
+}
+
+/*
+ * What io_uring checks when it takes a timeout entry: two clocks, then no
+ * timespec (-EFAULT), then a negative field. A tv_nsec past a second is fine.
+ */
+static inline int ior_timeout_check(const ior_timespec *ts, unsigned flags)
+{
+	if ((flags & IOR_TIMEOUT_BOOTTIME) && (flags & IOR_TIMEOUT_REALTIME)) {
+		return -EINVAL;
+	}
+	if (!ts) {
+		return -EFAULT;
+	}
+	if (ts->tv_sec < 0 || ts->tv_nsec < 0) {
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * The same for a link timeout, which also needs a linked entry before it in
+ * the same submit, one that is not a link timeout itself.
+ */
+static inline int ior_link_timeout_check(
+		const ior_timespec *ts, unsigned flags, int in_chain, int prev_lt)
+{
+	int ret = ior_timeout_check(ts, flags);
+	if (ret == 0 && (!in_chain || prev_lt)) {
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
 struct ior_ctx {
 	const ior_backend_ops *ops;
 	void *backend_ctx;

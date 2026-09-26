@@ -211,9 +211,7 @@ static int ior_threads_backend_submit(void *backend_ctx)
 	}
 
 	// Copy staged SQEs into work items, dispatch them, and provision workers.
-	ior_threads_pool_notify(ctx->pool, count);
-
-	return (int) count;
+	return (int) ior_threads_pool_notify(ctx->pool);
 }
 
 static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
@@ -233,8 +231,9 @@ static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_
 		return submitted;
 	}
 
-	// Wait for at least wait_nr completions
-	if (wait_nr == 0) {
+	// Wait for at least wait_nr completions, unless submit stopped at a bad
+	// entry: io_uring then returns without waiting.
+	if (wait_nr == 0 || ior_threads_ring_sq_space_left(&ctx->sq_ring) != ctx->sq_ring.size) {
 		return submitted;
 	}
 
@@ -311,18 +310,16 @@ static int ior_threads_backend_wait_cqe_timeout(
 
 	ior_ctx_threads *ctx = backend_ctx;
 
-	// Validate the timeout and turn it into an absolute monotonic deadline so
-	// that spurious wakeups can resume the wait without extending it.
+	// Turn the timeout into an absolute monotonic deadline so that spurious
+	// wakeups can resume the wait without extending it. As on io_uring, a
+	// negative one has already expired and a tv_nsec past a second adds up.
 	int has_deadline = 0;
 	uint64_t deadline_ns = 0;
 	if (timeout) {
-		if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L) {
-			return -EINVAL;
-		}
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		deadline_ns = (uint64_t) now.tv_sec * 1000000000ULL + (uint64_t) now.tv_nsec
-				+ (uint64_t) timeout->tv_sec * 1000000000ULL + (uint64_t) timeout->tv_nsec;
+				+ ior_timespec_ns(timeout);
 		has_deadline = 1;
 	}
 

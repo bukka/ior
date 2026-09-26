@@ -4,6 +4,7 @@
 #if defined(IOR_HAVE_THREADS) || defined(IOR_HAVE_URING)
 
 #include "ior_worker_pool.h"
+#include "ior_backend.h"
 #include "ior_log.h"
 #include <stdlib.h>
 #include <errno.h>
@@ -47,7 +48,7 @@ uint64_t ior_worker_pool_monotonic_ns(void)
 
 uint64_t ior_worker_pool_deadline_ns(const ior_timespec *ts, unsigned flags)
 {
-	uint64_t ns = (uint64_t) ts->tv_sec * 1000000000ULL + (uint64_t) ts->tv_nsec;
+	uint64_t ns = ior_timespec_ns(ts);
 	uint64_t now = ior_worker_pool_monotonic_ns();
 	if (!(flags & IOR_TIMEOUT_ABS)) {
 		return now + ns;

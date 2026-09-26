@@ -144,6 +144,15 @@ void ior_threads_ring_consume(ior_threads_ring *ring)
 	atomic_store_explicit(&ring->consumed, cached, memory_order_release);
 }
 
+void ior_threads_ring_consume_to(ior_threads_ring *ring, uint32_t pos)
+{
+	if (!ring || !ring->is_sq) {
+		return;
+	}
+
+	atomic_store_explicit(&ring->consumed, pos, memory_order_release);
+}
+
 // ===== Completion Queue Operations =====
 
 int ior_threads_ring_post_cqe(ior_threads_ring *ring, const ior_cqe *cqe)

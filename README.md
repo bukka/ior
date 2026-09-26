@@ -212,7 +212,10 @@ ior_sqe *ior_get_sqe(ior_ctx *ctx);
 // completion queue (-EBUSY: reap)
 int ior_get_sqe_ex(ior_ctx *ctx, ior_sqe **sqe_out);
 
-// Submit all pending operations
+// Submit all pending operations, with io_uring semantics on every backend:
+// an entry io_uring refuses (e.g. a negative timespec) fails its chain and
+// submission stops after it, leaving the rest staged for the next submit.
+// Waiting never submits.
 int ior_submit(ior_ctx *ctx);
 
 // Submit and wait for at least wait_nr completions
@@ -275,7 +278,8 @@ void ior_prep_connect(ior_ctx *ctx, ior_sqe *sqe, int fd,
 // Timeout operation: ts is a relative duration, or with IOR_TIMEOUT_ABS an
 // absolute deadline on the monotonic clock (IOR_TIMEOUT_BOOTTIME and
 // IOR_TIMEOUT_REALTIME select the boot-time or wall clock instead). ts is
-// read by ior_submit(), so it may live on the stack until submit returns.
+// read by the submit that takes the entry, so it may live on the stack until
+// that submit returns.
 void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
                       unsigned count, unsigned flags);
 

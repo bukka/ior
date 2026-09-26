@@ -84,6 +84,7 @@ typedef struct ior_work {
 	ior_worker_pool_job job; // FIFO node while queued as a chain head
 	ior_sqe sqe; // copied submission entry
 	uint64_t seq; // submission order, for IO_DRAIN
+	int32_t fail_res; // submit: the entry's own error when its chain failed
 	struct ior_work *next; // free-list link (scratch link while allocated)
 	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
 	/*
@@ -213,8 +214,8 @@ ior_threads_pool *ior_threads_pool_create(ior_ctx_threads *ctx, uint32_t num_thr
 ior_threads_pool *ior_threads_pool_create_ex(
 		ior_ctx_threads *ctx, const ior_threads_pool_config *config);
 
-// Notify pool that work is available (submits pending SQEs and wakes workers)
-void ior_threads_pool_notify(ior_threads_pool *pool, uint32_t count);
+// Submit the staged SQEs to the pool; returns how many were taken
+uint32_t ior_threads_pool_notify(ior_threads_pool *pool);
 
 // Shutdown pool and wait for all threads to finish
 void ior_threads_pool_destroy(ior_threads_pool *pool);

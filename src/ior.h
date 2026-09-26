@@ -184,7 +184,11 @@ typedef struct ior_timespec {
  * Bits for ior_sqe_set_flags().
  * @{
  */
-/** fd refers to a registered (fixed) file. */
+/**
+ * fd refers to a registered (fixed) file. ior has no way to register files
+ * yet, so on every backend an op that takes a descriptor fails with -EBADF
+ * when it runs, as io_uring does with an empty file table; others ignore it.
+ */
 #define IOR_SQE_FIXED_FILE (1U << 0)
 /** Wait for all prior SQEs to complete before this one. */
 #define IOR_SQE_IO_DRAIN (1U << 1)
@@ -439,6 +443,23 @@ int ior_get_sqe_ex(ior_ctx *ctx, ior_sqe **sqe_out);
 /**
  * Submit all prepared submission queue entries.
  *
+ * Follows io_uring on every backend. An entry io_uring refuses to take (a
+ * timeout with no timespec (-EFAULT), a negative field or two clocks
+ * (-EINVAL), a link timeout with no linked entry before it in the same submit
+ * (-EINVAL), an accept with flags other than IOR_ACCEPT_* (-EINVAL)) fails
+ * its whole chain: it completes with its own error and the rest of the chain
+ * with -ECANCELED. Submission stops right after it unless it links on, and
+ * the count includes it. The entries not taken stay staged,
+ * in order, and the next submit sends them; they need no new prep. An error
+ * found while an op runs, such as a bad descriptor, is its completion only.
+ *
+ * io_uring alone also takes fewer entries, or none (-EAGAIN, -ENOMEM), when
+ * the kernel cannot allocate a request; what is left stays staged the same way.
+ *
+ * Only ior_submit() and ior_submit_and_wait() submit: waiting or peeking for
+ * completions never sends staged entries, so waiting on an op that is still
+ * staged blocks.
+ *
  * @param ctx  I/O context.
  * @return The number of entries submitted (>= 0), or a negative errno.
  */
@@ -446,6 +467,9 @@ int ior_submit(ior_ctx *ctx);
 
 /**
  * Submit all prepared entries and wait for completions.
+ *
+ * Submits as ior_submit() does. When entries are left staged it returns
+ * without waiting, as io_uring does.
  *
  * @param ctx      I/O context.
  * @param wait_nr  Minimum number of completions to wait for (0 = do not wait).
@@ -464,8 +488,9 @@ int ior_submit_and_wait(ior_ctx *ctx, unsigned wait_nr);
 /**
  * Non-blocking check for a ready completion.
  *
- * Does not consume the completion; a subsequent peek or wait returns the same
- * CQE until it is consumed with ior_cqe_seen() or ior_cq_advance().
+ * Does not submit staged entries (see ior_submit()) and does not consume the
+ * completion; a subsequent peek or wait returns the same CQE until it is
+ * consumed with ior_cqe_seen() or ior_cq_advance().
  *
  * @param ctx      I/O context.
  * @param cqe_out  On success, set to the completion at the head of the queue.
@@ -477,9 +502,10 @@ int ior_peek_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
 /**
  * Block until a completion is ready.
  *
- * Waits indefinitely for the next completion. Does not return -EAGAIN
- * spuriously and does not consume the completion (the returned CQE is identical
- * to what ior_peek_cqe() would return).
+ * Waits indefinitely for the next completion. Does not submit staged entries
+ * (see ior_submit()), does not return -EAGAIN spuriously and does not consume
+ * the completion (the returned CQE is identical to what ior_peek_cqe() would
+ * return).
  *
  * @param ctx      I/O context.
  * @param cqe_out  On success, set to the completion at the head of the queue.
@@ -491,15 +517,17 @@ int ior_wait_cqe(ior_ctx *ctx, ior_cqe **cqe_out);
 /**
  * Block until a completion is ready or the timeout elapses.
  *
- * Like ior_wait_cqe() but bounded by @p timeout. Does not consume the
- * completion.
+ * Like ior_wait_cqe() but bounded by @p timeout. Does not submit staged
+ * entries and does not consume the completion.
  *
  * @param ctx      I/O context.
  * @param cqe_out  On success, set to the completion at the head of the queue.
- * @param timeout  Maximum time to wait, or NULL to wait indefinitely.
+ * @param timeout  Maximum time to wait, or NULL to wait indefinitely. Read as
+ *                 io_uring does: a negative one has already expired, and a
+ *                 tv_nsec of a second or more adds up.
  * @return 0 on success, -ETIME if the timeout elapsed before a completion
  *         arrived, or a negative errno on failure (e.g. -EINVAL for NULL ctx /
- *         cqe_out or an invalid timeout).
+ *         cqe_out).
  */
 int ior_wait_cqe_timeout(ior_ctx *ctx, ior_cqe **cqe_out, ior_timespec *timeout);
 
@@ -597,9 +625,11 @@ void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd_in, uint64_t off_in
 /**
  * Prepare a timeout that completes with -ETIME after @p ts elapses.
  *
- * @p ts is read by ior_submit() and copied then, on every backend, so it may
- * live on the caller's stack until submit returns (io_uring reads it during
- * io_uring_enter(); the other backends copy it into the entry).
+ * @p ts is read and copied by the submit that takes the entry, as io_uring
+ * does, so it may live on the caller's stack until that submit returns. An
+ * entry left staged (see ior_submit()) has it read by a later submit, so keep
+ * it valid until a submit has taken the entry. A tv_nsec of a second or more
+ * is a longer timeout, as on io_uring.
  *
  * @param ctx    I/O context.
  * @param sqe    Entry from ior_get_sqe().
@@ -631,7 +661,7 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  * completion uncancelled. If the guarded op is cancelled with ior_prep_cancel()
  * instead, both it and this link timeout complete with -ECANCELED.
  *
- * @p ts is read by ior_submit() and copied then, as for ior_prep_timeout().
+ * @p ts is read by the submit that takes the entry, as for ior_prep_timeout().
  *
  * @param ctx    I/O context.
  * @param sqe    Entry from ior_get_sqe(), submitted right after the guarded op.
@@ -696,7 +726,8 @@ void ior_prep_recv(
  * @param fd       Listening socket.
  * @param addr     Buffer for the peer address, or NULL.
  * @param addrlen  In/out size of @p addr, or NULL.
- * @param flags    IOR_ACCEPT_NONBLOCK, IOR_ACCEPT_CLOEXEC, or 0.
+ * @param flags    IOR_ACCEPT_NONBLOCK, IOR_ACCEPT_CLOEXEC, or 0; any other bit
+ *                 fails the entry at submit with -EINVAL (see ior_submit()).
  */
 void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr,
 		socklen_t *addrlen, unsigned flags);
