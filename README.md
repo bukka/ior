@@ -319,6 +319,12 @@ int ior_sigemptyset(ior_sigset_t *set);
 int ior_sigaddset(ior_sigset_t *set, int signo);
 int ior_sigismember(const ior_sigset_t *set, int signo);
 
+// Put back a signal a sigwait op took whose completion the caller discards
+// (a cancel that came too late): queued to the process again on POSIX, with
+// its siginfo on Linux; offered to the pending sigwaits, else raise()d, on
+// Windows.
+int ior_sigrequeue(const ior_siginfo_t *info);
+
 // Splice operation (Linux only)
 void ior_prep_splice(ior_ctx *ctx, ior_sqe *sqe, int fd_in, uint64_t off_in,
                      int fd_out, uint64_t off_out, unsigned nbytes, unsigned flags);

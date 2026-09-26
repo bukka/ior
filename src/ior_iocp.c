@@ -1569,7 +1569,11 @@ static bool iocp_waitpid_abort(ior_ctx_iocp *ctx, ior_iocp_op *op)
 static SRWLOCK g_sig_lock = SRWLOCK_INIT;
 static ior_ctx_iocp *g_sig_ctxs;
 
-static BOOL WINAPI iocp_sig_ctrl_handler(DWORD type)
+/*
+ * Hand the event to the first pending op whose set has its signal. Returns
+ * whether one took it.
+ */
+static bool iocp_sig_dispatch(DWORD type)
 {
 	int sig = type == CTRL_C_EVENT ? SIGINT : SIGBREAK;
 	ior_iocp_op *taker = NULL;
@@ -1596,7 +1600,7 @@ static BOOL WINAPI iocp_sig_ctrl_handler(DWORD type)
 	ReleaseSRWLockExclusive(&g_sig_lock);
 
 	if (!taker) {
-		return FALSE;
+		return false;
 	}
 	// The context outlives this post: its teardown drains the port until
 	// every reserved completion, this one included, has arrived.
@@ -1606,7 +1610,34 @@ static BOOL WINAPI iocp_sig_ctrl_handler(DWORD type)
 	}
 	taker->work_res = sig;
 	post_armed_op(owner, taker, ERROR_SUCCESS);
-	return TRUE;
+	return true;
+}
+
+static BOOL WINAPI iocp_sig_ctrl_handler(DWORD type)
+{
+	return iocp_sig_dispatch(type) ? TRUE : FALSE;
+}
+
+/*
+ * ior_sigrequeue() on Windows: the event is offered again as on its arrival,
+ * and with no taker goes where the handler would have passed it, as far as
+ * a program can send it: raise() reaches the CRT's signal() handler, or its
+ * default action.
+ */
+int ior_iocp_sigrequeue(const ior_siginfo_t *info)
+{
+	if (!info || (info->si_signo != SIGINT && info->si_signo != SIGBREAK)) {
+		return -EINVAL;
+	}
+	DWORD type = info->si_signo == SIGINT ? CTRL_C_EVENT : (DWORD) info->si_code;
+	if (info->si_signo == SIGBREAK && type != CTRL_BREAK_EVENT && type != CTRL_CLOSE_EVENT
+			&& type != CTRL_LOGOFF_EVENT && type != CTRL_SHUTDOWN_EVENT) {
+		type = CTRL_BREAK_EVENT;
+	}
+	if (iocp_sig_dispatch(type)) {
+		return 0;
+	}
+	return raise(info->si_signo) == 0 ? 0 : -EINVAL;
 }
 
 // Put ctx on the handler's list, installing the handler for the first one.

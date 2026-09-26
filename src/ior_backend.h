@@ -315,6 +315,8 @@ extern const ior_backend_ops ior_threads_ops;
 
 #ifdef IOR_HAVE_IOCP
 extern const ior_backend_ops ior_iocp_ops;
+/* ior_sigrequeue(): console control events are the IOCP backend's. */
+int ior_iocp_sigrequeue(const ior_siginfo_t *info);
 #endif
 
 #endif /* IOR_BACKEND_H */
