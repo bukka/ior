@@ -656,8 +656,11 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 			}
 		}
 		if (w->fail_res < 0 && !chain_failed) {
-			// Take the chain back off the queue; it completes below.
+			// Take the chain back off the queue; it completes below. Until
+			// then it is hidden from a cancel running on a worker, as
+			// io_uring never exposes an entry it refused.
 			chain_failed = 1;
+			atomic_store_explicit(&head->state, IOR_WORK_LINKED, memory_order_release);
 			last = before_head;
 			if (last) {
 				last->next = NULL;
@@ -689,13 +692,13 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 	ior_threads_ring_consume_to(&ctx->sq_ring, p);
 
 	// Failed chains complete before the cancels run, as io_uring posts them.
+	// Their ops stay LINKED until then, so no cancel finds them.
 	uint64_t done = 0;
 	while (failed) {
 		ior_work *w = failed;
 		failed = w->next;
 		for (ior_work *next; w; w = next) {
 			next = w->chain;
-			atomic_store_explicit(&w->state, IOR_WORK_RUNNING, memory_order_release);
 			ior_threads_pool_finish_res(pool, w, w->fail_res < 0 ? w->fail_res : -ECANCELED);
 			done++;
 		}

@@ -454,6 +454,64 @@ static void test_accept_bad_flags(void **state)
 }
 
 /*
+ * A cancel running while submit fails a chain does not find it: io_uring
+ * never exposes an entry it refused, so the cancel reports -ENOENT. The
+ * work op holds its linked cancel back until the failing submit is under
+ * way; several failed chains widen the window.
+ */
+static _Atomic int release_work;
+
+static int32_t wait_release(ior_work_token *token, void *arg)
+{
+	(void) token;
+	(void) arg;
+	while (!atomic_load(&release_work)) { }
+	return 0;
+}
+
+static void test_cancel_misses_refused_entry(void **state)
+{
+	test_state *ts = (test_state *) *state;
+	const unsigned nchains = 14;
+
+	for (unsigned i = 0; i < 2000; i++) {
+		atomic_store(&release_work, 0);
+		ior_sqe *sqe = ior_get_sqe(ts->ctx);
+		assert_non_null(sqe);
+		assert_return_code(ior_prep_work(ts->ctx, sqe, wait_release, NULL), 0);
+		ior_sqe_set_data(ts->ctx, sqe, (void *) 1);
+		ior_sqe_set_flags(ts->ctx, sqe, IOR_SQE_IO_LINK);
+		sqe = ior_get_sqe(ts->ctx);
+		assert_non_null(sqe);
+		ior_prep_cancel(ts->ctx, sqe, (void *) 3);
+		ior_sqe_set_data(ts->ctx, sqe, (void *) 2);
+		assert_int_equal(ior_submit(ts->ctx), 2);
+
+		for (unsigned k = 0; k < nchains; k++) {
+			stage_timeout(ts->ctx, 3, &bad_ts, 0, IOR_SQE_IO_LINK);
+			stage_nop(ts->ctx, 4, 0);
+		}
+		atomic_store(&release_work, 1);
+		assert_int_equal(ior_submit(ts->ctx), (int) (2 * nchains));
+
+		for (unsigned k = 0; k < 2 + 2 * nchains; k++) {
+			ior_cqe *cqe;
+			assert_return_code(ior_wait_cqe(ts->ctx, &cqe), 0);
+			uintptr_t id = (uintptr_t) ior_cqe_get_data(ts->ctx, cqe);
+			int32_t res = ior_cqe_get_res(ts->ctx, cqe);
+			if (id == 2) {
+				assert_int_equal(res, -ENOENT);
+			} else if (id == 3) {
+				assert_int_equal(res, -EINVAL);
+			} else if (id == 4) {
+				assert_int_equal(res, -ECANCELED);
+			}
+			ior_cqe_seen(ts->ctx, cqe);
+		}
+	}
+}
+
+/*
  * A wait timeout reads as on io_uring: a negative one has already expired
  * (-ETIME, or a completion that is ready), a tv_nsec past a second adds up.
  */
@@ -591,6 +649,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_accept_bad_flags, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(test_fixed_file_is_ebadf, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(test_link_timeout_on_nop, setup_ior_ctx, teardown_ior_ctx),
+		cmocka_unit_test_setup_teardown(
+				test_cancel_misses_refused_entry, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(
 				test_wait_timeout_like_uring, setup_ior_ctx, teardown_ior_ctx),
 		cmocka_unit_test_setup_teardown(test_wait_does_not_submit, setup_ior_ctx, teardown_ior_ctx),
