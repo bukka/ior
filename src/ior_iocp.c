@@ -54,6 +54,11 @@ typedef struct handle_set_entry {
 	// names a new one. Ops record it, so an abort of the old object's request
 	// is never replayed onto the new object.
 	uint32_t epoch;
+	// The object under this value is tied to this context's port, as far as
+	// ior knows: the process-wide owner map names this context for it (see
+	// iocp_owner_record_locked). Cleared when another context associates a new
+	// object under the value, so a stale entry is never taken for ours.
+	bool owned;
 	struct handle_set_entry *next;
 } handle_set_entry;
 
@@ -403,9 +408,6 @@ typedef struct ior_ctx_iocp {
 	struct ior_ctx_iocp *sig_next;
 	bool sig_registered;
 
-	// On the process-wide list of live contexts (see iocp_handle_held_elsewhere).
-	struct ior_ctx_iocp *live_next;
-
 	uint32_t flags;
 	uint32_t features;
 } ior_ctx_iocp;
@@ -629,6 +631,7 @@ static handle_set_entry *handle_set_insert_locked(handle_set *set, HANDLE h)
 	entry->handle = h;
 	entry->cancel_gen = 0;
 	entry->epoch = 0;
+	entry->owned = false;
 	entry->next = set->buckets[bucket];
 	set->buckets[bucket] = entry;
 	return entry;
@@ -962,51 +965,93 @@ static void post_armed_op(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD error_code)
 }
 
 /*
- * Every live context, so one can tell whether a handle it is refused belongs
- * to another. A context joins once it is set up and leaves only after its
- * teardown has drained the port: until then a handle moved away from it
- * could still complete a request of its own on the new port.
+ * The live context each handle value's object is tied to, as far as ior
+ * knows: the one that associated it with its port last, or took it over. A
+ * handle belongs to one port for as long as it is open, so this decides
+ * whether a context refused a handle may take it (no owner: a context
+ * destroyed since, or a port that is not ior's) or not (another live one,
+ * which may still have requests on it). Keyed by the owner, not by which
+ * contexts ever saw the value: values are recycled, and a context's set
+ * keeps a value long after the object under it was closed.
+ *
+ * Changed only under g_owner_lock, exclusively, with the association it
+ * records, so two contexts cannot both take a handle over. The contexts'
+ * handles.lock nests inside it, never the other way round. A context's
+ * records go only after its teardown has drained its port: until then a
+ * handle moved away from it could still complete a request of its own on
+ * the new port.
  */
-static SRWLOCK g_ctx_lock = SRWLOCK_INIT;
-static ior_ctx_iocp *g_ctxs;
+typedef struct owner_entry {
+	HANDLE handle;
+	struct ior_ctx_iocp *owner;
+	struct owner_entry *next;
+} owner_entry;
 
-static void iocp_ctx_register(ior_ctx_iocp *ctx)
+static SRWLOCK g_owner_lock = SRWLOCK_INIT;
+static owner_entry *g_owners[HANDLE_SET_SIZE];
+
+static owner_entry **iocp_owner_find_locked(HANDLE h)
 {
-	AcquireSRWLockExclusive(&g_ctx_lock);
-	ctx->live_next = g_ctxs;
-	g_ctxs = ctx;
-	ReleaseSRWLockExclusive(&g_ctx_lock);
+	owner_entry **pp = &g_owners[handle_hash(h)];
+	while (*pp && (*pp)->handle != h) {
+		pp = &(*pp)->next;
+	}
+	return pp;
 }
 
-static void iocp_ctx_unregister(ior_ctx_iocp *ctx)
+/*
+ * Name ctx the owner of h, which it has just associated or taken over. A
+ * previous owner's object under h was closed (or h would not have moved),
+ * so its entry no longer names what the value does. g_owner_lock held
+ * exclusively.
+ */
+static int iocp_owner_record_locked(ior_ctx_iocp *ctx, HANDLE h)
 {
-	AcquireSRWLockExclusive(&g_ctx_lock);
-	for (ior_ctx_iocp **pp = &g_ctxs; *pp; pp = &(*pp)->live_next) {
-		if (*pp == ctx) {
-			*pp = ctx->live_next;
-			break;
+	owner_entry **pp = iocp_owner_find_locked(h);
+	owner_entry *o = *pp;
+	if (!o) {
+		o = malloc(sizeof(*o));
+		if (!o) {
+			return -ENOMEM;
 		}
+		o->handle = h;
+		o->owner = NULL;
+		o->next = NULL;
+		*pp = o;
 	}
-	ctx->live_next = NULL;
-	ReleaseSRWLockExclusive(&g_ctx_lock);
+	if (o->owner && o->owner != ctx) {
+		EnterCriticalSection(&o->owner->handles.lock);
+		handle_set_entry *prev = handle_set_find_locked(&o->owner->handles, h);
+		if (prev) {
+			prev->owned = false;
+		}
+		LeaveCriticalSection(&o->owner->handles.lock);
+	}
+	o->owner = ctx;
+	return 0;
 }
 
-/* Whether another live context has used h. Called with no handle set lock
- * held, so two contexts looking at each other cannot deadlock. */
-static bool iocp_handle_held_elsewhere(ior_ctx_iocp *self, HANDLE h)
+/*
+ * Drop ctx's records once its port is drained: its handles are free to take.
+ * Found in the map itself, not through ctx's set, which may lack an entry
+ * for a record (an allocation failure): no record may outlive its owner.
+ */
+static void iocp_owner_forget(ior_ctx_iocp *ctx)
 {
-	bool held = false;
-	AcquireSRWLockShared(&g_ctx_lock);
-	for (ior_ctx_iocp *ctx = g_ctxs; ctx && !held; ctx = ctx->live_next) {
-		if (ctx == self) {
-			continue;
+	AcquireSRWLockExclusive(&g_owner_lock);
+	for (int i = 0; i < HANDLE_SET_SIZE; i++) {
+		owner_entry **pp = &g_owners[i];
+		while (*pp) {
+			owner_entry *o = *pp;
+			if (o->owner == ctx) {
+				*pp = o->next;
+				free(o);
+			} else {
+				pp = &o->next;
+			}
 		}
-		EnterCriticalSection(&ctx->handles.lock);
-		held = handle_set_find_locked(&ctx->handles, h) != NULL;
-		LeaveCriticalSection(&ctx->handles.lock);
 	}
-	ReleaseSRWLockShared(&g_ctx_lock);
-	return held;
+	ReleaseSRWLockExclusive(&g_owner_lock);
 }
 
 /*
@@ -1043,7 +1088,11 @@ static BOOL CALLBACK iocp_nt_set_info_resolve(PINIT_ONCE once, PVOID param, PVOI
 	return TRUE;
 }
 
-// Move h to ctx's port, away from whatever port it is tied to.
+/*
+ * Move h to ctx's port, away from whatever port it is tied to. The kernel
+ * refuses a handle with requests still pending on it (STATUS_UNSUCCESSFUL),
+ * as their completions would follow it: the other port is still using it.
+ */
 static int iocp_take_over_handle(ior_ctx_iocp *ctx, HANDLE h)
 {
 	InitOnceExecuteOnce(&g_nt_set_info_once, iocp_nt_set_info_resolve, NULL, NULL);
@@ -1054,13 +1103,23 @@ static int iocp_take_over_handle(ior_ctx_iocp *ctx, HANDLE h)
 	ior_file_completion_information info = { ctx->iocp_handle, (PVOID) h };
 	NTSTATUS status
 			= g_nt_set_info(h, &iosb, &info, sizeof(info), IOR_FILE_REPLACE_COMPLETION_INFORMATION);
-	return NT_SUCCESS(status) ? 0 : -EINVAL;
+	if (NT_SUCCESS(status)) {
+		return 0;
+	}
+	return status == (NTSTATUS) 0xC0000001L ? -EBUSY : -EINVAL; // STATUS_UNSUCCESSFUL
 }
 
 // The completion status of an op whose handle could not be tied to the port.
 static DWORD association_error(int ret)
 {
-	return ret == -EBUSY ? ERROR_BUSY : ERROR_INVALID_HANDLE;
+	switch (ret) {
+		case -EBUSY:
+			return ERROR_BUSY;
+		case -ENOMEM:
+			return ERROR_NOT_ENOUGH_MEMORY;
+		default:
+			return ERROR_INVALID_HANDLE;
+	}
 }
 
 /*
@@ -1073,16 +1132,22 @@ static DWORD association_error(int ret)
  * skip the association for a brand-new object and its completions would never
  * reach the port (a connect that never completes, a recv that never returns).
  * CreateIoCompletionPort on a handle that is already associated fails with
- * ERROR_INVALID_PARAMETER; the set of handles this context associated turns
- * that into "still ours, fine" against "bound to some other port". A handle
- * belongs to one port for as long as it is open, so one bound elsewhere is
- * taken over (a context destroyed since, or a port that is not ior's), unless
- * another live context has used it: that one may still have requests on it,
- * whose completions would follow the handle to this port (-EBUSY). When it
- * succeeds for a value already in the set, the value names a new
- * object and the entry's epoch moves on. The set only grows: entries are
- * reused across such recycling and freed at destroy, bounded by the process's
- * peak number of distinct handle values.
+ * ERROR_INVALID_PARAMETER; an entry this context owns turns that into "still
+ * ours, fine", the common case, which takes no lock but the context's own.
+ *
+ * Anything else (a value not seen, or one another context has associated a
+ * new object under since) is settled under g_owner_lock. A handle belongs to
+ * one port for as long as it is open, so one bound elsewhere is taken over
+ * (no owner: a context destroyed since, or a port that is not ior's), unless
+ * another live context owns it: that one may still have requests on it,
+ * whose completions would follow the handle to this port (-EBUSY, as when
+ * the kernel refuses to move a handle with requests pending).
+ *
+ * When the association succeeds for a value already in the set, or the
+ * handle is taken over, the value may name a new object and the entry's
+ * epoch moves on. The set only grows: entries are reused across such
+ * recycling and freed at destroy, bounded by the process's peak number of
+ * distinct handle values.
  */
 static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen, uint32_t *epoch)
 {
@@ -1091,39 +1156,57 @@ static int ensure_handle_associated(ior_ctx_iocp *ctx, HANDLE h, uint32_t *gen, 
 	}
 
 	EnterCriticalSection(&ctx->handles.lock);
-
 	handle_set_entry *entry = handle_set_find_locked(&ctx->handles, h);
-
-	HANDLE result = CreateIoCompletionPort(h, ctx->iocp_handle, (ULONG_PTR) h, 0);
-	if (result == NULL) {
-		DWORD err = GetLastError();
-		if (err != ERROR_INVALID_PARAMETER) {
+	if (entry && entry->owned) {
+		if (CreateIoCompletionPort(h, ctx->iocp_handle, (ULONG_PTR) h, 0)) {
+			entry->epoch++; // a new object under the value, and still ours
+		} else if (GetLastError() != ERROR_INVALID_PARAMETER) {
+			DWORD err = GetLastError();
 			LeaveCriticalSection(&ctx->handles.lock);
 			return win_error_to_errno(err);
 		}
-		if (!entry) {
-			// Tied to another port, or not a handle a port can take.
-			LeaveCriticalSection(&ctx->handles.lock);
-			int ret = iocp_handle_held_elsewhere(ctx, h) ? -EBUSY : iocp_take_over_handle(ctx, h);
-			if (ret < 0) {
-				return ret;
-			}
-			EnterCriticalSection(&ctx->handles.lock);
-			entry = handle_set_find_locked(&ctx->handles, h);
-		}
-		// Otherwise associated, and by this context: the same object is still open.
-	} else if (entry) {
-		entry->epoch++;
+		*gen = entry->cancel_gen;
+		*epoch = entry->epoch;
+		LeaveCriticalSection(&ctx->handles.lock);
+		return 0;
 	}
-
-	if (!entry) {
-		entry = handle_set_insert_locked(&ctx->handles, h);
-	}
-	*gen = entry ? entry->cancel_gen : 0;
-	*epoch = entry ? entry->epoch : 0;
 	LeaveCriticalSection(&ctx->handles.lock);
 
-	return 0;
+	AcquireSRWLockExclusive(&g_owner_lock);
+	int ret = 0;
+	if (!CreateIoCompletionPort(h, ctx->iocp_handle, (ULONG_PTR) h, 0)) {
+		DWORD err = GetLastError();
+		owner_entry *o = *iocp_owner_find_locked(h);
+		if (err != ERROR_INVALID_PARAMETER) {
+			ret = win_error_to_errno(err);
+		} else if (o && o->owner && o->owner != ctx) {
+			ret = -EBUSY;
+		} else if (!o || o->owner != ctx) {
+			// Tied to a port no live context owns, or not one a port can take.
+			ret = iocp_take_over_handle(ctx, h);
+		}
+		// Else ours already, with its entry lost to an allocation failure.
+	}
+	if (ret == 0) {
+		ret = iocp_owner_record_locked(ctx, h);
+	}
+	if (ret == 0) {
+		EnterCriticalSection(&ctx->handles.lock);
+		entry = handle_set_find_locked(&ctx->handles, h);
+		if (entry) {
+			entry->epoch++;
+		} else {
+			entry = handle_set_insert_locked(&ctx->handles, h);
+		}
+		if (entry) {
+			entry->owned = true;
+		}
+		*gen = entry ? entry->cancel_gen : 0;
+		*epoch = entry ? entry->epoch : 0;
+		LeaveCriticalSection(&ctx->handles.lock);
+	}
+	ReleaseSRWLockExclusive(&g_owner_lock);
+	return ret;
 }
 
 /* Current cancel generation of an associated handle (0 if never associated).
@@ -3274,7 +3357,6 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	params->cq_entries = ctx->ready.size;
 	params->features = ctx->features;
 
-	iocp_ctx_register(ctx);
 	*backend_ctx = ctx;
 	return 0;
 }
@@ -3477,7 +3559,7 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 
 	ready_queue_destroy(&ctx->ready);
 	// Drained: its handles may go to another context now.
-	iocp_ctx_unregister(ctx);
+	iocp_owner_forget(ctx);
 	handle_set_destroy(&ctx->handles);
 
 	if (ctx->sq_array) {
