@@ -100,6 +100,8 @@ typedef struct ior_work {
 	int pidfd; // waitpid op: the pidfd parked on the poller, -1 if none
 	struct ior_work_token *cur_token; // token the running callback observes
 	uint64_t deadline_ns; // link-timeout deadline once computed (0 = none)
+	struct ior_threads_pool_lt_arb
+			*arb; // link-timeout arbitration of a work, signal or process wait
 	struct ior_work_token token; // IOR_OP_WORK, IOR_OP_SIGWAIT: cancellation handle
 } ior_work;
 

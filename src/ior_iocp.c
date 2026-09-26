@@ -2070,9 +2070,10 @@ static void op_to_cqe(ior_iocp_op *op)
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
 	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL
 			|| op->opcode == IOR_OP_ASYNC_CANCEL || op->opcode == IOR_OP_WAITPID
-			|| op->opcode == IOR_OP_SIGWAIT) {
+			|| op->opcode == IOR_OP_SIGWAIT || op->opcode == IOR_OP_LINK_TIMEOUT) {
 		// The callback's return value (ready poll mask, cancel result, the
-		// waited pid, the signal), not a byte count.
+		// waited pid, the signal, a link timeout's cancel of a running
+		// callback), not a byte count.
 		op->cqe.iocp.res = op->work_res;
 	} else if (op->opcode == IOR_OP_ACCEPT) {
 		// The accepted socket, now the caller's (handles fit in 32 bits).
@@ -2276,6 +2277,19 @@ static ior_iocp_op *timer_heap_peek(timer_mgr *tm)
 	return tm->heap[0];
 }
 
+/*
+ * Whether op's link timeout is still armed, under timers.lock. A fired link
+ * timeout may be posted ahead of op (a callback still running, an abort still
+ * on its way), and the caller can then reap it and reuse its slot, so
+ * op->link_timeout counts only while that slot still guards op: a slot reused
+ * guards nothing (alloc_op) or another op, never op, which is still in flight.
+ */
+static bool link_timeout_armed_locked(ior_iocp_op *op)
+{
+	ior_iocp_op *lt = op->link_timeout;
+	return lt->guarded == op && lt->timer_armed;
+}
+
 static DWORD WINAPI timer_thread_main(LPVOID arg)
 {
 	ior_ctx_iocp *ctx = (ior_ctx_iocp *) arg;
@@ -2319,12 +2333,16 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			 * completion arrives through the normal IOCP path - and post this
 			 * link timeout as -ETIME.
 			 *
-			 * A guarded work op cannot be cancelled: its callback runs to
-			 * completion on the threadpool and posts its real result. Flag its
-			 * token instead so the callback can bail out early. The store
-			 * happens under timers.lock, which the completion path also takes
-			 * to resolve the pair before the op can be reaped and recycled, so
-			 * the guarded op is guaranteed alive here.
+			 * A guarded work op still queued on the threadpool is claimed so
+			 * its callback never runs, and completes as cancelled. A running
+			 * one cannot be stopped: its token is flagged so the callback can
+			 * bail out early, and as io_uring's link timeout on a running
+			 * request this one completes now with the cancel's -EALREADY,
+			 * the work op with its real result once the callback returns.
+			 * The claim and the store happen under timers.lock, which the
+			 * completion path also takes to resolve the pair before the op
+			 * can be reaped and recycled, so the guarded op is guaranteed
+			 * alive here.
 			 */
 			ior_iocp_op *guarded = op->guarded;
 			// Work and poll ops have no OVERLAPPED I/O to cancel: flag their
@@ -2336,6 +2354,24 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			bool is_poll = guarded->opcode == IOR_OP_POLL;
 			bool is_wait = guarded->opcode == IOR_OP_WAITPID;
 			bool is_sigwait = guarded->opcode == IOR_OP_SIGWAIT;
+			bool work_queued = false;
+			DWORD lt_error = ERROR_TIMEOUT;
+			if (guarded->opcode == IOR_OP_WORK) {
+				int expected = IOCP_OP_WORK;
+				work_queued
+						= atomic_compare_exchange_strong(&guarded->state, &expected, IOCP_OP_DONE);
+				if (!work_queued) {
+					// Running: -EALREADY. Done: the callback returned and
+					// posted before the consumer resolved the pair, so the op
+					// finished first and this completes as cancelled. Carried
+					// in work_res, as a cancel's result: submit_res would make
+					// a submit that has not reached this link timeout's SQE yet
+					// (armed with its guarded op, deadline already due) post it
+					// a second time, as one in a failed chain.
+					op->work_res = expected == IOCP_OP_WORK_RUNNING ? -EALREADY : -ECANCELED;
+					lt_error = ERROR_SUCCESS;
+				}
+			}
 			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
 			} else if (!is_wait && !is_sigwait) {
@@ -2357,7 +2393,14 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			if (is_sigwait) {
 				(void) iocp_sigwait_abort(ctx, guarded);
 			}
-			post_armed_op(ctx, op, ERROR_TIMEOUT);
+			if (work_queued) {
+				// As a cancel of a queued callback (see iocp_cancel_one).
+				WaitForThreadpoolWorkCallbacks(guarded->tp_work, TRUE);
+				CloseThreadpoolWork(guarded->tp_work);
+				guarded->tp_work = NULL;
+				post_armed_op(ctx, guarded, ERROR_OPERATION_ABORTED);
+			}
+			post_armed_op(ctx, op, lt_error);
 			EnterCriticalSection(&tm->lock);
 			continue;
 		}
@@ -2711,7 +2754,7 @@ static bool reissue_collateral_abort(ior_ctx_iocp *ctx, ior_iocp_op *op, DWORD b
 
 	EnterCriticalSection(&ctx->timers.lock);
 	bool collateral = atomic_load(&op->state) == IOCP_OP_IO
-			&& (!op->link_timeout || op->link_timeout->timer_armed)
+			&& (!op->link_timeout || link_timeout_armed_locked(op))
 			// A cancel moved the generation while this request was in flight:
 			// a set lookup, so an abort that is not a replay candidate at all
 			// (one the library did not cause: the caller's own CancelIoEx, or
@@ -3441,7 +3484,10 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 		// op is issued, not submitted as a standalone op. Still count it: its
 		// SQE was consumed, and other backends report both entries of the pair.
 		if (op->opcode == IOR_OP_LINK_TIMEOUT && op->guarded) {
-			atomic_store(&op->state, IOCP_OP_LINKED);
+			// Unless its guarded op, issued just before, armed it already
+			// and the deadline has even fired and posted it.
+			int expected = IOCP_OP_FREE;
+			atomic_compare_exchange_strong(&op->state, &expected, IOCP_OP_LINKED);
 			submitted++;
 			prev = op;
 			continue;
@@ -3845,10 +3891,10 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	 */
 	if (op->link_timeout) {
 		ior_iocp_op *lt = op->link_timeout;
-		op->link_timeout = NULL;
 
 		EnterCriticalSection(&ctx->timers.lock);
-		bool won = lt->timer_armed;
+		bool won = link_timeout_armed_locked(op);
+		op->link_timeout = NULL;
 		if (won) {
 			lt->timer_armed = false;
 			timer_heap_remove(&ctx->timers, lt);

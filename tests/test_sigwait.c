@@ -499,13 +499,14 @@ static void test_sigwait_link_timeout(void **state)
 		assert_int_equal(res[(uintptr_t) TAG_TMO], -ETIME);
 		assert_true(test_monotonic_now_ns() - start < 1000000000ULL);
 	} else {
-		// The deadline passed unnoticed by the blocked worker; the signal
-		// releases it, and the timeout is then known to have fired.
-		sleep_ms(200);
+		// The worker blocked in sigwait() cannot be stopped: the timeout
+		// completes at the deadline, the wait once a signal releases it.
+		reap_tags(s->ctx, 1, res, 5);
+		assert_int_equal(res[(uintptr_t) TAG_TMO], -EALREADY);
+		assert_true(test_monotonic_now_ns() - start < 1000000000ULL);
 		send_signal(SIG_A);
-		reap_tags(s->ctx, 2, res, 5);
+		reap_tags(s->ctx, 1, res, 5);
 		assert_int_equal(res[(uintptr_t) TAG_SIG], SIG_A);
-		assert_int_equal(res[(uintptr_t) TAG_TMO], -ETIME);
 	}
 }
 

@@ -348,12 +348,45 @@ static void test_waitpid_link_timeout(void **state)
 		assert_int_equal(res[(uintptr_t) TAG_TMO], -ETIME);
 		assert_true(test_monotonic_now_ns() - start < 1000000000ULL);
 	} else {
-		// The worker's waitpid() returned first; the timeout resolved after.
+		// The worker's waitpid() cannot be stopped: the timeout completed
+		// at the deadline, the wait once the child exited.
 		assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
-		assert_int_equal(res[(uintptr_t) TAG_TMO], -ECANCELED);
+		assert_int_equal(res[(uintptr_t) TAG_TMO], -EALREADY);
 		k->reaped = 1;
 	}
 }
+
+#ifndef _WIN32
+/*
+ * A wait that holds a worker (WUNTRACED is never watched) cannot be stopped,
+ * but its link timeout still completes at the deadline, with -EALREADY; the
+ * wait completes once the child exits.
+ */
+static void test_waitpid_link_timeout_blocking(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+	int status = -1;
+
+	kid *k = spawn_child(s, 3, 600);
+	submit_wait(s, k->pid, &status, WUNTRACED, TAG_WAIT, IOR_SQE_IO_LINK);
+	ior_sqe *lt = ior_get_sqe(s->ctx);
+	assert_non_null(lt);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 };
+	ior_prep_link_timeout(s->ctx, lt, &ts, 0);
+	ior_sqe_set_data(s->ctx, lt, TAG_TMO);
+	uint64_t start = test_monotonic_now_ns();
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	int32_t res[MAX_TAG];
+	reap_tags(s->ctx, 1, res, 5);
+	assert_int_equal(res[(uintptr_t) TAG_TMO], -EALREADY);
+	assert_true(test_monotonic_now_ns() - start < 400000000ULL);
+
+	reap_tags(s->ctx, 1, res, 5);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
+	check_reaped(s, res[(uintptr_t) TAG_WAIT], status);
+}
+#endif
 
 // Teardown with a wait still pending must not hang on a watched wait.
 static void test_waitpid_pending_at_exit(void **state)
@@ -509,6 +542,7 @@ int main(int argc, char **argv)
 		cmocka_unit_test_setup_teardown(test_waitpid_signaled, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any_cancel, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_link_timeout_blocking, setup_wp, teardown_wp),
 #endif
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);

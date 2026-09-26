@@ -114,7 +114,9 @@ struct ior_uring_wait {
  * worker path; a fired link timeout claims QUEUED -> CANCELLED to kill a job
  * that has not started (its callback then never runs). The refcount is held by
  * the worker (via the pool FIFO) and, when a link timeout is armed, by the
- * timer; the job is freed by whichever side finishes last.
+ * timer; the job is freed by whichever side finishes last. The link timeout's
+ * CQE is posted by whoever takes lt_posted first: the timer at the deadline
+ * while the callback runs (-EALREADY), else the worker once it returned.
  */
 enum {
 	IOR_URING_JOB_QUEUED = 0,
@@ -140,7 +142,7 @@ struct ior_uring_job {
 	int has_lt; // a LINK_TIMEOUT sqe followed and was intercepted
 	int lt_armed; // its deadline was valid and the timer is armed
 	uint64_t lt_user_data;
-	_Atomic int lt_fired;
+	_Atomic int lt_posted;
 
 	// IOR_OP_WAITPID run as a job: a worker's waitpid(2).
 	pid_t wait_pid;
@@ -371,16 +373,14 @@ static void ior_uring_run_job(void *owner, ior_worker_pool_job *pj)
 	}
 
 	int32_t res = job->fn(&job->token, job->arg);
+	// Unless the timer posted it while the callback ran, the link timeout
+	// resolves as "op finished first".
+	int post_lt = job->has_lt && !atomic_exchange(&job->lt_posted, 1);
 	atomic_store(&job->state, IOR_URING_JOB_DONE);
 
 	ior_uring_post_cqe(ctx, job->user_data, res);
-	if (job->has_lt) {
-		// -ETIME if the deadline passed while the callback ran, else the
-		// timeout resolves as "op finished first". A concurrent firing decides
-		// this race either way, matching io_uring's inherent cancel/complete
-		// race; the timer only posts when it wins the QUEUED state.
-		int fired = atomic_load(&job->lt_fired);
-		ior_uring_post_cqe(ctx, job->lt_user_data, fired ? -ETIME : -ECANCELED);
+	if (post_lt) {
+		ior_uring_post_cqe(ctx, job->lt_user_data, -ECANCELED);
 	}
 
 	ior_uring_job_release(job);
@@ -392,14 +392,19 @@ static void ior_uring_lt_fired(void *owner, void *arg)
 	ior_ctx_uring *ctx = owner;
 	ior_uring_job *job = arg;
 
-	atomic_store(&job->lt_fired, 1);
 	atomic_store_explicit(&job->token.cancelled, 1, memory_order_release);
 
 	int expected = IOR_URING_JOB_QUEUED;
 	if (atomic_compare_exchange_strong(&job->state, &expected, IOR_URING_JOB_CANCELLED)) {
 		// Job had not started: it never will. Post both completions here.
+		atomic_store(&job->lt_posted, 1);
 		ior_uring_post_cqe(ctx, job->user_data, -ECANCELED);
 		ior_uring_post_cqe(ctx, job->lt_user_data, -ETIME);
+	} else if (expected == IOR_URING_JOB_RUNNING && !atomic_exchange(&job->lt_posted, 1)) {
+		/* The callback cannot be stopped: as io_uring's link timeout on a
+		 * running request, complete now with the cancel's -EALREADY and
+		 * leave the op's CQE to the worker. */
+		ior_uring_post_cqe(ctx, job->lt_user_data, -EALREADY);
 	}
 
 	ior_uring_job_release(job);
@@ -843,6 +848,7 @@ static int ior_uring_cancel_job_locked(ior_ctx_uring *ctx, ior_uring_job *job, i
 		if (job->lt_armed && ior_worker_pool_cancel_timer(ctx->wp, job) == 0) {
 			job->cancel_drop++;
 		}
+		atomic_store(&job->lt_posted, 1);
 		ior_uring_post_cqe(ctx, job->user_data, -ECANCELED);
 		if (job->has_lt) {
 			ior_uring_post_cqe(ctx, job->lt_user_data, -ECANCELED);
@@ -1496,7 +1502,7 @@ static int ior_uring_job_new(
 	job->ksqe = s;
 	atomic_init(&job->state, IOR_URING_JOB_QUEUED);
 	atomic_init(&job->refs, 1);
-	atomic_init(&job->lt_fired, 0);
+	atomic_init(&job->lt_posted, 0);
 	atomic_init(&job->token.cancelled, 0);
 	job->token.shutdown = &ctx->shutdown;
 

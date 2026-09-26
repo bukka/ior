@@ -654,7 +654,15 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *   - if @p ts elapses first, the guarded op is cancelled (its CQE has
  *     res == -ECANCELED) and this link timeout completes with res == -ETIME;
  *   - if the guarded op finishes first, it reports its normal result and this
- *     link timeout completes with res == -ECANCELED.
+ *     link timeout completes with res == -ECANCELED;
+ *   - if @p ts elapses while the guarded op runs and cannot be stopped (a
+ *     work callback, a process wait that holds a worker thread, a signal
+ *     wait blocked in sigwait(3) where there is no sigtimedwait), this link
+ *     timeout completes at the deadline with res == -EALREADY, as io_uring's
+ *     does for a running request, and the guarded op completes with its own
+ *     result once it ends. Its memory stays in use until then.
+ *
+ * The deadline runs from submit, including any wait for a free worker.
  *
  * On the threads backend, cancellation is effective for read/write/send/recv on
  * pollable descriptors (sockets, pipes); a guarded op on a regular file runs to
@@ -774,8 +782,9 @@ void ior_prep_connect(
  * handle, so the op is cancellable and a link timeout bounds it. Every other
  * request (-1 for any child, a process group, WUNTRACED or WCONTINUED, or a
  * platform without a process watch) blocks a worker thread in waitpid(2)
- * until it returns: a cancel then reports -EALREADY and ior_queue_exit()
- * waits for it.
+ * until it returns: a cancel then reports -EALREADY, a link timeout completes
+ * at its deadline with -EALREADY while the op completes when waitpid(2)
+ * returns (see ior_prep_link_timeout()), and ior_queue_exit() waits for it.
  *
  * Windows accepts only @p pid > 0 (-ENOTSUP otherwise), ignores @p options
  * and stores the exit code in @p status. Any process can be waited for
@@ -820,7 +829,9 @@ int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int
  * ior_queue_exit(); every pending op occupies a worker for as long as it
  * waits. Where the platform has no sigtimedwait (macOS) the worker blocks in
  * sigwait(3) until a signal from the set arrives, uncancellable, filling
- * only si_signo in @p info, and ior_queue_exit() waits for it.
+ * only si_signo in @p info, and ior_queue_exit() waits for it: a cancel then
+ * reports -EALREADY, as does a link timeout at its deadline, and the op
+ * completes with the signal (see ior_prep_link_timeout()).
  *
  * Windows knows console control events only: @p set may name SIGINT
  * (Ctrl+C) and SIGBREAK (Ctrl+Break, and the close, logoff and shutdown
@@ -1023,11 +1034,14 @@ typedef int32_t (*ior_work_fn)(ior_work_token *token, void *arg);
  * produce a CQE:
  *   - callback finishes first: work CQE = callback's return value, link
  *     timeout CQE = -ECANCELED;
- *   - timeout fires before the callback started: work CQE = -ECANCELED (the
- *     callback never runs), link timeout CQE = -ETIME;
+ *   - timeout fires before the callback started, queued behind busy workers
+ *     included: work CQE = -ECANCELED (the callback never runs), link timeout
+ *     CQE = -ETIME;
  *   - timeout fires while the callback runs: the callback cannot be killed;
- *     the token is flagged so it can return early, the work CQE carries its
- *     return value when it does, and the link timeout CQE = -ETIME.
+ *     the token is flagged so it can return early, the link timeout CQE =
+ *     -EALREADY is posted at the deadline, and the work CQE carries the
+ *     callback's return value once it returns. @p arg stays in use until
+ *     then, and the callback keeps its worker thread busy.
  * Other IOR_SQE_IO_LINK / IOR_SQE_IO_DRAIN combinations involving work ops are
  * not supported on the io_uring backend (the kernel cannot order around a
  * userspace callback).
