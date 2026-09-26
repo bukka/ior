@@ -189,19 +189,64 @@ typedef struct busy_state {
 } busy_state;
 
 // Keeps the multishot polls reporting, so the poller thread is often busy
-// (and holding its lock) when the test forks.
+// (and holding its lock) when the test forks. Each pipe is drained and then
+// written, so it stays readable until the next round: a byte read back at
+// once could be gone before the poller looks, and an edge-triggered watch
+// then reports nothing.
 static void *busy_writer(void *arg)
 {
 	busy_state *b = arg;
 	char buf[16];
 	while (!atomic_load(&b->stop)) {
 		for (int i = 0; i < BUSY_PIPES; i++) {
-			(void) write(b->p[i][1], "x", 1);
-			(void) read(b->p[i][0], buf, sizeof(buf));
+			ssize_t n = read(b->p[i][0], buf, sizeof(buf));
+			(void) n;
+			n = write(b->p[i][1], "x", 1);
+			(void) n;
 		}
 		usleep(1000);
 	}
 	return NULL;
+}
+
+// Reap a child, which must exit within 10 s: one still running then is
+// killed and reported, so a hang fails the test instead of timing it out.
+static int reap_child(pid_t pid)
+{
+	int status;
+	for (int i = 0; i < 1000; i++) {
+		pid_t r = waitpid(pid, &status, WNOHANG);
+		assert_true(r >= 0);
+		if (r == pid) {
+			return status;
+		}
+		usleep(10000);
+	}
+	char path[64];
+	char line[256];
+	snprintf(path, sizeof(path), "/proc/%d/wchan", (int) pid);
+	FILE *f = fopen(path, "r");
+	if (f) {
+		if (fgets(line, sizeof(line), f)) {
+			fprintf(stderr, "stuck child %d wchan: %s\n", (int) pid, line);
+		}
+		fclose(f);
+	}
+	snprintf(path, sizeof(path), "/proc/%d/status", (int) pid);
+	f = fopen(path, "r");
+	if (f) {
+		while (fgets(line, sizeof(line), f)) {
+			if (strncmp(line, "State:", 6) == 0 || strncmp(line, "SigBlk:", 7) == 0
+					|| strncmp(line, "SigIgn:", 7) == 0) {
+				fprintf(stderr, "stuck child %d %s", (int) pid, line);
+			}
+		}
+		fclose(f);
+	}
+	kill(pid, SIGKILL);
+	waitpid(pid, &status, 0);
+	fail_msg("child %d did not exit within 10 s", (int) pid);
+	return -1;
 }
 
 // Whether fd is a descriptor of the read end of one of the watched pipes.
@@ -256,7 +301,16 @@ static void test_forget_busy_poller(void **state)
 	// before it is published, the child cannot know its descriptors. Every
 	// poll having reported an edge, it is up.
 	int seen[BUSY_PIPES] = { 0 };
+	uint64_t start = test_monotonic_now_ns();
 	for (int left = BUSY_PIPES; left > 0;) {
+		if (test_monotonic_now_ns() - start > 10000000000ULL) {
+			for (int i = 0; i < BUSY_PIPES; i++) {
+				if (!seen[i]) {
+					fprintf(stderr, "pipe %d never reported\n", i);
+				}
+			}
+			fail_msg("%d polls did not report within 10 s", left);
+		}
 		ior_cqe *cqe = NULL;
 		ior_timespec to = { .tv_sec = 5, .tv_nsec = 0 };
 		int ret;
@@ -295,8 +349,7 @@ static void test_forget_busy_poller(void **state)
 			}
 			_exit(0);
 		}
-		int status;
-		assert_int_equal(waitpid(pid, &status, 0), pid);
+		int status = reap_child(pid);
 		assert_true(WIFEXITED(status));
 		assert_int_equal(WEXITSTATUS(status), 0);
 	}
