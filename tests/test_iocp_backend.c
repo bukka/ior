@@ -10,6 +10,8 @@
  *   - timer completion via the dedicated timer thread
  *   - synchronous-completion accounting (cached reads)
  *   - teardown while operations are still in flight
+ *   - a handle moving between rings (one completion port per handle), with
+ *     recycled handle values, requests pending elsewhere and racing rings
  *
  * The whole file compiles to an empty (passing) cmocka group on non-IOCP
  * builds, so it is harmless to register unconditionally in CMake - but the
@@ -355,6 +357,324 @@ static void test_sync_completion_accounting(void **state)
 }
 
 /* ===================================================================== */
+/* One completion port per handle                                        */
+/* ===================================================================== */
+
+// Read a few bytes of fd through ctx and return the result.
+static int32_t read_once(ior_ctx *ctx, ior_fd_t fd)
+{
+	char buf[8];
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_read(ctx, sqe, fd, buf, sizeof(buf), 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x300);
+	assert_true(ior_submit(ctx) >= 0);
+	ior_cqe *cqe = NULL;
+	assert_return_code(ior_wait_cqe(ctx, &cqe), 0);
+	assert_ptr_equal(ior_cqe_get_data(ctx, cqe), (void *) 0x300);
+	int32_t res = ior_cqe_get_res(ctx, cqe);
+	ior_cqe_seen(ctx, cqe);
+	return res;
+}
+
+/*
+ * A handle stays tied to the port of the first ring that used it; once that
+ * ring is destroyed, the next ring to use it takes it over.
+ */
+static void test_handle_moves_after_destroy(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(test_fd_is_valid(fd));
+
+	ior_ctx *other = NULL;
+	assert_return_code(ior_queue_init(32, &other), 0);
+	assert_true(read_once(other, fd) >= 0);
+	ior_queue_exit(other);
+
+	assert_true(read_once(s->ctx, fd) >= 0);
+	assert_true(read_once(s->ctx, fd) >= 0);
+	test_close_fd(fd);
+}
+
+/*
+ * While the first ring lives, it may still have requests on the handle, so
+ * another ring is refused with -EBUSY; it gets the handle once the first is
+ * destroyed.
+ */
+static void test_handle_busy_in_live_ring(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(test_fd_is_valid(fd));
+
+	ior_ctx *other = NULL;
+	assert_return_code(ior_queue_init(32, &other), 0);
+	assert_true(read_once(other, fd) >= 0);
+
+	assert_int_equal(read_once(s->ctx, fd), -EBUSY);
+	assert_true(read_once(other, fd) >= 0); // still the first ring's
+
+	ior_queue_exit(other);
+	assert_true(read_once(s->ctx, fd) >= 0);
+	test_close_fd(fd);
+}
+
+// A handle tied to a completion port that is not ior's is taken over.
+static void test_handle_from_foreign_port(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(test_fd_is_valid(fd));
+
+	HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	assert_non_null(port);
+	assert_non_null(CreateIoCompletionPort((HANDLE) fd, port, 0, 0));
+
+	assert_true(read_once(s->ctx, fd) >= 0);
+	CloseHandle(port);
+	test_close_fd(fd);
+}
+
+#define READ_NO_COMPLETION INT32_MIN
+
+/*
+ * Read a few bytes of fd through ctx, READ_NO_COMPLETION if nothing arrives
+ * within 2s (the completion went to another port). No asserts: also run on
+ * threads of their own.
+ */
+static int32_t read_timed(ior_ctx *ctx, ior_fd_t fd)
+{
+	char buf[8];
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	if (!sqe) {
+		return -ENOBUFS;
+	}
+	ior_prep_read(ctx, sqe, fd, buf, sizeof(buf), 0);
+	if (ior_submit(ctx) < 0) {
+		return -EIO;
+	}
+	ior_cqe *cqe = NULL;
+	ior_timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+	if (ior_wait_cqe_timeout(ctx, &cqe, &ts) < 0) {
+		return READ_NO_COMPLETION;
+	}
+	int32_t res = ior_cqe_get_res(ctx, cqe);
+	ior_cqe_seen(ctx, cqe);
+	return res;
+}
+
+// Close fd and open the file again, for the same handle value if it comes back.
+static ior_fd_t reopen(const char *path, ior_fd_t fd)
+{
+	test_close_fd(fd);
+	ior_fd_t again = test_open_fd(path);
+	assert_true(test_fd_is_valid(again));
+	return again;
+}
+
+/*
+ * A live ring that used a handle value whose object was closed since does not
+ * hold the object under it now: once that one's ring is gone, a third ring
+ * takes it over instead of being refused.
+ */
+static void test_handle_recycled_value_not_busy(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_ctx *first = NULL, *second = NULL;
+	assert_return_code(ior_queue_init(32, &first), 0);
+	assert_return_code(ior_queue_init(32, &second), 0);
+
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(read_once(first, fd) >= 0);
+	ior_fd_t again = reopen(s->path, fd);
+	if (again != fd) {
+		test_close_fd(again);
+		ior_queue_exit(second);
+		ior_queue_exit(first);
+		skip(); // the value did not come back
+	}
+	assert_true(read_once(second, again) >= 0);
+	ior_queue_exit(second);
+
+	int32_t res = read_timed(s->ctx, again);
+	ior_queue_exit(first);
+	assert_true(res >= 0);
+	test_close_fd(again);
+}
+
+/*
+ * A ring that used a handle value before, and meets it again naming an object
+ * another ring (destroyed since) had, takes the object over rather than
+ * taking it for its own: its request would complete on the other port.
+ */
+static void test_handle_recycled_value_retaken(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_ctx *other = NULL;
+	assert_return_code(ior_queue_init(32, &other), 0);
+
+	ior_fd_t fd = test_open_fd(s->path);
+	assert_true(read_once(s->ctx, fd) >= 0);
+	ior_fd_t again = reopen(s->path, fd);
+	if (again != fd) {
+		test_close_fd(again);
+		ior_queue_exit(other);
+		skip();
+	}
+	assert_true(read_once(other, again) >= 0);
+	ior_queue_exit(other);
+
+	int32_t res = read_timed(s->ctx, again);
+	if (res == READ_NO_COMPLETION) {
+		s->ctx = NULL; // its teardown would wait for the lost completion
+	}
+	assert_true(res >= 0 && res != READ_NO_COMPLETION);
+	test_close_fd(again);
+}
+
+/*
+ * A handle with a request pending on a port that is not ior's stays there:
+ * the kernel does not move it, as that request's completion would follow it.
+ * The ring gets -EBUSY and the other port its completion.
+ */
+static void test_handle_foreign_pending_busy(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fds[2];
+	assert_return_code(test_make_socketpair(fds), 0);
+	HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	assert_non_null(port);
+	assert_non_null(CreateIoCompletionPort((HANDLE) fds[0], port, 7, 0));
+
+	char fbuf[4];
+	OVERLAPPED fov;
+	memset(&fov, 0, sizeof(fov));
+	WSABUF wb = { sizeof(fbuf), fbuf };
+	DWORD flags = 0;
+	int rc = WSARecv((SOCKET) fds[0], &wb, 1, NULL, &flags, &fov, NULL);
+	assert_true(rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING);
+
+	char ibuf[4];
+	ior_sqe *sqe = ior_get_sqe(s->ctx);
+	assert_non_null(sqe);
+	ior_prep_recv(s->ctx, sqe, fds[0], ibuf, sizeof(ibuf), 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	ior_cqe *cqe = NULL;
+	assert_return_code(ior_wait_cqe(s->ctx, &cqe), 0);
+	assert_int_equal(ior_cqe_get_res(s->ctx, cqe), -EBUSY);
+	ior_cqe_seen(s->ctx, cqe);
+
+	assert_int_equal(send((SOCKET) fds[1], "abcd", 4, 0), 4);
+	DWORD n = 0;
+	ULONG_PTR key = 0;
+	LPOVERLAPPED ov = NULL;
+	assert_true(GetQueuedCompletionStatus(port, &n, &key, &ov, 2000));
+	assert_ptr_equal(ov, &fov);
+	assert_int_equal(key, 7);
+
+	test_close_fd(fds[0]);
+	test_close_fd(fds[1]);
+	CloseHandle(port);
+}
+
+// Sockets move as files do: from a port that is not ior's, from a ring gone.
+static void test_handle_socket_moves(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	ior_fd_t fds[2];
+	assert_return_code(test_make_socketpair(fds), 0);
+	HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	assert_non_null(port);
+	assert_non_null(CreateIoCompletionPort((HANDLE) fds[0], port, 0, 0));
+
+	ior_ctx *other = NULL;
+	assert_return_code(ior_queue_init(32, &other), 0);
+	char buf[4];
+	ior_ctx *rings[2] = { other, s->ctx };
+	for (int i = 0; i < 2; i++) {
+		// Through `other` first (from the foreign port), then this ring.
+		assert_int_equal(send((SOCKET) fds[1], "abcd", 4, 0), 4);
+		ior_sqe *sqe = ior_get_sqe(rings[i]);
+		assert_non_null(sqe);
+		ior_prep_recv(rings[i], sqe, fds[0], buf, sizeof(buf), 0);
+		assert_true(ior_submit(rings[i]) >= 0);
+		ior_cqe *cqe = NULL;
+		assert_return_code(ior_wait_cqe(rings[i], &cqe), 0);
+		assert_int_equal(ior_cqe_get_res(rings[i], cqe), 4);
+		ior_cqe_seen(rings[i], cqe);
+		if (i == 0) {
+			ior_queue_exit(other);
+		}
+	}
+	test_close_fd(fds[0]);
+	test_close_fd(fds[1]);
+	CloseHandle(port);
+}
+
+typedef struct race_arg {
+	ior_ctx *ctx;
+	ior_fd_t fd;
+	HANDLE go;
+	int32_t res;
+} race_arg;
+
+static DWORD WINAPI race_read(LPVOID p)
+{
+	race_arg *a = p;
+	WaitForSingleObject(a->go, INFINITE);
+	a->res = read_timed(a->ctx, a->fd);
+	return 0;
+}
+
+/*
+ * Two rings reaching for a handle no live ring owns at once: one takes it
+ * over, the other finds it owned and gets -EBUSY. Never both.
+ */
+static void test_handle_takeover_race(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	for (int round = 0; round < 50; round++) {
+		ior_fd_t fd = test_open_fd(s->path);
+		ior_ctx *gone = NULL;
+		assert_return_code(ior_queue_init(32, &gone), 0);
+		assert_true(read_once(gone, fd) >= 0);
+		ior_queue_exit(gone);
+
+		HANDLE go = CreateEventW(NULL, TRUE, FALSE, NULL);
+		assert_non_null(go);
+		race_arg args[2];
+		HANDLE threads[2];
+		for (int i = 0; i < 2; i++) {
+			args[i].ctx = NULL;
+			assert_return_code(ior_queue_init(32, &args[i].ctx), 0);
+			args[i].fd = fd;
+			args[i].go = go;
+			args[i].res = 0;
+			threads[i] = CreateThread(NULL, 0, race_read, &args[i], 0, NULL);
+			assert_non_null(threads[i]);
+		}
+		SetEvent(go);
+		WaitForMultipleObjects(2, threads, TRUE, INFINITE);
+		for (int i = 0; i < 2; i++) {
+			CloseHandle(threads[i]);
+		}
+		CloseHandle(go);
+
+		int won = (args[0].res >= 0) + (args[1].res >= 0);
+		int busy = (args[0].res == -EBUSY) + (args[1].res == -EBUSY);
+		for (int i = 0; i < 2; i++) {
+			if (args[i].res != READ_NO_COMPLETION) {
+				ior_queue_exit(args[i].ctx);
+			}
+		}
+		assert_int_equal(won, 1);
+		assert_int_equal(busy, 1);
+		test_close_fd(fd);
+	}
+}
+
+/* ===================================================================== */
 /* Teardown with operations still in flight                              */
 /* ===================================================================== */
 
@@ -404,6 +724,16 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_timer_heap_order, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_sync_completion_accounting, iocp_setup, iocp_teardown),
 		cmocka_unit_test(test_teardown_inflight),
+		cmocka_unit_test_setup_teardown(test_handle_moves_after_destroy, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_handle_busy_in_live_ring, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_handle_from_foreign_port, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(
+				test_handle_recycled_value_not_busy, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(
+				test_handle_recycled_value_retaken, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_handle_foreign_pending_busy, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_handle_socket_moves, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_handle_takeover_race, iocp_setup, iocp_teardown),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 #else

@@ -154,6 +154,12 @@ int main() {
 > backend issues overlapped `ReadFile`/`WriteFile`, so handles passed to
 > `ior_prep_read`/`ior_prep_write` must be opened with `FILE_FLAG_OVERLAPPED`
 > (e.g. via `CreateFile`). A CRT `_open()` descriptor will not work.
+>
+> A handle is tied to the completion port of the first ring that uses it. A
+> later ring takes it over once that ring is destroyed, or from a port that is
+> not ior's; while that ring lives, another one gets `-EBUSY` for the handle,
+> since the first may still have requests on it, as it does for a handle with
+> requests still pending on a port that is not ior's.
 
 ### Operation Chaining Example
 
