@@ -377,6 +377,187 @@ static void test_cq_reserve_race(void **state)
 	ior_queue_exit(ctx);
 }
 
+/*
+ * A read of a regular file holds its worker until it returns, as io_uring's
+ * io-wq request does, so its link timeout cannot cancel it: the timeout
+ * completes at the deadline with -EALREADY and the read with all it read.
+ * Should the read not have started by the deadline, it never does
+ * (-ECANCELED) and the timeout reports -ETIME. The timeout never waits for
+ * the read to report it was first (-ECANCELED). (io_uring reads a cached
+ * file inline at submit, before its link timeout is armed, hence a thread
+ * backend test.)
+ */
+static void test_link_timeout_file_read(void **state)
+{
+	(void) state;
+	enum { SIZE = 64 << 20 };
+	char *content = calloc(1, SIZE);
+	assert_non_null(content);
+	char *path = create_temp_file(content, SIZE);
+	assert_non_null(path);
+	ior_fd_t fd = test_open_fd(path);
+	assert_true(test_fd_is_valid(fd));
+	// Once in the page cache, a read is a copy: long, but it cannot wait.
+	assert_int_equal(read(fd, content, SIZE), SIZE);
+
+	ior_ctx *ctx = init_threads(32, 64);
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_read(ctx, sqe, fd, content, SIZE, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x1);
+	ior_sqe_set_flags(ctx, sqe, IOR_SQE_IO_LINK);
+	sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; // 1 ms
+	ior_prep_link_timeout(ctx, sqe, &ts, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x2);
+	assert_int_equal(ior_submit(ctx), 2);
+
+	int32_t res_read = 0, res_lt = 0;
+	for (int i = 0; i < 2; i++) {
+		void *tag;
+		int32_t res = reap_one(ctx, &tag, NULL);
+		if (tag == (void *) 0x1) {
+			res_read = res;
+		} else {
+			assert_ptr_equal(tag, (void *) 0x2);
+			res_lt = res;
+		}
+	}
+	if (res_lt == -ETIME) {
+		assert_int_equal(res_read, -ECANCELED);
+	} else {
+		assert_int_equal(res_lt, -EALREADY);
+		assert_int_equal(res_read, SIZE);
+	}
+
+	ior_queue_exit(ctx);
+	test_close_fd(fd);
+	remove_temp_file(path);
+	free(path);
+	free(content);
+}
+
+#define BUSY_WORKERS 32 // the worker pool's default cap
+
+static int32_t hold_worker_fn(ior_work_token *token, void *arg)
+{
+	(void) token;
+	(void) arg;
+	usleep(300000);
+	return 0;
+}
+
+/*
+ * A read of a regular file still waiting for a worker at its link timeout's
+ * deadline never starts, as a socket op that would park does not: it
+ * completes with -ECANCELED and the timeout with -ETIME once a worker takes
+ * it, and the file is not read.
+ */
+static void test_link_timeout_file_read_queued(void **state)
+{
+	(void) state;
+	enum { SIZE = 1 << 20 };
+	char *content = malloc(SIZE);
+	assert_non_null(content);
+	memset(content, 'f', SIZE);
+	char *path = create_temp_file(content, SIZE);
+	assert_non_null(path);
+	ior_fd_t fd = test_open_fd(path);
+	assert_true(test_fd_is_valid(fd));
+	memset(content, 0, SIZE);
+
+	ior_ctx *ctx = init_threads(64, 128);
+	for (int i = 0; i < BUSY_WORKERS; i++) {
+		ior_sqe *sqe = ior_get_sqe(ctx);
+		assert_non_null(sqe);
+		assert_return_code(ior_prep_work(ctx, sqe, hold_worker_fn, NULL), 0);
+		ior_sqe_set_data(ctx, sqe, (void *) 0x9);
+	}
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_read(ctx, sqe, fd, content, SIZE, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x1);
+	ior_sqe_set_flags(ctx, sqe, IOR_SQE_IO_LINK);
+	sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50 ms
+	ior_prep_link_timeout(ctx, sqe, &ts, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x2);
+	assert_int_equal(ior_submit(ctx), BUSY_WORKERS + 2);
+
+	int32_t res_read = 0, res_lt = 0;
+	for (int i = 0; i < BUSY_WORKERS + 2; i++) {
+		void *tag;
+		int32_t res = reap_one(ctx, &tag, NULL);
+		if (tag == (void *) 0x1) {
+			res_read = res;
+		} else if (tag == (void *) 0x2) {
+			res_lt = res;
+		}
+	}
+	assert_int_equal(res_read, -ECANCELED);
+	assert_int_equal(res_lt, -ETIME);
+	assert_int_equal(content[0], 0); // never read
+
+	ior_queue_exit(ctx);
+	test_close_fd(fd);
+	remove_temp_file(path);
+	free(path);
+	free(content);
+}
+
+/*
+ * The same for a receive whose data is already there when a worker finally
+ * takes it: past its deadline it never starts, so the data stays unread.
+ */
+static void test_link_timeout_recv_queued(void **state)
+{
+	(void) state;
+	ior_fd_t sock[2];
+	assert_return_code(test_make_socketpair(sock), 0);
+	assert_int_equal(send(sock[0], "x", 1, 0), 1);
+
+	ior_ctx *ctx = init_threads(64, 128);
+	for (int i = 0; i < BUSY_WORKERS; i++) {
+		ior_sqe *sqe = ior_get_sqe(ctx);
+		assert_non_null(sqe);
+		assert_return_code(ior_prep_work(ctx, sqe, hold_worker_fn, NULL), 0);
+		ior_sqe_set_data(ctx, sqe, (void *) 0x9);
+	}
+	char buf[8];
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_recv(ctx, sqe, sock[1], buf, sizeof(buf), 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x1);
+	ior_sqe_set_flags(ctx, sqe, IOR_SQE_IO_LINK);
+	sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; // well before a worker is free
+	ior_prep_link_timeout(ctx, sqe, &ts, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x2);
+	assert_int_equal(ior_submit(ctx), BUSY_WORKERS + 2);
+
+	int32_t res_recv = 1, res_lt = 1;
+	for (int got = 0; got < BUSY_WORKERS + 2; got++) {
+		void *tag;
+		int32_t res = reap_one(ctx, &tag, NULL);
+		if (tag == (void *) 0x1) {
+			res_recv = res;
+		} else if (tag == (void *) 0x2) {
+			res_lt = res;
+		}
+	}
+	assert_int_equal(res_recv, -ECANCELED);
+	assert_int_equal(res_lt, -ETIME);
+	// Not read: the byte is still there.
+	assert_int_equal(recv(sock[1], buf, sizeof(buf), MSG_DONTWAIT), 1);
+
+	ior_queue_exit(ctx);
+	test_close_fd(sock[0]);
+	test_close_fd(sock[1]);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -385,6 +566,9 @@ int main(void)
 		cmocka_unit_test(test_cq_full_cancel_parked),
 		cmocka_unit_test(test_cq_full_multishot_ends),
 		cmocka_unit_test(test_cq_reserve_race),
+		cmocka_unit_test(test_link_timeout_file_read),
+		cmocka_unit_test(test_link_timeout_file_read_queued),
+		cmocka_unit_test(test_link_timeout_recv_queued),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

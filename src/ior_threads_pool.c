@@ -1363,6 +1363,7 @@ typedef struct ior_threads_pool_lt_arb {
 	ior_work *w; // the guarded op, valid under work_lock while ARMED
 	ior_work *lt;
 	int stoppable; // the op ends once its token is flagged (a signal wait)
+	uint64_t deadline_ns; // when the timer fires
 	_Atomic int state; // IOR_LT_*
 	_Atomic int refs;
 } ior_threads_pool_lt_arb;
@@ -1479,7 +1480,12 @@ static void ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *w, ior
 	atomic_init(&arb->state, IOR_LT_ARMED);
 	atomic_init(&arb->refs, 2); // the worker + the timer thread
 
-	uint64_t deadline_ns = ior_worker_pool_deadline_ns(ts, lt->sqe.threads.timeout_flags);
+	// A chain head's deadline was taken at submit; any other op's runs from now.
+	uint64_t deadline_ns = w->deadline_ns
+			? w->deadline_ns
+			: ior_worker_pool_deadline_ns(ts, lt->sqe.threads.timeout_flags);
+
+	arb->deadline_ns = deadline_ns;
 
 	if (ior_worker_pool_arm_timer(
 				pool->wp, deadline_ns, ior_threads_pool_lt_fired, ior_threads_pool_lt_dropped, arb)
@@ -1560,6 +1566,57 @@ static uint64_t ior_threads_pool_lt_finish(ior_threads_pool *pool, ior_work *lt,
 	}
 	ior_threads_pool_finish_res(pool, lt, res);
 	return 1;
+}
+
+/*
+ * Claim w for its deadline if that has passed before w started, as the timer
+ * does when it finds w not started (see ior_threads_pool_lt_fired): w then
+ * never starts and completes with -ECANCELED, its link timeout with -ETIME.
+ * For an op armed by the worker that reached it, whose deadline may have
+ * gone by while it waited for a worker: the timer, already due, would
+ * otherwise race the worker, which would usually start the op first.
+ */
+static void ior_threads_pool_lt_arb_expire_due(ior_threads_pool *pool, ior_work *w)
+{
+	ior_threads_pool_lt_arb *arb = w->arb;
+	if (!arb || ior_worker_pool_monotonic_ns() < arb->deadline_ns) {
+		return;
+	}
+	pthread_mutex_lock(&pool->work_lock);
+	int state = atomic_load_explicit(&w->state, memory_order_acquire);
+	if (atomic_load_explicit(&arb->state, memory_order_acquire) == IOR_LT_ARMED
+			&& (state == IOR_WORK_QUEUED || state == IOR_WORK_LINKED)
+			&& atomic_compare_exchange_strong(&w->state, &state, IOR_WORK_CANCELLED)) {
+		atomic_store_explicit(&arb->state, IOR_LT_FIRED, memory_order_release);
+	}
+	pthread_mutex_unlock(&pool->work_lock);
+}
+
+/*
+ * Retire w with res, then its link timeout lt, if it has one, as the two
+ * settled: -ECANCELED when w finished first, -ETIME when the deadline
+ * stopped it before it ran, nothing when the timer has posted -EALREADY for
+ * it already. Returns how many ops completed.
+ */
+static uint64_t ior_threads_pool_finish_guarded(
+		ior_threads_pool *pool, ior_work *w, ior_work *lt, const ior_cqe *cqe)
+{
+	ior_threads_pool_lt_arb *arb = w->arb;
+	int32_t lt_res = lt ? ior_threads_pool_lt_arb_settle(pool, arb) : 0;
+	ior_threads_pool_finish_op(pool, w, cqe);
+	// Only now: a cancel may flag the token through w->cur_token until w is retired.
+	ior_threads_pool_lt_arb_done(arb);
+	return 1 + (lt ? ior_threads_pool_lt_finish(pool, lt, lt_res) : 0);
+}
+
+static uint64_t ior_threads_pool_finish_guarded_res(
+		ior_threads_pool *pool, ior_work *w, ior_work *lt, int32_t res)
+{
+	ior_cqe cqe;
+	memset(&cqe, 0, sizeof(cqe));
+	cqe.threads.user_data = w->sqe.threads.user_data;
+	cqe.threads.res = res;
+	return ior_threads_pool_finish_guarded(pool, w, lt, &cqe);
 }
 
 /*
@@ -1858,6 +1915,27 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		}
 
 		/*
+		 * A chain head's deadline runs from submit. One still waiting for a
+		 * worker when it passed never starts, whatever it would find: a
+		 * socket with data already there as much as a file, as the timer
+		 * ends an op armed at submit (see ior_threads_pool_lt_fired). Not
+		 * an op the poller has found ready meanwhile: that readiness came
+		 * in time. A cancel that claimed it first is the result instead.
+		 */
+		if (lt && w->deadline_ns && !w->arb && !w->ready
+				&& ior_worker_pool_monotonic_ns() >= w->deadline_ns) {
+			int claimed = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0;
+			ior_threads_pool_finish_res(pool, w, -ECANCELED);
+			ior_threads_pool_finish_res(pool, lt, claimed ? -ECANCELED : -ETIME);
+			count += 2;
+			if (has_link) {
+				cancel = 1;
+			}
+			w = after;
+			continue;
+		}
+
+		/*
 		 * Readiness gate: poll ops always wait on the poller. An rw op runs
 		 * at once and parks below if it would block, which needs a syscall
 		 * that reports rather than waits: a per-call non-blocking form where
@@ -1888,14 +1966,9 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 				return;
 			}
 
-			// Registration failed (or a cancel claimed the op meanwhile): fail
-			// the op here, cancel any linked rest.
-			ior_threads_pool_finish_res(pool, w, ret);
-			count++;
-			if (lt) {
-				ior_threads_pool_finish_res(pool, lt, -ECANCELED);
-				count++;
-			}
+			// Registration failed (or a cancel or the deadline claimed the op
+			// meanwhile): fail the op here, cancel any linked rest.
+			count += ior_threads_pool_finish_guarded_res(pool, w, lt, ret);
 			if (has_link) {
 				cancel = 1;
 			}
@@ -1913,12 +1986,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		 */
 		if (unready && nowait) {
 			int res = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0 ? -ECANCELED : -EAGAIN;
-			ior_threads_pool_finish_res(pool, w, res);
-			count++;
-			if (lt) {
-				ior_threads_pool_finish_res(pool, lt, -ECANCELED);
-				count++;
-			}
+			count += ior_threads_pool_finish_guarded_res(pool, w, lt, res);
 			if (has_link) {
 				cancel = 1; // a failed linked op breaks the chain
 			}
@@ -1974,6 +2042,19 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		ior_cqe cqe;
 		w->cur_token = &w->token;
 		int may_park = events && !nowait && ior_threads_pool_rw_may_park(&w->sqe);
+		/*
+		 * An op that holds this worker until its syscall returns (a read or
+		 * write on a regular file, and anything else with no readiness to
+		 * wait for) cannot be stopped, like the io-wq request io_uring makes
+		 * of it: its link timeout is armed now, so that it completes at the
+		 * deadline with -EALREADY (see ior_threads_pool_lt_fired). One that
+		 * may park instead takes its deadline to the poller.
+		 */
+		if (lt && !may_park && !w->arb) {
+			ior_threads_pool_lt_arb_arm(pool, w, lt);
+			// Queued past its deadline, it never starts, as a parked op would not.
+			ior_threads_pool_lt_arb_expire_due(pool, w);
+		}
 		if (ior_threads_pool_enter(w, may_park ? IOR_WORK_TRYING : IOR_WORK_RUNNING) < 0) {
 			memset(&cqe, 0, sizeof(cqe));
 			cqe.threads.user_data = w->sqe.threads.user_data;
@@ -2008,14 +2089,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 				cqe.threads.res = ret;
 			}
 		}
-		ior_threads_pool_finish_op(pool, w, &cqe);
-		count++;
-
-		if (lt) {
-			// The guarded op finished first: its link timeout is cancelled.
-			ior_threads_pool_finish_res(pool, lt, -ECANCELED);
-			count++;
-		}
+		count += ior_threads_pool_finish_guarded(pool, w, lt, &cqe);
 
 		if (has_link && cqe.threads.res < 0) {
 			cancel = 1; // a failed linked op breaks the chain
