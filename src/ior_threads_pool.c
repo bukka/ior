@@ -1915,6 +1915,27 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		}
 
 		/*
+		 * A chain head's deadline runs from submit. One still waiting for a
+		 * worker when it passed never starts, whatever it would find: a
+		 * socket with data already there as much as a file, as the timer
+		 * ends an op armed at submit (see ior_threads_pool_lt_fired). Not
+		 * an op the poller has found ready meanwhile: that readiness came
+		 * in time. A cancel that claimed it first is the result instead.
+		 */
+		if (lt && w->deadline_ns && !w->arb && !w->ready
+				&& ior_worker_pool_monotonic_ns() >= w->deadline_ns) {
+			int claimed = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0;
+			ior_threads_pool_finish_res(pool, w, -ECANCELED);
+			ior_threads_pool_finish_res(pool, lt, claimed ? -ECANCELED : -ETIME);
+			count += 2;
+			if (has_link) {
+				cancel = 1;
+			}
+			w = after;
+			continue;
+		}
+
+		/*
 		 * Readiness gate: poll ops always wait on the poller. An rw op runs
 		 * at once and parks below if it would block, which needs a syscall
 		 * that reports rather than waits: a per-call non-blocking form where
