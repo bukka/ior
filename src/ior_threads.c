@@ -230,6 +230,31 @@ static int ior_threads_backend_submit(void *backend_ctx)
 	return (int) ior_threads_pool_notify(ctx->pool);
 }
 
+/*
+ * Wait for the completion event until at least `need` completions are in the
+ * ring. A poster signals only while someone waits, once until the waiter it
+ * woke has reset `signalled` (see ior_threads_pool_post_completion), so the
+ * wait is announced first and the ring looked at after it, and the reset
+ * comes before the caller looks at the ring again. A signal left over from
+ * a wait that timed out keeps the event readable: the next wait consumes it
+ * at once. Returns 1 when the completions are there without waiting, 0
+ * after a wakeup, or the event wait's error (-ETIMEDOUT, -EINTR).
+ */
+static int ior_threads_wait_completions(ior_ctx_threads *ctx, uint32_t need, int timeout_ms)
+{
+	atomic_fetch_add_explicit(&ctx->waiters, 1, memory_order_seq_cst);
+	int ret = 1;
+	if (ior_threads_ring_count(&ctx->cq_ring) < need) {
+		ret = ior_threads_event_wait(&ctx->event, timeout_ms);
+		if (ret == 0) {
+			ior_threads_event_clear(&ctx->event);
+			atomic_store_explicit(&ctx->signalled, 0, memory_order_seq_cst);
+		}
+	}
+	atomic_fetch_sub_explicit(&ctx->waiters, 1, memory_order_relaxed);
+	return ret;
+}
+
 static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_nr)
 {
 	if (!backend_ctx) {
@@ -256,12 +281,11 @@ static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_
 	// Wait for completions to become available
 	while (ior_threads_ring_count(&ctx->cq_ring) < wait_nr) {
 		IOR_LOG_TRACE("event wait start");
-		int ret = ior_threads_event_wait(&ctx->event, -1);
+		int ret = ior_threads_wait_completions(ctx, wait_nr, -1);
 		IOR_LOG_TRACE("event wait done: ret=%d", ret);
 		if (ret < 0) {
 			return ret;
 		}
-		ior_threads_event_clear(&ctx->event);
 	}
 
 	return submitted;
@@ -308,12 +332,10 @@ static int ior_threads_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 			return 0;
 		}
 
-		int ret = ior_threads_event_wait(&ctx->event, -1);
+		int ret = ior_threads_wait_completions(ctx, 1, -1);
 		if (ret < 0) {
 			return ret; // genuine error (e.g. -EINTR)
 		}
-
-		ior_threads_event_clear(&ctx->event);
 	}
 }
 
@@ -365,15 +387,13 @@ static int ior_threads_backend_wait_cqe_timeout(
 			timeout_ms = rem_ms > (uint64_t) INT_MAX ? INT_MAX : (int) rem_ms;
 		}
 
-		int ret = ior_threads_event_wait(&ctx->event, timeout_ms);
+		int ret = ior_threads_wait_completions(ctx, 1, timeout_ms);
 		if (ret == -ETIMEDOUT) {
 			continue; // loop re-checks the ring, then the deadline -> -ETIME
 		}
 		if (ret < 0) {
 			return ret; // genuine error (e.g. -EINTR)
 		}
-
-		ior_threads_event_clear(&ctx->event);
 	}
 }
 
@@ -611,7 +631,8 @@ static uint32_t ior_threads_backend_cqe_get_flags(ior_cqe *cqe)
 	return cqe->threads.flags;
 }
 
-/* Completion notification: the event every completion already signals. */
+/* Completion notification: the completion event, signalled for every
+ * completion once handed out. */
 
 static ior_fd_t ior_threads_backend_notify_fd(void *backend_ctx)
 {
@@ -619,6 +640,14 @@ static ior_fd_t ior_threads_backend_notify_fd(void *backend_ctx)
 		return IOR_INVALID_FD;
 	}
 	ior_ctx_threads *ctx = backend_ctx;
+	/* Handed out: from now on every completion signals it, whether or not a
+	 * thread waits in ior. Those already pending are announced here, as
+	 * ior_notify_fd() promises: armed first and the ring looked at after it,
+	 * so a completion posted meanwhile is signalled by one side or both. */
+	if (!atomic_exchange_explicit(&ctx->notify_armed, 1, memory_order_seq_cst)
+			&& ior_threads_ring_count(&ctx->cq_ring) > 0) {
+		ior_threads_event_signal(&ctx->event);
+	}
 	return ior_threads_event_get_fd(&ctx->event);
 }
 

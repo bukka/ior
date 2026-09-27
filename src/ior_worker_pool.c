@@ -273,7 +273,16 @@ void ior_worker_pool_submit(ior_worker_pool *pool, ior_worker_pool_job *first,
 		}
 	}
 
-	pthread_cond_broadcast(&pool->work_cond);
+	/*
+	 * Wake a waiting worker per job rather than all of them: the others would
+	 * only find the FIFO empty again. A worker that is busy takes the next job
+	 * itself when it is done, and one that is woken runs every job it finds,
+	 * so none is left behind if fewer wake than signals were sent.
+	 */
+	uint32_t wake = count < pool->num_threads_waiting ? count : pool->num_threads_waiting;
+	for (uint32_t i = 0; i < wake; i++) {
+		pthread_cond_signal(&pool->work_cond);
+	}
 	pthread_mutex_unlock(&pool->lock);
 }
 
@@ -354,9 +363,12 @@ static void *ior_worker_pool_worker_thread_func(void *arg)
 
 	IOR_LOG_TRACE("worker thread created");
 
+	/*
+	 * The lock is held from one job to the next: finishing a job and taking
+	 * the next one is a single critical section while there is work.
+	 */
+	pthread_mutex_lock(&pool->lock);
 	while (1) {
-		pthread_mutex_lock(&pool->lock);
-
 		// Wait for a job, exiting on shutdown (once the FIFO is drained) or
 		// after being idle too long (excess thread above the minimum).
 		while (!pool->job_head) {
@@ -381,7 +393,9 @@ static void *ior_worker_pool_worker_thread_func(void *arg)
 			struct timespec timeout;
 			timeout.tv_sec = now.tv_sec + 1;
 			timeout.tv_nsec = now.tv_usec * 1000;
+			pool->num_threads_waiting++;
 			pthread_cond_timedwait(&pool->work_cond, &pool->lock, &timeout);
+			pool->num_threads_waiting--;
 		}
 
 		ior_worker_pool_job *job = pool->job_head;
@@ -403,7 +417,6 @@ static void *ior_worker_pool_worker_thread_func(void *arg)
 		pthread_mutex_lock(&pool->lock);
 		pool->jobs_running--;
 		pool->num_threads_idle++;
-		pthread_mutex_unlock(&pool->lock);
 	}
 
 	return NULL;

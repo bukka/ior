@@ -2056,9 +2056,19 @@ static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_c
 		IOR_LOG_ERROR("completion lost: %d", ret);
 	}
 
-	IOR_LOG_TRACE("signaling completion");
-	// Signal event to wake waiting thread
-	ior_threads_event_signal(&ctx->event);
+	/*
+	 * Wake a waiter, if there is one. Published before the waiters are
+	 * looked at, and a waiter announces itself before it looks at the ring
+	 * (ior_threads_wait_completions), each with a full barrier: either this
+	 * sees the waiter or the waiter sees the completion.
+	 */
+	atomic_thread_fence(memory_order_seq_cst);
+	if (atomic_load_explicit(&ctx->notify_armed, memory_order_relaxed)
+			|| (atomic_load_explicit(&ctx->waiters, memory_order_relaxed)
+					&& !atomic_exchange_explicit(&ctx->signalled, 1, memory_order_seq_cst))) {
+		IOR_LOG_TRACE("signaling completion");
+		ior_threads_event_signal(&ctx->event);
+	}
 }
 
 /*
