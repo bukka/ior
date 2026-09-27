@@ -2285,12 +2285,19 @@ static int issue_poll(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	atomic_fetch_add(&ctx->active_count, 1);
 	atomic_store(&op->state, IOCP_OP_POLL);
 
+	// Wake the poller only for the first op on an empty incoming list: one
+	// already there has sent a byte the poller has not acted on yet (it takes
+	// the list only after draining the byte that woke it), and it takes this
+	// op with that one.
 	iocp_poller *p = &ctx->poller;
 	EnterCriticalSection(&p->lock);
+	bool first = p->incoming == NULL;
 	op->next_pending = p->incoming;
 	p->incoming = op;
 	LeaveCriticalSection(&p->lock);
-	iocp_poller_wake(p);
+	if (first) {
+		iocp_poller_wake(p);
+	}
 
 	return 0;
 }
