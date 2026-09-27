@@ -857,6 +857,8 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 	ior_work **failed_tail = &failed;
 	ior_work *cancels = NULL;
 	ior_work *cancels_tail = NULL;
+	ior_work *timers = NULL; // standalone timeouts, armed below in order
+	ior_work **timers_tail = &timers;
 	/*
 	 * Every staged entry gets an item: grow the pool first if the free list
 	 * is short, by at least its size, so growth stays rare. Without the
@@ -910,6 +912,12 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 		w->chain = NULL;
 		w->cur_token = NULL;
 		w->deadline_ns = 0;
+		// A timeout heading its chain counts from submit, as on io_uring,
+		// not from when a worker gets to it.
+		if (opcode == IOR_OP_TIMER && w->fail_res == 0 && !prev_link
+				&& !(w->sqe.threads.flags & IOR_SQE_IO_DRAIN)) {
+			w->deadline_ns = ior_worker_pool_deadline_ns(ts, w->sqe.threads.timeout_flags);
+		}
 		w->arb = NULL;
 		w->ready = 0;
 		w->fdmode = 0;
@@ -938,6 +946,13 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 					cancels = w;
 				}
 				cancels_tail = w;
+			} else if (w->deadline_ns && !has_link && ior_threads_pool_timer_valid(w)) {
+				// A standalone timeout skips the workers: armed at submit
+				// like io_uring, timeouts then expire in deadline order.
+				atomic_store_explicit(&w->state, IOR_WORK_TIMER, memory_order_release);
+				w->next = NULL;
+				*timers_tail = w;
+				timers_tail = &w->next;
 			} else {
 				atomic_store_explicit(&w->state, IOR_WORK_QUEUED, memory_order_release);
 				w->job.next = NULL;
@@ -1008,6 +1023,13 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 			ior_threads_pool_finish_res(pool, w, w->fail_res < 0 ? w->fail_res : -ECANCELED);
 			done++;
 		}
+	}
+	// Armed before the cancels run, so they find these timeouts armed.
+	while (timers) {
+		ior_work *w = timers;
+		timers = w->next;
+		ior_threads_pool_arm_timer(pool, w);
+		done++;
 	}
 	while (cancels) {
 		ior_work *c = cancels;
@@ -2509,8 +2531,10 @@ static int ior_threads_pool_timer_valid(const ior_work *work)
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work)
 {
 	int err = 0;
-	uint64_t deadline_ns = ior_worker_pool_deadline_ns(
-			ior_threads_pool_ts(work), work->sqe.threads.timeout_flags);
+	uint64_t deadline_ns = work->deadline_ns
+			? work->deadline_ns
+			: ior_worker_pool_deadline_ns(
+					  ior_threads_pool_ts(work), work->sqe.threads.timeout_flags);
 
 	pthread_mutex_lock(&pool->arm_lock);
 	int ret = ior_worker_pool_arm_timer(
