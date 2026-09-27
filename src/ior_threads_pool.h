@@ -20,6 +20,20 @@ typedef struct ior_ctx_threads {
 	ior_threads_ring cq_ring; // Completion queue
 
 	ior_threads_event event; // Completion notification
+	/*
+	 * A posted completion signals the event only while a thread waits for
+	 * one in ior (waiters), once per wait (signalled, reset by the waiter it
+	 * woke), or for every completion once the event has been handed out as
+	 * the notification descriptor (notify_armed, for good): a write per
+	 * completion is most of what posting costs. Padded to a cache line of
+	 * their own: every posting worker reads them, and sharing the line with
+	 * the fields around them costs more than the writes they save.
+	 */
+	char pad_before[64];
+	_Atomic uint32_t waiters;
+	_Atomic int signalled;
+	_Atomic int notify_armed;
+	char pad_after[64];
 	ior_threads_pool *pool; // Worker thread pool
 
 	uint32_t flags;

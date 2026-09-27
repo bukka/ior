@@ -176,6 +176,44 @@ static void test_notify_clear_then_more(void **state)
 	reap_peek(s, 1, (void *) 0x5);
 }
 
+// A completion still pending after the caller reaped another one is announced
+// by the first ior_notify_fd() call too, wherever the backend keeps it by then.
+static void test_notify_late_request_after_reap(void **state)
+{
+	(void) state;
+	ior_ctx *ctx;
+	assert_return_code(ior_queue_init(32, &ctx), 0);
+	for (uintptr_t i = 1; i <= 2; i++) {
+		ior_sqe *sqe = ior_get_sqe(ctx);
+		assert_non_null(sqe);
+		ior_prep_nop(ctx, sqe);
+		ior_sqe_set_data(ctx, sqe, (void *) i);
+	}
+	assert_int_equal(ior_submit_and_wait(ctx, 2), 2);
+	ior_cqe *cqe = NULL;
+	assert_return_code(ior_wait_cqe(ctx, &cqe), 0);
+	ior_cqe_seen(ctx, cqe);
+
+	ior_fd_t nfd = ior_notify_fd(ctx);
+	assert_true(test_fd_is_valid(nfd));
+	assert_int_equal(test_wait_readable(nfd, 2000), 1);
+	assert_return_code(ior_notify_clear(ctx), 0);
+	assert_return_code(ior_peek_cqe(ctx, &cqe), 0);
+	ior_cqe_seen(ctx, cqe);
+	assert_int_equal(ior_peek_cqe(ctx, &cqe), -EAGAIN);
+	ior_queue_exit(ctx);
+}
+
+// Clearing a descriptor that was never requested is refused on every backend.
+static void test_notify_clear_unrequested(void **state)
+{
+	(void) state;
+	ior_ctx *ctx;
+	assert_return_code(ior_queue_init(32, &ctx), 0);
+	assert_int_equal(ior_notify_clear(ctx), -EINVAL);
+	ior_queue_exit(ctx);
+}
+
 // A completion posted before the first ior_notify_fd() call is announced
 // by that call (a fresh context that has not requested the descriptor yet).
 static void test_notify_late_request(void **state)
@@ -233,6 +271,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_notify_timer, setup_notify, teardown_notify),
 		cmocka_unit_test_setup_teardown(test_notify_clear_then_more, setup_notify, teardown_notify),
 		cmocka_unit_test(test_notify_late_request),
+		cmocka_unit_test(test_notify_clear_unrequested),
+		cmocka_unit_test(test_notify_late_request_after_reap),
 		cmocka_unit_test_setup_teardown(test_notify_mixed_wait, setup_notify, teardown_notify),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);

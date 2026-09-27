@@ -69,6 +69,7 @@ struct ior_worker_pool {
 	ior_worker_pool_worker_t *threads;
 	uint32_t num_threads_current;
 	uint32_t num_threads_idle;
+	uint32_t num_threads_waiting; /* blocked on work_cond: what a signal can wake */
 	uint32_t num_threads_min;
 	uint32_t num_threads_max;
 	uint32_t stack_size;
