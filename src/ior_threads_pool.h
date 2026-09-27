@@ -90,9 +90,9 @@ typedef struct ior_threads_pool_fdmode {
 /*
  * A submitted operation, copied out of the SQ ring at submit time. Workers
  * consume these from the shared worker pool's dispatch queue, so a slow op
- * never pins an SQ slot. Items live in a fixed pool and move between the free
- * list (via `next`) and the pool FIFO (via the embedded job node); `chain`
- * links the ops of one IO_LINK chain.
+ * never pins an SQ slot. Items live in chunks the pool grows as needed and
+ * move between the free list (via `next`) and the pool FIFO (via the
+ * embedded job node); `chain` links the ops of one IO_LINK chain.
  */
 typedef struct ior_work {
 	ior_worker_pool_job job; // FIFO node while queued as a chain head
@@ -111,6 +111,15 @@ typedef struct ior_work {
 	struct ior_work *fd_next;
 	struct ior_work *fd_prev;
 	int fd_indexed;
+	// The IO_DRAIN epoch it was submitted in (see ior_threads_pool_epoch).
+	struct ior_threads_pool_epoch *epoch;
+	/*
+	 * A completion that found the CQ full waits here, carried by its own
+	 * item, until the consumer makes room (see ior_threads_pool_post).
+	 * Guarded by the CQ ring's tail_lock.
+	 */
+	struct ior_work *ovf_next;
+	ior_cqe ovf_cqe;
 	/*
 	 * Fields a worker writes while it owns the op, kept together (and off the
 	 * neighbouring item's SQE) so the submitter's alloc and copy do not share
@@ -160,15 +169,18 @@ struct ior_threads_pool {
 	/*
 	 * Free-at-submit dispatch. submit() copies each SQE into a work item and
 	 * enqueues it (chains as a unit) onto the worker pool FIFO, freeing the SQ
-	 * slot immediately; workers consume from the FIFO. The work pool is fixed at
-	 * cq_entries, the in-flight bound. Protected by work_lock.
+	 * slot immediately; workers consume from the FIFO. Nothing bounds the ops
+	 * in flight but memory, as on io_uring: submit grows the items in chunks
+	 * when the free list runs short. Protected by work_lock.
 	 */
 	pthread_mutex_t work_lock;
-	ior_work *work_items; // pool array [work_cap]
+	struct ior_threads_pool_chunk *chunks; // every item, for forget and destroy
+	uint32_t work_total; // items in all chunks
+	uint32_t work_free_count;
 	/*
 	 * Allocated items by user data and by descriptor, so a cancel looks at
 	 * the items it may match rather than at every one. index_mask + 1 buckets,
-	 * a power of two at least work_cap. Protected by work_lock.
+	 * a power of two, grown with the items. Protected by work_lock.
 	 */
 	ior_work **ud_index;
 	ior_work **fd_index;
@@ -182,13 +194,12 @@ struct ior_threads_pool {
 	 */
 	pthread_mutex_t arm_lock;
 	ior_work *work_free; // free list
-	uint32_t work_cap;
 	uint64_t next_seq; // next submission sequence to assign
 
 	/*
 	 * Switched descriptors (see ior_threads_pool_fdmode), a chained hash by
-	 * descriptor number. Nodes come from a fixed array of work_cap, one per
-	 * in-flight op at most. fdmode_lock covers the table and the ioctl that
+	 * descriptor number, grown as descriptors are added; nodes are allocated
+	 * on demand and kept on a free list. fdmode_lock covers the table and the ioctl that
 	 * restores, so a restore is never interleaved with a new op's look at
 	 * the mode; the look and the switch themselves run outside it. A leaf
 	 * lock, taken with no other held, and kept off work_lock so that taking
@@ -196,31 +207,35 @@ struct ior_threads_pool {
 	 */
 	pthread_mutex_t fdmode_lock;
 	ior_threads_pool_fdmode **fdmode_buckets;
-	ior_threads_pool_fdmode *fdmode_nodes;
 	ior_threads_pool_fdmode *fdmode_free;
 	uint32_t fdmode_mask;
+	uint32_t fdmode_count; // entries in the table
 
 	/*
-	 * outstanding = SQEs handed out whose op has not finished: get_sqe stops
-	 * at work_cap so a submit always finds a work item. cq_pending = CQ
-	 * slots promised: one per SQE handed out, for its op's last completion,
-	 * plus one per multishot edge posted, each released as the consumer
-	 * reaps it. get_sqe stops at the CQ size and an edge is posted only if
-	 * a slot is free, so posting a completion never finds the CQ full and
-	 * never waits on the consumer.
+	 * Completions that found the CQ full, oldest first, each carried by its
+	 * op's work item: posting never waits on the consumer, which moves them
+	 * into the ring as it makes room (ior_threads_pool_flush_overflow), as
+	 * io_uring keeps its overflowing completions (IORING_FEAT_NODROP). While
+	 * any is waiting, later completions queue behind it, so the order they
+	 * were posted in is kept. Guarded by the CQ ring's tail_lock; the count
+	 * lets the consumer skip the lock while there are none.
 	 */
-	_Atomic uint32_t outstanding;
-	_Atomic uint32_t cq_pending;
+	ior_work *ovf_head;
+	ior_work *ovf_tail;
+	_Atomic uint32_t ovf_count;
 
 	/*
-	 * IO_DRAIN ordering, keyed on submission sequence. A drain op waits until
-	 * every earlier seq has completed. drain_done marks completed seqs and
-	 * drain_upto is the contiguous front; sized past the in-flight span so seqs
-	 * never alias.
+	 * IO_DRAIN ordering by epochs: every op counts in the epoch current when
+	 * it was submitted, and each drain op starts a new one, then waits until
+	 * the older ones are empty. epochs is the list of those not freed yet,
+	 * oldest first, epoch_cur the newest; an epoch goes once it is empty and
+	 * no longer current. The counts are atomic, so an op takes drain_lock
+	 * only when it empties an epoch. Unbounded however long an op stays in
+	 * flight, and one atomic add and subtract per op while no drain is used.
 	 */
-	uint8_t *drain_done;
-	uint32_t drain_mask;
-	uint64_t drain_upto;
+	struct ior_threads_pool_epoch *epochs;
+	struct ior_threads_pool_epoch *epoch_cur;
+	uint32_t drain_waiters;
 	pthread_mutex_t drain_lock;
 	pthread_cond_t drain_cond;
 };
@@ -249,20 +264,20 @@ ior_threads_pool *ior_threads_pool_create(ior_ctx_threads *ctx, uint32_t num_thr
 ior_threads_pool *ior_threads_pool_create_ex(
 		ior_ctx_threads *ctx, const ior_threads_pool_config *config);
 
-// Submit the staged SQEs to the pool; returns how many were taken
-uint32_t ior_threads_pool_notify(ior_threads_pool *pool);
+// Submit the staged SQEs to the pool; returns how many were taken, or
+// -EAGAIN when no memory could be had for their work items (all stay staged)
+int ior_threads_pool_notify(ior_threads_pool *pool);
 
 // Shutdown pool and wait for all threads to finish
 void ior_threads_pool_destroy(ior_threads_pool *pool);
 void ior_threads_pool_forget(ior_threads_pool *pool);
 
 /*
- * Promise a CQ slot (see cq_pending): 0, or -EBUSY when every slot is
- * promised already. Release returns nr slots once their completions are
- * reaped; releasing more than are promised is logged and clamped.
+ * Move completions waiting on the overflow list into the CQ ring as far as
+ * it has room. The consumer calls it once it has made room, and before it
+ * looks at the ring. Cheap when nothing is waiting.
  */
-int ior_threads_pool_cq_reserve(ior_threads_pool *pool);
-void ior_threads_pool_cq_release(ior_threads_pool *pool, uint32_t nr);
+void ior_threads_pool_flush_overflow(ior_threads_pool *pool);
 
 // Get number of worker threads
 uint32_t ior_threads_pool_get_num_threads(ior_threads_pool *pool);

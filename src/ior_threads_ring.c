@@ -155,6 +155,18 @@ void ior_threads_ring_consume_to(ior_threads_ring *ring, uint32_t pos)
 
 // ===== Completion Queue Operations =====
 
+int ior_threads_ring_post_cqe_locked(ior_threads_ring *ring, const ior_cqe *cqe)
+{
+	uint32_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+	uint32_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+	if (tail - head >= ring->size) {
+		return -EOVERFLOW;
+	}
+	((ior_cqe *) ring->entries)[tail & ring->mask] = *cqe;
+	atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
+	return 0;
+}
+
 int ior_threads_ring_post_cqe(ior_threads_ring *ring, const ior_cqe *cqe)
 {
 	if (!ring || ring->is_sq || !cqe) {

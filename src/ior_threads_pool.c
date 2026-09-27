@@ -36,7 +36,7 @@ static void ior_threads_pool_run_job(void *owner, ior_worker_pool_job *job);
 static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *head);
 static void ior_threads_pool_process_single_sqe(
 		ior_threads_pool *pool, ior_work *w, ior_cqe *cqe, ior_work_token *token);
-static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe);
+static int ior_threads_pool_post(ior_threads_pool *pool, ior_work *w, const ior_cqe *cqe);
 static void ior_threads_pool_arm_timer(ior_threads_pool *pool, ior_work *work);
 static int ior_threads_pool_timer_valid(const ior_work *work);
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
@@ -73,11 +73,50 @@ static uint32_t ior_threads_pool_round_up_pow2(uint32_t n)
 // helpers take drain_lock themselves. Dispatch itself (FIFO + worker wakeup)
 // lives in the shared ior_worker_pool.
 
+// A block of work items; the pool grows by adding one and never shrinks.
+typedef struct ior_threads_pool_chunk {
+	struct ior_threads_pool_chunk *next;
+	uint32_t count;
+	ior_work items[];
+} ior_threads_pool_chunk;
+
 static ior_work *ior_threads_pool_work_alloc(ior_threads_pool *pool)
 {
 	ior_work *w = pool->work_free;
 	pool->work_free = w->next;
+	pool->work_free_count--;
 	return w;
+}
+
+static void ior_threads_pool_index_rehash(ior_threads_pool *pool, uint32_t cap);
+
+/*
+ * Add a chunk of n items to the free list (work_lock held, or before the
+ * pool is shared). The cancel indexes grow with the items, so their chains
+ * stay short; failing to grow them only makes the chains longer.
+ */
+static int ior_threads_pool_work_grow(ior_threads_pool *pool, uint32_t n)
+{
+	ior_threads_pool_chunk *chunk = calloc(1, sizeof(*chunk) + (size_t) n * sizeof(ior_work));
+	if (!chunk) {
+		return -ENOMEM;
+	}
+	chunk->count = n;
+	chunk->next = pool->chunks;
+	pool->chunks = chunk;
+	for (uint32_t i = 0; i < n; i++) {
+		ior_work *w = &chunk->items[i];
+		atomic_init(&w->state, IOR_WORK_FREE);
+		w->pidfd = -1;
+		w->next = pool->work_free;
+		pool->work_free = w;
+	}
+	pool->work_total += n;
+	pool->work_free_count += n;
+	if (pool->ud_index && pool->work_total > pool->index_mask + 1) {
+		ior_threads_pool_index_rehash(pool, ior_threads_pool_round_up_pow2(pool->work_total));
+	}
+	return 0;
 }
 
 /* ===== Cancel lookup (work_lock held) ===== */
@@ -97,6 +136,52 @@ static uint32_t ior_threads_pool_fd_slot(const ior_threads_pool *pool, int fd)
 }
 
 static int ior_threads_pool_op_has_fd(uint8_t opcode);
+
+// Move every indexed item into cap buckets (work_lock held).
+static void ior_threads_pool_index_rehash(ior_threads_pool *pool, uint32_t cap)
+{
+	ior_work **ud = calloc(cap, sizeof(*ud));
+	ior_work **fd = calloc(cap, sizeof(*fd));
+	if (!ud || !fd) {
+		free(ud);
+		free(fd);
+		return;
+	}
+	ior_work **old_ud = pool->ud_index;
+	ior_work **old_fd = pool->fd_index;
+	uint32_t old_cap = pool->index_mask + 1;
+	pool->ud_index = ud;
+	pool->fd_index = fd;
+	pool->index_mask = cap - 1;
+	for (uint32_t i = 0; i < old_cap; i++) {
+		ior_work *w = old_ud[i];
+		while (w) {
+			ior_work *next = w->ud_next;
+			ior_work **head = &ud[ior_threads_pool_ud_slot(pool, w->sqe.threads.user_data)];
+			w->ud_prev = NULL;
+			w->ud_next = *head;
+			if (*head) {
+				(*head)->ud_prev = w;
+			}
+			*head = w;
+			w = next;
+		}
+		w = old_fd[i];
+		while (w) {
+			ior_work *next = w->fd_next;
+			ior_work **head = &fd[ior_threads_pool_fd_slot(pool, w->sqe.threads.fd)];
+			w->fd_prev = NULL;
+			w->fd_next = *head;
+			if (*head) {
+				(*head)->fd_prev = w;
+			}
+			*head = w;
+			w = next;
+		}
+	}
+	free(old_ud);
+	free(old_fd);
+}
 
 /*
  * Make w findable by a cancel: by its user data, and by its descriptor when
@@ -155,6 +240,7 @@ static void ior_threads_pool_work_release(ior_threads_pool *pool, ior_work *w)
 	atomic_store_explicit(&w->state, IOR_WORK_FREE, memory_order_release);
 	w->next = pool->work_free;
 	pool->work_free = w;
+	pool->work_free_count++;
 }
 
 /*
@@ -174,18 +260,69 @@ static int ior_threads_pool_enter(ior_work *w, int state)
 	}
 }
 
-// Mark a submission sequence completed and advance the contiguous drain front,
-// waking any IO_DRAIN op waiting for earlier ops to finish.
-static void ior_threads_pool_drain_complete(ior_threads_pool *pool, uint64_t seq)
+/* An IO_DRAIN epoch: the ops submitted since one drain op until the next. */
+typedef struct ior_threads_pool_epoch {
+	struct ior_threads_pool_epoch *next; // newer
+	_Atomic uint32_t pending; // its ops not completed yet
+} ior_threads_pool_epoch;
+
+// Free the empty epochs at the old end, never the current one (drain_lock held).
+static void ior_threads_pool_epoch_reap_locked(ior_threads_pool *pool)
 {
-	pthread_mutex_lock(&pool->drain_lock);
-	pool->drain_done[seq & pool->drain_mask] = 1;
-	while (pool->drain_done[pool->drain_upto & pool->drain_mask]) {
-		pool->drain_done[pool->drain_upto & pool->drain_mask] = 0;
-		pool->drain_upto++;
+	while (pool->epochs != pool->epoch_cur
+			&& atomic_load_explicit(&pool->epochs->pending, memory_order_acquire) == 0) {
+		ior_threads_pool_epoch *e = pool->epochs;
+		pool->epochs = e->next;
+		free(e);
 	}
-	pthread_cond_broadcast(&pool->drain_cond);
+}
+
+/*
+ * Start an epoch for a drain op and the ops after it (work_lock held, as
+ * submit holds it). Without memory the current one goes on: the drain op
+ * then waits for nothing older, which only happens when the malloc fails.
+ */
+static void ior_threads_pool_epoch_start(ior_threads_pool *pool)
+{
+	ior_threads_pool_epoch *e = calloc(1, sizeof(*e));
+	if (!e) {
+		return;
+	}
+	atomic_init(&e->pending, 0);
+	pthread_mutex_lock(&pool->drain_lock);
+	pool->epoch_cur->next = e;
+	pool->epoch_cur = e;
+	ior_threads_pool_epoch_reap_locked(pool);
 	pthread_mutex_unlock(&pool->drain_lock);
+}
+
+/*
+ * An op of epoch e has completed (its completion is posted). Emptying an
+ * epoch other than the current one can release a drain op: wake them, and
+ * free what is no longer needed. e is not touched after the decrement.
+ */
+static void ior_threads_pool_epoch_done(ior_threads_pool *pool, ior_threads_pool_epoch *e)
+{
+	if (atomic_fetch_sub_explicit(&e->pending, 1, memory_order_acq_rel) != 1) {
+		return;
+	}
+	pthread_mutex_lock(&pool->drain_lock);
+	ior_threads_pool_epoch_reap_locked(pool);
+	if (pool->drain_waiters) {
+		pthread_cond_broadcast(&pool->drain_cond);
+	}
+	pthread_mutex_unlock(&pool->drain_lock);
+}
+
+// Every epoch older than w's is empty (drain_lock held).
+static int ior_threads_pool_epoch_clear_before_locked(ior_threads_pool *pool, ior_work *w)
+{
+	for (ior_threads_pool_epoch *e = pool->epochs; e && e != w->epoch; e = e->next) {
+		if (atomic_load_explicit(&e->pending, memory_order_acquire)) {
+			return 0;
+		}
+	}
+	return 1;
 }
 
 // Block until every op submitted before w has completed (for IO_DRAIN), or
@@ -196,10 +333,12 @@ static int ior_threads_pool_drain_wait(ior_threads_pool *pool, ior_work *w)
 		return -ECANCELED;
 	}
 	pthread_mutex_lock(&pool->drain_lock);
-	while (pool->drain_upto < w->seq
+	pool->drain_waiters++;
+	while (!ior_threads_pool_epoch_clear_before_locked(pool, w)
 			&& atomic_load_explicit(&w->state, memory_order_acquire) != IOR_WORK_CANCELLED) {
 		pthread_cond_wait(&pool->drain_cond, &pool->drain_lock);
 	}
+	pool->drain_waiters--;
 	pthread_mutex_unlock(&pool->drain_lock);
 	return atomic_load_explicit(&w->state, memory_order_acquire) == IOR_WORK_CANCELLED ? -ECANCELED
 																					   : 0;
@@ -214,6 +353,29 @@ static ior_threads_pool_fdmode **ior_threads_pool_fdmode_slot(ior_threads_pool *
 		slot = &(*slot)->next;
 	}
 	return slot;
+}
+
+// Double the mode table's buckets (fdmode_lock held); failing keeps them.
+static void ior_threads_pool_fdmode_grow(ior_threads_pool *pool)
+{
+	uint32_t cap = (pool->fdmode_mask + 1) * 2;
+	ior_threads_pool_fdmode **buckets = calloc(cap, sizeof(*buckets));
+	if (!buckets) {
+		return;
+	}
+	for (uint32_t i = 0; i <= pool->fdmode_mask; i++) {
+		ior_threads_pool_fdmode *m = pool->fdmode_buckets[i];
+		while (m) {
+			ior_threads_pool_fdmode *next = m->next;
+			ior_threads_pool_fdmode **head = &buckets[(uint32_t) m->fd & (cap - 1)];
+			m->next = *head;
+			*head = m;
+			m = next;
+		}
+	}
+	free(pool->fdmode_buckets);
+	pool->fdmode_buckets = buckets;
+	pool->fdmode_mask = cap - 1;
 }
 
 /*
@@ -243,12 +405,20 @@ static int ior_threads_pool_fdmode_acquire(ior_threads_pool *pool, ior_work *w)
 		m->refs++;
 	} else {
 		m = pool->fdmode_free;
-		pool->fdmode_free = m->next;
+		if (m) {
+			pool->fdmode_free = m->next;
+		} else if (!(m = malloc(sizeof(*m)))) {
+			pthread_mutex_unlock(&pool->fdmode_lock);
+			return -ENOMEM; // the caller probes readiness instead
+		}
 		m->fd = fd;
 		m->refs = 1;
 		atomic_store_explicit(&m->owned, 0, memory_order_relaxed);
 		m->next = NULL;
 		*slot = m;
+		if (++pool->fdmode_count > pool->fdmode_mask + 1) {
+			ior_threads_pool_fdmode_grow(pool);
+		}
 	}
 	pthread_mutex_unlock(&pool->fdmode_lock);
 	w->fdmode = 1;
@@ -300,39 +470,41 @@ static void ior_threads_pool_fdmode_release(ior_threads_pool *pool, ior_work *w)
 		*slot = m->next;
 		m->next = pool->fdmode_free;
 		pool->fdmode_free = m;
+		pool->fdmode_count--;
 	}
 	pthread_mutex_unlock(&pool->fdmode_lock);
 	w->fdmode = 0;
 }
 
 /*
- * Retire one operation: return its work item to the pool and drop the
- * outstanding count, then post its completion and record it for drain
- * ordering. The counts go first so that a consumer who has reaped the CQE is
- * always given an SQE (the CQ slot itself stays promised until the reap, see
- * cq_pending); the CQE is the caller's copy and nothing after the release
- * reads the item, which may already be serving a new op. The item is marked
- * DONE before it is released, so a cancel submitted by a consumer who has
- * seen the CQE finds nothing in flight (-ENOENT). A descriptor mode the op
- * took over is restored before the CQE too, so the consumer never sees the
- * switch.
+ * Retire one operation: post its completion, then return its work item to
+ * the pool, unless the item carries the completion on the overflow list, in
+ * which case the flush that moves it into the ring releases it. The item is
+ * marked DONE first, so a cancel submitted by a consumer who has seen the
+ * CQE finds nothing in flight (-ENOENT); the CQE is the caller's copy. A
+ * descriptor mode the op took over is restored before the CQE too, so the
+ * consumer never sees the switch.
  */
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe)
 {
-	uint64_t seq = work->seq;
 	atomic_store_explicit(&work->state, IOR_WORK_DONE, memory_order_release);
 
 	if (work->fdmode) {
 		ior_threads_pool_fdmode_release(pool, work);
 	}
 
-	pthread_mutex_lock(&pool->work_lock);
-	ior_threads_pool_work_release(pool, work);
-	pthread_mutex_unlock(&pool->work_lock);
-	atomic_fetch_sub(&pool->outstanding, 1);
-
-	ior_threads_pool_post_completion(pool, cqe);
-	ior_threads_pool_drain_complete(pool, seq);
+	/*
+	 * Counted out of its drain epoch once the completion is out, so a drain
+	 * op never starts before it; the epoch is read first, as a flush may
+	 * release an item that carries its completion on the overflow list.
+	 */
+	ior_threads_pool_epoch *epoch = work->epoch;
+	if (ior_threads_pool_post(pool, work, cqe) == 0) {
+		pthread_mutex_lock(&pool->work_lock);
+		ior_threads_pool_work_release(pool, work);
+		pthread_mutex_unlock(&pool->work_lock);
+	}
+	ior_threads_pool_epoch_done(pool, epoch);
 }
 
 static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res)
@@ -429,25 +601,21 @@ static int ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 	 * is not claimed back: a cancel racing this is found there and delivers
 	 * the final -ECANCELED after the edge. One that claimed the op already
 	 * (possible only once the poller has unlinked it) gets no edge; its
-	 * cancellation follows. An edge needs a CQ slot of its own; when none
-	 * is free the edge is declined and the poller ends the op with it as
-	 * the last completion, posted in the slot the op holds, as io_uring
-	 * ends a multishot on a full CQ.
+	 * cancellation follows. An edge goes into the CQ only while it has
+	 * room; otherwise the edge is declined and the poller ends the op with
+	 * it as the last completion, which the op's item carries on the
+	 * overflow list, as io_uring ends a multishot on a full CQ.
 	 */
 	if (more) {
 		if (atomic_load_explicit(&w->state, memory_order_acquire) != IOR_WORK_POLLING) {
 			return 0;
-		}
-		if (ior_threads_pool_cq_reserve(pool) < 0) {
-			return 1;
 		}
 		ior_cqe cqe;
 		memset(&cqe, 0, sizeof(cqe));
 		cqe.threads.user_data = w->sqe.threads.user_data;
 		cqe.threads.res = res;
 		cqe.threads.flags = IOR_CQE_F_MORE;
-		ior_threads_pool_post_completion(pool, &cqe);
-		return 0;
+		return ior_threads_pool_post(pool, NULL, &cqe) < 0 ? 1 : 0;
 	}
 
 	// Claim the op back from the poller. A cancel that raced the poller's
@@ -509,6 +677,41 @@ static ior_threads_poller *ior_threads_pool_get_poller(ior_threads_pool *pool)
 	return poller;
 }
 
+// The items, the indexes and the mode table; nothing may be in flight.
+static void ior_threads_pool_free_storage(ior_threads_pool *pool)
+{
+	ior_threads_pool_chunk *chunk = pool->chunks;
+	while (chunk) {
+		ior_threads_pool_chunk *next = chunk->next;
+		free(chunk);
+		chunk = next;
+	}
+	pool->chunks = NULL;
+	ior_threads_pool_fdmode *m = pool->fdmode_free;
+	while (m) {
+		ior_threads_pool_fdmode *next = m->next;
+		free(m);
+		m = next;
+	}
+	pool->fdmode_free = NULL;
+	for (uint32_t i = 0; pool->fdmode_buckets && i <= pool->fdmode_mask; i++) {
+		m = pool->fdmode_buckets[i];
+		while (m) {
+			ior_threads_pool_fdmode *next = m->next;
+			free(m);
+			m = next;
+		}
+	}
+	free(pool->fdmode_buckets);
+	free(pool->fd_index);
+	free(pool->ud_index);
+	while (pool->epochs) {
+		ior_threads_pool_epoch *next = pool->epochs->next;
+		free(pool->epochs);
+		pool->epochs = next;
+	}
+}
+
 ior_threads_pool *ior_threads_pool_create(ior_ctx_threads *ctx, uint32_t num_threads)
 {
 	ior_threads_pool_config config = {
@@ -539,15 +742,10 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	atomic_init(&pool->shutdown, 0);
 
 	/*
-	 * Work-item pool (free-at-submit). Capacity matches the CQ (the in-flight
-	 * bound). The drain bitmap is sized past the worst-case in-flight seq span
-	 * so sequence numbers never alias.
+	 * Work-item pool (free-at-submit): a first chunk the size of the CQ,
+	 * grown by submit as more ops are in flight.
 	 */
-	pool->work_cap = ctx->cq_ring.size;
 	pool->next_seq = 0;
-	atomic_init(&pool->outstanding, 0);
-	atomic_init(&pool->cq_pending, 0);
-	pool->drain_upto = 0;
 
 	if (pthread_mutex_init(&pool->work_lock, NULL) != 0) {
 		free(pool);
@@ -559,20 +757,21 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		return NULL;
 	}
 
-	pool->work_items = calloc(pool->work_cap, sizeof(*pool->work_items));
-	uint32_t index_cap = ior_threads_pool_round_up_pow2(pool->work_cap);
+	uint32_t index_cap = ior_threads_pool_round_up_pow2(ctx->cq_ring.size);
 	pool->index_mask = index_cap - 1;
 	pool->ud_index = calloc(index_cap, sizeof(*pool->ud_index));
 	pool->fd_index = calloc(index_cap, sizeof(*pool->fd_index));
-	uint32_t drain_cap = ior_threads_pool_round_up_pow2(pool->work_cap * 2);
-	pool->drain_mask = drain_cap - 1;
-	pool->drain_done = calloc(drain_cap, sizeof(*pool->drain_done));
-	if (!pool->work_items || !pool->ud_index || !pool->fd_index || !pool->drain_done
+	pool->fdmode_mask = index_cap - 1;
+	pool->fdmode_buckets = calloc(index_cap, sizeof(*pool->fdmode_buckets));
+	atomic_init(&pool->ovf_count, 0);
+	pool->epochs = pool->epoch_cur = calloc(1, sizeof(*pool->epochs));
+	if (pool->epochs) {
+		atomic_init(&pool->epochs->pending, 0);
+	}
+	if (!pool->epochs || !pool->ud_index || !pool->fd_index || !pool->fdmode_buckets
+			|| ior_threads_pool_work_grow(pool, ctx->cq_ring.size) < 0
 			|| pthread_mutex_init(&pool->drain_lock, NULL) != 0) {
-		free(pool->drain_done);
-		free(pool->fd_index);
-		free(pool->ud_index);
-		free(pool->work_items);
+		ior_threads_pool_free_storage(pool);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
@@ -580,45 +779,20 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	}
 	if (pthread_cond_init(&pool->drain_cond, NULL) != 0) {
 		pthread_mutex_destroy(&pool->drain_lock);
-		free(pool->drain_done);
-		free(pool->fd_index);
-		free(pool->ud_index);
-		free(pool->work_items);
+		ior_threads_pool_free_storage(pool);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
 	}
-	for (uint32_t i = 0; i < pool->work_cap; i++) {
-		atomic_init(&pool->work_items[i].state, IOR_WORK_FREE);
-		pool->work_items[i].pidfd = -1;
-		pool->work_items[i].next = pool->work_free;
-		pool->work_free = &pool->work_items[i];
-	}
-
-	// Switched-descriptor table: at most one entry per in-flight op.
-	uint32_t fdmode_cap = ior_threads_pool_round_up_pow2(pool->work_cap);
-	pool->fdmode_mask = fdmode_cap - 1;
-	pool->fdmode_buckets = calloc(fdmode_cap, sizeof(*pool->fdmode_buckets));
-	pool->fdmode_nodes = calloc(pool->work_cap, sizeof(*pool->fdmode_nodes));
-	if (!pool->fdmode_buckets || !pool->fdmode_nodes
-			|| pthread_mutex_init(&pool->fdmode_lock, NULL) != 0) {
-		free(pool->fdmode_nodes);
-		free(pool->fdmode_buckets);
+	if (pthread_mutex_init(&pool->fdmode_lock, NULL) != 0) {
 		pthread_cond_destroy(&pool->drain_cond);
 		pthread_mutex_destroy(&pool->drain_lock);
-		free(pool->drain_done);
-		free(pool->fd_index);
-		free(pool->ud_index);
-		free(pool->work_items);
+		ior_threads_pool_free_storage(pool);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
 		return NULL;
-	}
-	for (uint32_t i = 0; i < pool->work_cap; i++) {
-		pool->fdmode_nodes[i].next = pool->fdmode_free;
-		pool->fdmode_free = &pool->fdmode_nodes[i];
 	}
 
 	// Worker lifecycle, dispatch FIFO and timers live in the shared pool.
@@ -630,14 +804,9 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	pool->wp = ior_worker_pool_create(&wp_config, ior_threads_pool_run_job, pool);
 	if (!pool->wp) {
 		pthread_mutex_destroy(&pool->fdmode_lock);
-		free(pool->fdmode_nodes);
-		free(pool->fdmode_buckets);
 		pthread_cond_destroy(&pool->drain_cond);
 		pthread_mutex_destroy(&pool->drain_lock);
-		free(pool->drain_done);
-		free(pool->fd_index);
-		free(pool->ud_index);
-		free(pool->work_items);
+		ior_threads_pool_free_storage(pool);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
 		free(pool);
@@ -647,7 +816,7 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	return pool;
 }
 
-uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
+int ior_threads_pool_notify(ior_threads_pool *pool)
 {
 	if (!pool) {
 		return 0;
@@ -688,6 +857,22 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 	ior_work **failed_tail = &failed;
 	ior_work *cancels = NULL;
 	ior_work *cancels_tail = NULL;
+	/*
+	 * Every staged entry gets an item: grow the pool first if the free list
+	 * is short, by at least its size, so growth stays rare. Without the
+	 * memory nothing is taken and everything stays staged, as io_uring
+	 * refuses a submit it cannot allocate for (-EAGAIN).
+	 */
+	uint32_t staged = cached - consumed;
+	if (pool->work_free_count < staged) {
+		uint32_t need = staged - pool->work_free_count;
+		if (ior_threads_pool_work_grow(pool, need > pool->work_total ? need : pool->work_total)
+				< 0) {
+			pthread_mutex_unlock(&pool->work_lock);
+			return -EAGAIN;
+		}
+	}
+
 	uint32_t p = consumed;
 	while (p != cached) {
 		ior_work *w = ior_threads_pool_work_alloc(pool);
@@ -717,6 +902,11 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 			w->fail_res = ior_accept_check(w->sqe.threads.rw_flags);
 		}
 		w->seq = pool->next_seq++;
+		if (w->sqe.threads.flags & IOR_SQE_IO_DRAIN) {
+			ior_threads_pool_epoch_start(pool);
+		}
+		w->epoch = pool->epoch_cur;
+		atomic_fetch_add_explicit(&w->epoch->pending, 1, memory_order_relaxed);
 		w->chain = NULL;
 		w->cur_token = NULL;
 		w->deadline_ns = 0;
@@ -846,10 +1036,13 @@ void ior_threads_pool_forget(ior_threads_pool *pool)
 	if (!pool) {
 		return;
 	}
-	for (uint32_t i = 0; i < pool->work_cap; i++) {
-		int pidfd = pool->work_items[i].pidfd;
-		if (pidfd >= 0) {
-			close(pidfd);
+	// Chunks are only ever prepended, so the list reads whole in a child.
+	for (ior_threads_pool_chunk *chunk = pool->chunks; chunk; chunk = chunk->next) {
+		for (uint32_t i = 0; i < chunk->count; i++) {
+			int pidfd = chunk->items[i].pidfd;
+			if (pidfd >= 0) {
+				close(pidfd);
+			}
 		}
 	}
 	ior_threads_poller *poller = atomic_load_explicit(&pool->poller, memory_order_acquire);
@@ -878,16 +1071,12 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	// polls complete with -ECANCELED before the poller thread exits.
 	ior_threads_poller_destroy(atomic_load(&pool->poller));
 
-	// Cleanup. Every op has completed by now, so the mode table is empty.
+	// Cleanup. Every op has completed by now, so the mode table is empty;
+	// completions still on the overflow list go with their items.
 	pthread_mutex_destroy(&pool->fdmode_lock);
-	free(pool->fdmode_nodes);
-	free(pool->fdmode_buckets);
 	pthread_cond_destroy(&pool->drain_cond);
 	pthread_mutex_destroy(&pool->drain_lock);
-	free(pool->drain_done);
-	free(pool->fd_index);
-	free(pool->ud_index);
-	free(pool->work_items);
+	ior_threads_pool_free_storage(pool);
 	pthread_mutex_destroy(&pool->arm_lock);
 	pthread_mutex_destroy(&pool->work_lock);
 	free(pool);
@@ -2126,26 +2315,15 @@ static void ior_threads_pool_process_single_sqe(
 	}
 }
 
-/*
- * Post a completion into the slot promised for it (see cq_pending): the ring
- * cannot be full, so this never waits on the consumer, which may well be the
- * thread posting (a cancel completes on the submitting thread).
- */
-static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_cqe *cqe)
+// Wake a waiter for a posted completion, if there is one.
+static void ior_threads_pool_signal_completion(ior_threads_pool *pool)
 {
 	ior_ctx_threads *ctx = pool->ctx;
-
-	int ret = ior_threads_ring_post_cqe(&ctx->cq_ring, cqe);
-	if (ret < 0) {
-		// Cannot happen: every completion has a slot promised before it is posted.
-		IOR_LOG_ERROR("completion lost: %d", ret);
-	}
-
 	/*
-	 * Wake a waiter, if there is one. Published before the waiters are
-	 * looked at, and a waiter announces itself before it looks at the ring
-	 * (ior_threads_wait_completions), each with a full barrier: either this
-	 * sees the waiter or the waiter sees the completion.
+	 * Published before the waiters are looked at, and a waiter announces
+	 * itself before it looks at the ring (ior_threads_wait_completions),
+	 * each with a full barrier: either this sees the waiter or the waiter
+	 * sees the completion.
 	 */
 	atomic_thread_fence(memory_order_seq_cst);
 	if (atomic_load_explicit(&ctx->notify_armed, memory_order_relaxed)
@@ -2157,36 +2335,76 @@ static void ior_threads_pool_post_completion(ior_threads_pool *pool, const ior_c
 }
 
 /*
- * Promise a CQ slot: one for each SQE handed out (its op's last completion),
- * one for each multishot edge. A CAS, as get_sqe and the poller thread
- * reserve concurrently and a check-then-add could promise one slot too many.
+ * Post a completion. Into the CQ ring when it has room and nothing is
+ * waiting on the overflow list, which keeps the order completions were
+ * posted in; otherwise the op's item w carries it on that list until the
+ * consumer makes room, so posting never waits on the consumer. Returns 0 if
+ * posted to the ring, 1 if w now carries
+ * it (w must not be released), or -EOVERFLOW when there is no room and no
+ * item to carry it (a multishot edge, which is then declined).
  */
-int ior_threads_pool_cq_reserve(ior_threads_pool *pool)
+static int ior_threads_pool_post(ior_threads_pool *pool, ior_work *w, const ior_cqe *cqe)
 {
-	uint32_t size = pool->ctx->cq_ring.size;
-	uint32_t n = atomic_load_explicit(&pool->cq_pending, memory_order_relaxed);
-	do {
-		if (n >= size) {
-			return -EBUSY;
+	ior_threads_ring *ring = &pool->ctx->cq_ring;
+	int ret = 0;
+
+	pthread_mutex_lock(&ring->tail_lock);
+	if (atomic_load_explicit(&pool->ovf_count, memory_order_relaxed) == 0
+			&& ior_threads_ring_post_cqe_locked(ring, cqe) == 0) {
+		ret = 0;
+	} else if (w) {
+		w->ovf_cqe = *cqe;
+		w->ovf_next = NULL;
+		if (pool->ovf_tail) {
+			pool->ovf_tail->ovf_next = w;
+		} else {
+			pool->ovf_head = w;
 		}
-	} while (!atomic_compare_exchange_weak(&pool->cq_pending, &n, n + 1));
-	return 0;
+		pool->ovf_tail = w;
+		atomic_fetch_add_explicit(&pool->ovf_count, 1, memory_order_release);
+		ret = 1;
+	} else {
+		ret = -EOVERFLOW;
+	}
+	pthread_mutex_unlock(&ring->tail_lock);
+
+	if (ret >= 0) {
+		ior_threads_pool_signal_completion(pool);
+	}
+	return ret;
 }
 
-void ior_threads_pool_cq_release(ior_threads_pool *pool, uint32_t nr)
+void ior_threads_pool_flush_overflow(ior_threads_pool *pool)
 {
-	uint32_t n = atomic_load_explicit(&pool->cq_pending, memory_order_relaxed);
-	uint32_t left;
-	do {
-		if (nr > n) {
-			// A completion marked seen that was never posted: without the
-			// clamp the count would wrap and get_sqe would refuse for good.
-			IOR_LOG_ERROR("%u completions reaped, %u pending", nr, n);
-			left = 0;
-		} else {
-			left = n - nr;
+	if (!atomic_load_explicit(&pool->ovf_count, memory_order_acquire)) {
+		return;
+	}
+	ior_threads_ring *ring = &pool->ctx->cq_ring;
+	ior_work *moved = NULL;
+
+	pthread_mutex_lock(&ring->tail_lock);
+	while (pool->ovf_head
+			&& ior_threads_ring_post_cqe_locked(ring, &pool->ovf_head->ovf_cqe) == 0) {
+		ior_work *w = pool->ovf_head;
+		pool->ovf_head = w->ovf_next;
+		if (!pool->ovf_head) {
+			pool->ovf_tail = NULL;
 		}
-	} while (!atomic_compare_exchange_weak(&pool->cq_pending, &n, left));
+		atomic_fetch_sub_explicit(&pool->ovf_count, 1, memory_order_release);
+		w->ovf_next = moved;
+		moved = w;
+	}
+	pthread_mutex_unlock(&ring->tail_lock);
+
+	if (moved) {
+		pthread_mutex_lock(&pool->work_lock);
+		while (moved) {
+			ior_work *next = moved->ovf_next;
+			ior_threads_pool_work_release(pool, moved);
+			moved = next;
+		}
+		pthread_mutex_unlock(&pool->work_lock);
+	}
 }
 
 // ===== Timers =====

@@ -73,6 +73,8 @@ void ior_threads_ring_consume_to(ior_threads_ring *ring, uint32_t pos);
 // ===== Completion Queue Operations =====
 
 int ior_threads_ring_post_cqe(ior_threads_ring *ring, const ior_cqe *cqe);
+// The same with the ring's tail_lock already held: -EOVERFLOW when full.
+int ior_threads_ring_post_cqe_locked(ior_threads_ring *ring, const ior_cqe *cqe);
 ior_cqe *ior_threads_ring_peek_cqe(ior_threads_ring *ring);
 void ior_threads_ring_cqe_seen(ior_threads_ring *ring);
 uint32_t ior_threads_ring_peek_batch_cqe(ior_threads_ring *ring, ior_cqe **cqes, uint32_t max);

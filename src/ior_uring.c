@@ -1367,14 +1367,8 @@ static int ior_uring_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 	}
 
 	ior_ctx_uring *ctx = backend_ctx;
-	/*
-	 * A full CQ is refused rather than overflowed: the kernel would buffer
-	 * the completions, but off the ring and on a slow path, and the other
-	 * backends refuse here too. Reaping makes room.
-	 */
-	if (io_uring_cq_ready(&ctx->ring) >= ctx->cq_entries) {
-		return -EBUSY;
-	}
+	/* Only a full SQ refuses: a completion that finds the CQ full is kept
+	 * by the kernel (IORING_FEAT_NODROP) until the reaper makes room. */
 	struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
 	if (!sqe) {
 		return -ENOSPC;
