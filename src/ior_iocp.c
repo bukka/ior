@@ -500,6 +500,10 @@ static int win_error_to_errno(DWORD err)
 		 * packet's error status.
 		 */
 		case WSAECONNRESET:
+		case ERROR_NETNAME_DELETED:
+			// What AFD reports for a request the peer's reset failed: a recv
+			// on a reset connection, or the AcceptEx that takes a connection
+			// reset while it was queued.
 			return -ECONNRESET;
 		case WSAECONNREFUSED:
 		case ERROR_CONNECTION_REFUSED:
@@ -1710,7 +1714,15 @@ static void accept_multi_unlink_locked(ior_iocp_op *parent, ior_iocp_op *child)
 /*
  * Put one more AcceptEx out for a parent. Returns 0 once the child's request
  * is in flight, or its failure is on its way through the port (a synthetic
- * completion, which then takes the parent out), -ENOMEM with no op to be had.
+ * completion, which then takes the parent out), -ENOMEM with no op to be had,
+ * -ECANCELED for a parent on its way out, which gets no more children.
+ *
+ * The child is linked and issued under timers.lock, the lock the timer thread
+ * takes the parent out under when its link timeout fires
+ * (accept_multi_end_locked): that pass cancels the children it finds, so a
+ * child linked after it must not be issued, and one linked before it must
+ * already be in flight, or it would be left out, never cancelled, and the
+ * parent would complete only with the next connection.
  */
 static int accept_multi_spawn(ior_ctx_iocp *ctx, ior_iocp_op *parent)
 {
@@ -1727,10 +1739,16 @@ static int accept_multi_spawn(ior_ctx_iocp *ctx, ior_iocp_op *parent)
 	child->poll_parent_gen = parent->gen;
 
 	EnterCriticalSection(&ctx->timers.lock);
+	if (parent->accept_ending) {
+		LeaveCriticalSection(&ctx->timers.lock);
+		free_op(ctx, child);
+		return -ECANCELED;
+	}
 	accept_multi_link_locked(parent, child);
-	LeaveCriticalSection(&ctx->timers.lock);
 	live_add(ctx, child);
-	return issue_accept(ctx, child);
+	int ret = issue_accept(ctx, child);
+	LeaveCriticalSection(&ctx->timers.lock);
+	return ret;
 }
 
 /*
@@ -1783,11 +1801,21 @@ static int issue_accept_multi(ior_ctx_iocp *ctx, ior_iocp_op *op)
  * A child has been dequeued (its slot given back, finish_socket_op run).
  * Returns true if its CQE is the caller's: a connection it accepted while
  * its parent is in flight, even one on its way out (the connection is real,
- * and the parent's completion is still behind it). A failure takes the
- * parent out, the first one's error being the parent's result (-ECANCELED
- * for its own cancellation); a parent without memory for a replacement
- * ends the same way once no child is left. A child of a parent the
- * teardown completed is nobody's, and its socket goes with it (free_op).
+ * and the parent's completion is still behind it).
+ *
+ * A failure of the request takes the parent out, the first one's error
+ * being the parent's result: one that never got in flight (synthetic: no
+ * socket to be had, AcceptEx refused, the listener not a socket) or an
+ * abort (-ECANCELED: the parent's own cancellation, the listener closed
+ * with the request pending, a CancelIoEx behind the library's back). A
+ * connection that failed on its own is another matter: a peer that resets
+ * while queued fails the AcceptEx that takes it (ERROR_NETNAME_DELETED)
+ * and leaves the listener as it was, so as accept(2) never reports such a
+ * connection on Linux it is dropped here and the child replaced. A
+ * listener that is in fact gone refuses the replacement, which ends the
+ * parent. A parent without memory for a replacement ends once no child is
+ * left. A child of a parent the teardown completed is nobody's, and its
+ * socket goes with it (free_op).
  */
 static bool accept_multi_child_done(ior_ctx_iocp *ctx, ior_iocp_op *child)
 {
@@ -1802,10 +1830,12 @@ static bool accept_multi_child_done(ior_ctx_iocp *ctx, ior_iocp_op *child)
 	if (alive) {
 		accept_multi_unlink_locked(parent, child);
 		deliver = child->error_code == ERROR_SUCCESS;
-		if (!deliver) {
+		bool fatal = !deliver
+				&& (child->is_synthetic || child->error_code == ERROR_OPERATION_ABORTED);
+		if (fatal) {
 			accept_multi_end_locked(ctx, parent, child->error_code);
 		}
-		replace = deliver && !parent->accept_ending;
+		replace = !fatal && !parent->accept_ending;
 	}
 	LeaveCriticalSection(&tm->lock);
 	if (!alive) {

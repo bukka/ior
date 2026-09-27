@@ -643,6 +643,89 @@ static void test_accept_multishot_link_timeout(void **state)
 }
 
 /*
+ * A link timeout firing while connections stream in: whenever the deadline
+ * lands relative to an accept being reported and the next one being armed,
+ * the operation must still end (-ECANCELED, no IOR_CQE_F_MORE) once the
+ * timeout has fired, without waiting for yet another connection. Connections
+ * are made one at a time, each reported before the next, so that at the
+ * deadline the backlog is usually empty: an accept armed after the timeout
+ * fired, and missed by it, would then hang the operation. A connection the
+ * round left in the backlog is reset by its client's abortive close below
+ * and met by the next round's accept: reported as a connection where the
+ * system hands the dead socket over (Linux), dropped where it reports the
+ * reset instead (ECONNABORTED from accept(2) on BSD and macOS, a failed
+ * AcceptEx on Windows), and never the end of the operation.
+ */
+// Close abortively (RST, no TIME_WAIT): the test makes thousands of
+// connections, more than the ephemeral port range holds in TIME_WAIT. On
+// Windows only closesocket() honours the linger option (CloseHandle() goes
+// to the driver directly and closes gracefully).
+static void close_abortive(ior_fd_t fd)
+{
+	struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+#ifdef _WIN32
+	setsockopt((SOCKET) fd, SOL_SOCKET, SO_LINGER, (const char *) &lg, sizeof(lg));
+	closesocket((SOCKET) fd);
+#else
+	setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+	test_close_fd(fd);
+#endif
+}
+
+static void test_accept_multishot_link_timeout_under_load(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	enum { ROUNDS = 200, MAX_CLIENTS = 32 };
+	ior_fd_t fds[2 * MAX_CLIENTS + 8];
+
+	for (int round = 0; round < ROUNDS; round++) {
+		int nfds = 0;
+		int clients = 0;
+		ior_sqe *a = ior_get_sqe(s->ctx);
+		assert_non_null(a);
+		ior_prep_accept_multishot(s->ctx, a, s->listener, 0);
+		ior_sqe_set_data(s->ctx, a, TAG_MACCEPT);
+		ior_sqe_set_flags(s->ctx, a, IOR_SQE_IO_LINK);
+		ior_sqe *t = ior_get_sqe(s->ctx);
+		assert_non_null(t);
+		ior_timespec ts = { .tv_sec = 0, .tv_nsec = (1 + round % 3) * 500000L };
+		ior_prep_link_timeout(s->ctx, t, &ts, 0);
+		ior_sqe_set_data(s->ctx, t, TAG_TMO);
+		assert_true(ior_submit(s->ctx) >= 0);
+
+		int got_end = 0, got_tmo = 0;
+		while (!got_end || !got_tmo) {
+			if (!got_tmo && !got_end && clients < MAX_CLIENTS) {
+				fds[nfds++] = connect_client(s);
+				clients++;
+			}
+			cqe_rec r;
+			if (reap_one(s->ctx, &r, 3000) != 0) {
+				fail_msg("round %d: no completion after %d connections (timeout %d, end %d)",
+						round, clients, got_tmo, got_end);
+			}
+			if (r.tag == TAG_TMO) {
+				assert_int_equal(r.res, -ETIME);
+				got_tmo = 1;
+			} else {
+				assert_ptr_equal(r.tag, TAG_MACCEPT);
+				if (r.flags & IOR_CQE_F_MORE) {
+					assert_false(got_end);
+					assert_true(nfds < (int) (sizeof(fds) / sizeof(fds[0])));
+					fds[nfds++] = accepted_fd(r.res);
+				} else {
+					assert_int_equal(r.res, -ECANCELED);
+					got_end = 1;
+				}
+			}
+		}
+		for (int i = 0; i < nfds; i++) {
+			close_abortive(fds[i]);
+		}
+	}
+}
+
+/*
  * A cancel right behind the submit, with connections queued: whatever the
  * accept reported before its -ECANCELED is the caller's, and the rest is
  * still in the backlog for a one-shot accept. No connection is lost.
@@ -795,6 +878,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_accept_multishot_flags, setup_ac, teardown_ac),
 #endif
 		cmocka_unit_test_setup_teardown(test_accept_multishot_link_timeout, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(
+				test_accept_multishot_link_timeout_under_load, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(
 				test_accept_multishot_cancel_keeps_connections, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(

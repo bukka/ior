@@ -618,6 +618,12 @@ static int ior_threads_pool_accept_edge(ior_threads_pool *pool, ior_work *w)
 		if (nfd == -EAGAIN || nfd == -EWOULDBLOCK) {
 			return 0; // the backlog is empty: wait for the next edge
 		}
+		if (nfd == -ECONNABORTED) {
+			// A connection the peer reset while it was queued, which accept(2)
+			// reports on BSD and macOS (Linux hands the dead socket over):
+			// nobody's, and no fault of the listener's; on to the next one.
+			continue;
+		}
 		if (nfd < 0) {
 			w->accept_last = nfd;
 			return 1;

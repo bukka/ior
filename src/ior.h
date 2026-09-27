@@ -808,7 +808,10 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
  * queue full: that connection is its last completion, with the socket as
  * res (>= 0) and no IOR_CQE_F_MORE, as io_uring ends a multishot accept.
  * IOCP keeps a few accepts outstanding, and ends only when no memory is
- * left. Re-arm by submitting a new operation.
+ * left. Re-arm by submitting a new operation. A connection the peer resets
+ * while it is still queued is dropped, not reported and not the end of the
+ * operation, where the system reports it at all (BSD, macOS and Windows;
+ * Linux hands the dead socket over as any other).
  *
  * io_uring uses IORING_ACCEPT_MULTISHOT (Linux 5.19). The thread backend
  * watches the listener edge-triggered on its poller, as a multishot poll,
