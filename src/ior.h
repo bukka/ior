@@ -486,8 +486,10 @@ int ior_get_sqe_ex(ior_ctx *ctx, ior_sqe **sqe_out);
  * in order, and the next submit sends them; they need no new prep. An error
  * found while an op runs, such as a bad descriptor, is its completion only.
  *
- * io_uring alone also takes fewer entries, or none (-EAGAIN, -ENOMEM), when
- * the kernel cannot allocate a request; what is left stays staged the same way.
+ * Without memory for the operations a submit also takes fewer entries, or
+ * none: io_uring when the kernel cannot allocate a request (-EAGAIN,
+ * -ENOMEM), the thread backend when it cannot grow its work items (-EAGAIN,
+ * taking none). What is left stays staged the same way.
  *
  * Only ior_submit() and ior_submit_and_wait() submit: waiting or peeking for
  * completions never sends staged entries, so waiting on an op that is still

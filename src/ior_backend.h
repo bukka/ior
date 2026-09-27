@@ -164,7 +164,7 @@ typedef struct ior_backend_ops {
 	void (*forget)(void *backend_ctx);
 
 	/* Submission queue operations. get_sqe: 0, -ENOSPC (submission queue
-	 * full), -EBUSY (no completion slot free). */
+	 * full), -ENOMEM (no memory for the entry, IOCP). */
 	int (*get_sqe)(void *backend_ctx, ior_sqe **sqe_out);
 	int (*submit)(void *backend_ctx);
 	int (*submit_and_wait)(void *backend_ctx, unsigned wait_nr);
