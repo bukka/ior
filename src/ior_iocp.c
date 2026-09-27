@@ -3951,9 +3951,13 @@ static int iocp_pump_ensure(ior_ctx_iocp *ctx)
 	// Published under the lock iocp_backlog_push decides under: a completion
 	// the port refused before now is in the backlog, not the port, and its
 	// wake packet went to the port, where the pump drops it as stray.
+	// Completions dequeued already and waiting in the ready queue are
+	// pending too, and ior_notify_fd() announces what is pending, as the
+	// other backends do for everything in their completion queue. Only the
+	// consuming thread, which is calling this, touches the ready queue.
 	EnterCriticalSection(&p->lock);
 	p->thread = thread;
-	if (atomic_load(&ctx->backlog_count)) {
+	if (atomic_load(&ctx->backlog_count) || !ready_queue_empty(&ctx->ready)) {
 		iocp_pump_signal_locked(p);
 	}
 	LeaveCriticalSection(&p->lock);
