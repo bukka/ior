@@ -247,6 +247,112 @@ static void test_in_flight_beyond_cq(void **state)
 }
 
 /*
+ * With the notification descriptor handed out first, completions of more
+ * operations than the completion queue holds are all announced and reaped:
+ * wherever a backend keeps the ones the queue has no room for, none is lost.
+ */
+static void test_in_flight_beyond_cq_notify(void **state)
+{
+	(void) state;
+	enum { N = 3 * SQ_DEPTH };
+	ior_ctx *ctx = NULL;
+	ior_params params = { .sq_entries = SQ_DEPTH, .cq_entries = SQ_DEPTH };
+	assert_return_code(ior_queue_init_params(SQ_DEPTH, &ctx, &params), 0);
+	ior_fd_t nfd = ior_notify_fd(ctx);
+	assert_true(test_fd_is_valid(nfd));
+
+	ior_fd_t sock[2];
+	assert_return_code(test_make_socketpair(sock), 0);
+	char buf[N][8];
+	for (unsigned i = 0; i < N; i++) {
+		ior_sqe *sqe = NULL;
+		int ret = ior_get_sqe_ex(ctx, &sqe);
+		if (ret == -ENOSPC) {
+			assert_true(ior_submit(ctx) > 0);
+			ret = ior_get_sqe_ex(ctx, &sqe);
+		}
+		assert_int_equal(ret, 0);
+		ior_prep_recv(ctx, sqe, sock[1], buf[i], sizeof(buf[i]), 0);
+		ior_sqe_set_data(ctx, sqe, TAG_RECV);
+	}
+	assert_true(ior_submit(ctx) > 0);
+
+	test_close_fd(sock[0]);
+	unsigned got = 0;
+	while (got < N) {
+		assert_int_equal(test_wait_readable(nfd, 3000), 1);
+		assert_return_code(ior_notify_clear(ctx), 0);
+		ior_cqe *cqe = NULL;
+		while (got < N && ior_peek_cqe(ctx, &cqe) == 0) {
+			assert_ptr_equal(ior_cqe_get_data(ctx, cqe), TAG_RECV);
+			ior_cqe_seen(ctx, cqe);
+			got++;
+		}
+	}
+
+	test_close_fd(sock[1]);
+	ior_queue_exit(ctx);
+}
+
+/*
+ * A cancel finds its target however many operations are in flight beside
+ * it, beyond what the completion queue holds: each of them, by its own
+ * user_data, the oldest and the newest alike.
+ */
+static void test_cancel_beyond_cq(void **state)
+{
+	(void) state;
+	enum { N = 3 * SQ_DEPTH };
+	ior_ctx *ctx = NULL;
+	ior_params params = { .sq_entries = SQ_DEPTH, .cq_entries = SQ_DEPTH };
+	assert_return_code(ior_queue_init_params(SQ_DEPTH, &ctx, &params), 0);
+
+	ior_timespec ts = { .tv_sec = 30, .tv_nsec = 0 };
+	for (uintptr_t i = 0; i < 2 * N; i++) {
+		ior_sqe *sqe = NULL;
+		int ret = ior_get_sqe_ex(ctx, &sqe);
+		if (ret == -ENOSPC) {
+			assert_true(ior_submit(ctx) > 0);
+			ret = ior_get_sqe_ex(ctx, &sqe);
+		}
+		assert_int_equal(ret, 0);
+		if (i < N) {
+			ior_prep_timeout(ctx, sqe, &ts, 0, 0);
+			ior_sqe_set_data(ctx, sqe, (void *) (0x1000 + i));
+		} else {
+			// Newest first, so the scan meets the target last among the rest.
+			ior_prep_cancel(ctx, sqe, (void *) (0x1000 + (2 * N - 1 - i)));
+			ior_sqe_set_data(ctx, sqe, (void *) (0x2000 + (2 * N - 1 - i)));
+		}
+	}
+	assert_true(ior_submit(ctx) > 0);
+
+	int32_t timeout_res[N];
+	int32_t cancel_res[N];
+	for (unsigned i = 0; i < N; i++) {
+		timeout_res[i] = 1;
+		cancel_res[i] = 1;
+	}
+	for (unsigned n = 0; n < 2 * N; n++) {
+		ior_cqe *cqe = NULL;
+		ior_timespec to = { .tv_sec = 3, .tv_nsec = 0 };
+		assert_return_code(ior_wait_cqe_timeout(ctx, &cqe, &to), 0);
+		uintptr_t data = (uintptr_t) ior_cqe_get_data(ctx, cqe);
+		if (data >= 0x2000) {
+			cancel_res[data - 0x2000] = ior_cqe_get_res(ctx, cqe);
+		} else {
+			timeout_res[data - 0x1000] = ior_cqe_get_res(ctx, cqe);
+		}
+		ior_cqe_seen(ctx, cqe);
+	}
+	for (unsigned i = 0; i < N; i++) {
+		assert_int_equal(cancel_res[i], 0);
+		assert_int_equal(timeout_res[i], -ECANCELED);
+	}
+	ior_queue_exit(ctx);
+}
+
+/*
  * IO_DRAIN waits for every earlier operation, however many completed around
  * a long-lived one meanwhile: far more than the queue holds.
  */
@@ -308,6 +414,8 @@ int main(void)
 		cmocka_unit_test(test_cq_full_overflows),
 		cmocka_unit_test(test_overflow_keeps_order),
 		cmocka_unit_test(test_in_flight_beyond_cq),
+		cmocka_unit_test(test_in_flight_beyond_cq_notify),
+		cmocka_unit_test(test_cancel_beyond_cq),
 		cmocka_unit_test(test_drain_behind_long_op),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);

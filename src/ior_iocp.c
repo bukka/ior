@@ -224,6 +224,16 @@ typedef struct ior_iocp_op {
 
 	// Free list linkage (preserved across prep_*)
 	struct ior_iocp_op *next_free;
+
+	// Its packet, staged by the completion pump (see iocp_pump).
+	struct ior_iocp_op *pump_next;
+	DWORD pump_bytes;
+	DWORD pump_error;
+
+	// On the context's list of ops in flight (see live_add); consumer only.
+	struct ior_iocp_op *live_prev;
+	struct ior_iocp_op *live_next;
+	bool live;
 } ior_iocp_op;
 
 /* A block of ops; the pool grows by adding one and never shrinks. */
@@ -309,10 +319,11 @@ typedef struct iocp_pump {
 	HANDLE thread; // NULL until ior_notify_fd()
 	SOCKET wake_tx;
 	SOCKET wake_rx;
-	pump_entry *entries; // circular, protected by lock
-	uint32_t head;
-	uint32_t count;
-	uint32_t cap;
+	// Packets staged, oldest first, linked through their ops: an op has at
+	// most one packet out at a time, so staging needs no room of its own
+	// however many ops are in flight (protected by lock).
+	struct ior_iocp_op *staged_head;
+	struct ior_iocp_op *staged_tail;
 	// A wake byte is on the socket that ior_notify_clear() has not consumed
 	// yet, so further packets need not send another (protected by lock).
 	bool signalled;
@@ -340,6 +351,15 @@ typedef struct ior_ctx_iocp {
 	// which nothing bounds but memory, as on io_uring.
 	iocp_op_chunk *op_chunks;
 	uint32_t pool_size; // ops in all chunks
+
+	/*
+	 * Ops submitted and not yet completed (dequeued), oldest first: what a
+	 * cancel and teardown look through, rather than a pool that grows with
+	 * the most ops ever in flight and never shrinks. Submit and dequeue both
+	 * run on the consuming thread, which alone touches it.
+	 */
+	ior_iocp_op *live_head;
+	ior_iocp_op *live_tail;
 
 	// Free list (protected because timer thread may free ops on PQCS failure/teardown)
 	CRITICAL_SECTION pool_lock;
@@ -723,6 +743,10 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->link_timeout = NULL;
 	op->guarded = NULL;
 
+	op->live_prev = NULL;
+	op->live_next = NULL;
+	op->live = false;
+
 	op->seq = 0;
 	op->drain_after = 0;
 	op->link_next = NULL;
@@ -795,6 +819,41 @@ static void free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	ctx->free_count++;
 
 	LeaveCriticalSection(&ctx->pool_lock);
+}
+
+// Put a submitted op on the list of ops in flight, as the newest.
+static void live_add(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	op->live_prev = ctx->live_tail;
+	op->live_next = NULL;
+	if (ctx->live_tail) {
+		ctx->live_tail->live_next = op;
+	} else {
+		ctx->live_head = op;
+	}
+	ctx->live_tail = op;
+	op->live = true;
+}
+
+// Take a completed op off it; nothing for one never on it (a multishot edge).
+static void live_remove(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	if (!op->live) {
+		return;
+	}
+	if (op->live_prev) {
+		op->live_prev->live_next = op->live_next;
+	} else {
+		ctx->live_head = op->live_next;
+	}
+	if (op->live_next) {
+		op->live_next->live_prev = op->live_prev;
+	} else {
+		ctx->live_tail = op->live_prev;
+	}
+	op->live_prev = NULL;
+	op->live_next = NULL;
+	op->live = false;
 }
 
 /* ================= SQ ring ================= */
@@ -2929,8 +2988,9 @@ static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 }
 
 /*
- * Execute a cancel op inline, like io_uring does at submit: scan the op pool
- * for the first in-flight match and post the result as this op's completion.
+ * Execute a cancel op inline, like io_uring does at submit: look through the
+ * ops in flight, oldest first, for the first match and post the result as
+ * this op's completion.
  */
 static int issue_cancel(ior_ctx_iocp *ctx, ior_iocp_op *c)
 {
@@ -2940,27 +3000,19 @@ static int issue_cancel(ior_ctx_iocp *ctx, ior_iocp_op *c)
 		ret = -EBADF;
 	} else {
 		ret = -ENOENT;
-		// The poller thread may grow the pool meanwhile (a multishot edge):
-		// a chunk is linked in whole, at the head, its ops free and skipped.
-		for (iocp_op_chunk *chunk = ctx->op_chunks; chunk && ret == -ENOENT; chunk = chunk->next) {
-			for (uint32_t i = 0; i < chunk->count; i++) {
-				ior_iocp_op *op = &chunk->ops[i];
-				if (op == c) {
-					continue;
-				}
-				int state = atomic_load(&op->state);
-				if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE
-						|| state == IOCP_OP_IO_CANCEL) {
-					continue; // IO_CANCEL: already being cancelled, its CQE is on its way
-				}
-				if (!iocp_cancel_match(op, c)) {
-					continue;
-				}
-				ret = iocp_cancel_one(ctx, op);
-				if (ret != -ENOENT) {
-					break;
-				}
+		for (ior_iocp_op *op = ctx->live_head; op && ret == -ENOENT; op = op->live_next) {
+			if (op == c) {
+				continue;
 			}
+			int state = atomic_load(&op->state);
+			if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE
+					|| state == IOCP_OP_IO_CANCEL) {
+				continue; // IO_CANCEL: already being cancelled, its CQE is on its way
+			}
+			if (!iocp_cancel_match(op, c)) {
+				continue;
+			}
+			ret = iocp_cancel_one(ctx, op);
 		}
 	}
 
@@ -3425,12 +3477,9 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	// Signal waits: each abort posts -ECANCELED (a handler that wins the
 	// race posts the signal instead), then the context leaves the handler's
 	// list, so no event reaches it any more.
-	for (iocp_op_chunk *chunk = ctx->op_chunks; chunk; chunk = chunk->next) {
-		for (uint32_t i = 0; i < chunk->count; i++) {
-			ior_iocp_op *op = &chunk->ops[i];
-			if (atomic_load(&op->state) == IOCP_OP_SIGWAIT) {
-				(void) iocp_sigwait_abort(ctx, op);
-			}
+	for (ior_iocp_op *op = ctx->live_head; op; op = op->live_next) {
+		if (atomic_load(&op->state) == IOCP_OP_SIGWAIT) {
+			(void) iocp_sigwait_abort(ctx, op);
 		}
 	}
 	iocp_sig_unregister(ctx);
@@ -3442,12 +3491,9 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		 * and the drain below waiting. Each abort posts -ECANCELED (a
 		 * callback that wins the race posts the real result instead).
 		 */
-		for (iocp_op_chunk *chunk = ctx->op_chunks; chunk; chunk = chunk->next) {
-			for (uint32_t i = 0; i < chunk->count; i++) {
-				ior_iocp_op *op = &chunk->ops[i];
-				if (atomic_load(&op->state) == IOCP_OP_WAIT) {
-					(void) iocp_waitpid_abort(ctx, op);
-				}
+		for (ior_iocp_op *op = ctx->live_head; op; op = op->live_next) {
+			if (atomic_load(&op->state) == IOCP_OP_WAIT) {
+				(void) iocp_waitpid_abort(ctx, op);
 			}
 		}
 		CloseThreadpoolCleanupGroupMembers(ctx->work_cleanup, FALSE, NULL);
@@ -3530,15 +3576,15 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	 * signal waits were aborted above, and this pass cancels the overlapped
 	 * requests. A new kind of op that is counted but not forced here would
 	 * hang teardown instead of spinning out.
+	 *
+	 * Every op still in flight is on the live list (the ones freed above
+	 * stay linked, but read FREE, and nothing is allocated any more).
 	 */
-	for (iocp_op_chunk *chunk = ctx->op_chunks; chunk; chunk = chunk->next) {
-		for (uint32_t i = 0; i < chunk->count; i++) {
-			ior_iocp_op *op = &chunk->ops[i];
-			int state = atomic_load(&op->state);
-			if (state == IOCP_OP_IO || state == IOCP_OP_IO_CANCEL) {
-				atomic_store(&op->state, IOCP_OP_IO_CANCEL);
-				CancelIoEx((HANDLE) op->fd, &op->overlapped);
-			}
+	for (ior_iocp_op *op = ctx->live_head; op; op = op->live_next) {
+		int state = atomic_load(&op->state);
+		if (state == IOCP_OP_IO || state == IOCP_OP_IO_CANCEL) {
+			atomic_store(&op->state, IOCP_OP_IO_CANCEL);
+			CancelIoEx((HANDLE) op->fd, &op->overlapped);
 		}
 	}
 
@@ -3737,6 +3783,8 @@ static int ior_iocp_backend_submit(void *backend_ctx)
 
 		// Assign submission sequence
 		op->seq = atomic_fetch_add(&ctx->submit_seq, 1) + 1;
+		// In flight until its completion is dequeued, whatever happens below.
+		live_add(ctx, op);
 
 		if ((op->opcode == IOR_OP_TIMER || op->opcode == IOR_OP_LINK_TIMEOUT) && op->timeout_ts) {
 			op->timeout_val = *op->timeout_ts;
@@ -3856,29 +3904,17 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 			continue; // stray packet (external PostQueuedCompletionStatus)
 		}
 
+		ior_iocp_op *op = (ior_iocp_op *) overlapped;
+		op->pump_bytes = bytes;
+		op->pump_error = err;
+		op->pump_next = NULL;
 		EnterCriticalSection(&p->lock);
-		if (p->count == p->cap) {
-			// Cannot happen: every op has at most one packet in flight and the
-			// queue is sized past the op pool. Grow anyway rather than lose one.
-			uint32_t cap = p->cap * 2;
-			pump_entry *entries = malloc(cap * sizeof(*entries));
-			if (entries) {
-				for (uint32_t i = 0; i < p->count; i++) {
-					entries[i] = p->entries[(p->head + i) % p->cap];
-				}
-				free(p->entries);
-				p->entries = entries;
-				p->head = 0;
-				p->cap = cap;
-			}
+		if (p->staged_tail) {
+			p->staged_tail->pump_next = op;
+		} else {
+			p->staged_head = op;
 		}
-		if (p->count < p->cap) {
-			pump_entry *e = &p->entries[(p->head + p->count) % p->cap];
-			e->overlapped = overlapped;
-			e->bytes = bytes;
-			e->error = err;
-			p->count++;
-		}
+		p->staged_tail = op;
 		/*
 		 * Signal under the lock, after staging, and only if no byte is
 		 * outstanding. The lock makes "stage, then signal" atomic against the
@@ -3908,7 +3944,7 @@ static int iocp_pump_pop(ior_ctx_iocp *ctx, DWORD timeout_ms, pump_entry *out)
 	iocp_pump *p = &ctx->pump;
 
 	EnterCriticalSection(&p->lock);
-	while (p->count == 0) {
+	while (!p->staged_head) {
 		if (atomic_load(&ctx->backlog_count)) {
 			// The caller's next dequeue takes it (see iocp_backlog_push).
 			LeaveCriticalSection(&p->lock);
@@ -3924,10 +3960,16 @@ static int iocp_pump_pop(ior_ctx_iocp *ctx, DWORD timeout_ms, pump_entry *out)
 			return -ETIMEDOUT;
 		}
 	}
-	*out = p->entries[p->head];
-	p->head = (p->head + 1) % p->cap;
-	p->count--;
+	ior_iocp_op *op = p->staged_head;
+	p->staged_head = op->pump_next;
+	if (!p->staged_head) {
+		p->staged_tail = NULL;
+	}
 	LeaveCriticalSection(&p->lock);
+	op->pump_next = NULL;
+	out->overlapped = &op->overlapped;
+	out->bytes = op->pump_bytes;
+	out->error = op->pump_error;
 	return 0;
 }
 
@@ -3965,13 +4007,8 @@ static int iocp_pump_ensure(ior_ctx_iocp *ctx)
 		goto fail;
 	}
 
-	p->cap = ctx->pool_size + 16;
-	p->entries = malloc(p->cap * sizeof(*p->entries));
-	if (!p->entries) {
-		goto fail;
-	}
-	p->head = 0;
-	p->count = 0;
+	p->staged_head = NULL;
+	p->staged_tail = NULL;
 	p->signalled = false;
 	p->wake_rx = rx;
 	p->wake_tx = tx;
@@ -3997,9 +4034,6 @@ static int iocp_pump_ensure(ior_ctx_iocp *ctx)
 	return 0;
 
 fail:
-	free(p->entries);
-	p->entries = NULL;
-	p->cap = 0;
 	if (rx != INVALID_SOCKET) {
 		closesocket(rx);
 	}
@@ -4025,15 +4059,13 @@ static void iocp_pump_stop(ior_ctx_iocp *ctx)
 	CloseHandle(p->thread);
 	p->thread = NULL;
 
-	while (p->count > 0) {
-		ior_iocp_op *op = (ior_iocp_op *) p->entries[p->head].overlapped;
-		p->head = (p->head + 1) % p->cap;
-		p->count--;
+	while (p->staged_head) {
+		ior_iocp_op *op = p->staged_head;
+		p->staged_head = op->pump_next;
 		atomic_fetch_sub(&ctx->active_count, 1);
 		free_op(ctx, op);
 	}
-	free(p->entries);
-	p->entries = NULL;
+	p->staged_tail = NULL;
 	closesocket(p->wake_tx);
 	closesocket(p->wake_rx);
 	p->wake_tx = INVALID_SOCKET;
@@ -4108,6 +4140,7 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		op->bytes_transferred = ok ? bytes_transferred : 0;
 		atomic_store(&op->state, IOCP_OP_DONE);
 	}
+	live_remove(ctx, op);
 
 	if (op->tp_work) {
 		// The callback has posted this completion, so it is done with the
