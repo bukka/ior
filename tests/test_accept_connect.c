@@ -376,7 +376,8 @@ static int reap_one(ior_ctx *ctx, cqe_rec *r, int timeout_ms)
 {
 	for (;;) {
 		ior_cqe *cqe = NULL;
-		ior_timespec to = { .tv_sec = timeout_ms / 1000, .tv_nsec = (timeout_ms % 1000) * 1000000L };
+		ior_timespec to
+				= { .tv_sec = timeout_ms / 1000, .tv_nsec = (timeout_ms % 1000) * 1000000L };
 		int ret = ior_wait_cqe_timeout(ctx, &cqe, &to);
 		if (ret == -EAGAIN || ret == -EINTR) {
 			continue;
@@ -415,6 +416,15 @@ static void reap_maccept_end(ior_ctx *ctx, int32_t res)
 	assert_ptr_equal(r.tag, TAG_MACCEPT);
 	assert_false(r.flags & IOR_CQE_F_MORE);
 	assert_int_equal(r.res, res);
+}
+
+static void sleep_ms(int ms)
+{
+#ifdef _WIN32
+	Sleep((DWORD) ms);
+#else
+	usleep((useconds_t) ms * 1000);
+#endif
 }
 
 static void assert_silent(ior_ctx *ctx, int timeout_ms)
@@ -722,8 +732,8 @@ static void test_accept_multishot_link_timeout_under_load(void **state)
 			}
 			cqe_rec r;
 			if (reap_one(s->ctx, &r, 3000) != 0) {
-				fail_msg("round %d: no completion after %d connections (timeout %d, end %d)",
-						round, clients, got_tmo, got_end);
+				fail_msg("round %d: no completion after %d connections (timeout %d, end %d)", round,
+						clients, got_tmo, got_end);
 			}
 			if (r.tag == TAG_TMO) {
 				assert_int_equal(r.res, -ETIME);
@@ -884,6 +894,20 @@ static void test_accept_multishot_cq_full(void **state)
 	for (unsigned i = 0; i < n; i++) {
 		clients[i] = connect_client(s);
 	}
+
+	/*
+	 * Let the queue fill before reaping: the thread backend's poller accepts
+	 * behind the connects (the poll(2) poller looks about once a
+	 * millisecond), and a reap that makes room while it is still at it keeps
+	 * the operation going with every connection reported. Once the queue is
+	 * full, the poller's next accept finds it so.
+	 */
+	uint64_t start = test_monotonic_now_ns();
+	while (ior_cq_space_left(s->ctx) > 0 && test_monotonic_now_ns() - start < 3000000000ULL) {
+		sleep_ms(1);
+	}
+	assert_int_equal(ior_cq_space_left(s->ctx), 0);
+	sleep_ms(50);
 
 	// cq edges fill the queue; the next connection ends the operation.
 	unsigned got = 0;
