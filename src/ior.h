@@ -810,16 +810,18 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
  * IOCP keeps a few accepts outstanding, and ends only when no memory is
  * left. Re-arm by submitting a new operation. A connection the peer resets
  * while it is still queued is dropped, not reported and not the end of the
- * operation, where the system reports it at all (BSD, macOS and Windows;
- * Linux hands the dead socket over as any other).
+ * operation, where the system reports the reset to the accept at all
+ * (FreeBSD, Windows); Linux and macOS hand the dead socket over as any
+ * other.
  *
  * io_uring uses IORING_ACCEPT_MULTISHOT (Linux 5.19). The thread backend
- * watches the listener edge-triggered on its poller, as a multishot poll,
- * taking a blocking listener's mode over meanwhile (see ior_prep_accept()),
- * and accepts on the poller thread until the backlog is empty at every
- * edge. IOCP keeps four AcceptEx outstanding, each with a socket created
- * ahead of the listener's family and protocol, and issues another after
- * each completion. A link timeout bounds the whole operation as it does a
+ * accepts what is queued at submit on a worker, then watches the listener
+ * edge-triggered on its poller, as a multishot poll, taking a blocking
+ * listener's mode over meanwhile (see ior_prep_accept()), and accepts on
+ * the poller thread until the backlog is empty at every edge. IOCP keeps
+ * four AcceptEx outstanding, each with a socket created ahead of the
+ * listener's family and protocol, and issues another after each
+ * completion. A link timeout bounds the whole operation as it does a
  * multishot poll; do not link another entry behind it.
  *
  * @param ctx    I/O context.

@@ -649,12 +649,13 @@ static void test_accept_multishot_link_timeout(void **state)
  * timeout has fired, without waiting for yet another connection. Connections
  * are made one at a time, each reported before the next, so that at the
  * deadline the backlog is usually empty: an accept armed after the timeout
- * fired, and missed by it, would then hang the operation. A connection the
- * round left in the backlog is reset by its client's abortive close below
- * and met by the next round's accept: reported as a connection where the
- * system hands the dead socket over (Linux), dropped where it reports the
- * reset instead (ECONNABORTED from accept(2) on BSD and macOS, a failed
- * AcceptEx on Windows), and never the end of the operation.
+ * fired, and missed by it, would then hang the operation. What a round
+ * leaves in the backlog (the connection made right before the timeout was
+ * reaped, at least) is drained before the next round: left there, it would
+ * be reported by the next round's accept ahead of that round's own
+ * connections (Linux and macOS hand a connection over even once its peer
+ * has reset it), which then delays their report by one, and so leaves one
+ * more behind every round.
  */
 // Close abortively (RST, no TIME_WAIT): the test makes thousands of
 // connections, more than the ephemeral port range holds in TIME_WAIT. On
@@ -670,6 +671,26 @@ static void close_abortive(ior_fd_t fd)
 	setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 	test_close_fd(fd);
 #endif
+}
+
+// Accept and close whatever is queued on the listener right now.
+static void drain_listener(ac_state *s)
+{
+	while (test_wait_readable(s->listener, 0) == 1) {
+#ifdef _WIN32
+		SOCKET a = accept((SOCKET) s->listener, NULL, NULL);
+		if (a == INVALID_SOCKET) {
+			break;
+		}
+		test_close_fd((ior_fd_t) a);
+#else
+		int a = accept(s->listener, NULL, NULL);
+		if (a < 0) {
+			break;
+		}
+		test_close_fd(a);
+#endif
+	}
 }
 
 static void test_accept_multishot_link_timeout_under_load(void **state)
@@ -719,6 +740,7 @@ static void test_accept_multishot_link_timeout_under_load(void **state)
 				}
 			}
 		}
+		drain_listener(s);
 		for (int i = 0; i < nfds; i++) {
 			close_abortive(fds[i]);
 		}
@@ -779,6 +801,43 @@ static void test_accept_multishot_cancel_keeps_connections(void **state)
 		test_close_fd(accepted[i]);
 		test_close_fd(clients[i]);
 	}
+}
+
+/*
+ * A socket that is not listening fails the operation at once with -EINVAL,
+ * as accept(2) does, and without IOR_CQE_F_MORE: the thread backend must not
+ * park it on its poller, where nothing would ever wake it.
+ */
+static void test_accept_multishot_not_listening(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	ior_fd_t bound;
+	assert_return_code(test_make_tcp_socket(&bound), 0);
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifdef _WIN32
+	assert_int_equal(bind((SOCKET) bound, (struct sockaddr *) &a, sizeof(a)), 0);
+#else
+	assert_int_equal(bind(bound, (struct sockaddr *) &a, sizeof(a)), 0);
+#endif
+
+	ior_sqe *sqe = ior_get_sqe(s->ctx);
+	assert_non_null(sqe);
+	ior_prep_accept_multishot(s->ctx, sqe, bound, 0);
+	ior_sqe_set_data(s->ctx, sqe, TAG_MACCEPT);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	cqe_rec r;
+	if (reap_one(s->ctx, &r, 3000) != 0) {
+		fail_msg("no completion for a socket that is not listening");
+	}
+	assert_ptr_equal(r.tag, TAG_MACCEPT);
+	assert_false(r.flags & IOR_CQE_F_MORE);
+	assert_int_equal(r.res, -EINVAL);
+	assert_silent(s->ctx, 20);
+	test_close_fd(bound);
 }
 
 // Torn down with a multishot accept armed: exit must not hang.
@@ -882,6 +941,7 @@ int main(void)
 				test_accept_multishot_link_timeout_under_load, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(
 				test_accept_multishot_cancel_keeps_connections, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(test_accept_multishot_not_listening, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(
 				test_accept_multishot_pending_at_exit, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(test_accept_multishot_cq_full, setup_ac, teardown_ac),

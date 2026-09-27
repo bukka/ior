@@ -594,9 +594,10 @@ static int ior_threads_pool_accept_multi(const ior_sqe *sqe)
 }
 
 /*
- * An edge on a multishot accept's listener, on the poller thread: accept
- * until the backlog is empty, one completion per connection, flagged
- * IOR_CQE_F_MORE. Returns non-zero to decline the edge, which ends the op:
+ * An edge on a multishot accept's listener, on the poller thread (and once
+ * on the worker, before the op is handed over): accept until the backlog is
+ * empty, one completion per connection, flagged IOR_CQE_F_MORE. Returns
+ * non-zero to decline the edge, which ends the op:
  * on an error (EMFILE, say), kept as the last completion's result, and when
  * a connection finds the completion queue full, as io_uring ends a multishot
  * accept then; that descriptor is kept and becomes the last completion,
@@ -619,9 +620,10 @@ static int ior_threads_pool_accept_edge(ior_threads_pool *pool, ior_work *w)
 			return 0; // the backlog is empty: wait for the next edge
 		}
 		if (nfd == -ECONNABORTED) {
-			// A connection the peer reset while it was queued, which accept(2)
-			// reports on BSD and macOS (Linux hands the dead socket over):
-			// nobody's, and no fault of the listener's; on to the next one.
+			// A connection the peer reset while it was queued, where accept(2)
+			// reports that (FreeBSD documents it; Linux and macOS hand the
+			// dead socket over): nobody's, and no fault of the listener's;
+			// on to the next one.
 			continue;
 		}
 		if (nfd < 0) {
@@ -2074,6 +2076,25 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 			} else {
 				unready = !ior_threads_pool_fd_ready(w->sqe.threads.fd, events);
 			}
+		}
+		/*
+		 * A multishot accept first accepts what is queued already, here, as
+		 * a one-shot accept tries before it parks: so a descriptor accept(2)
+		 * refuses (not a socket, a socket not listening: -EINVAL) fails the
+		 * op at once instead of parking it on the poller for good, and the
+		 * backlog at submit is reported without a poller round trip. A
+		 * declined pass ends the op as a declined edge would, with what it
+		 * kept, unless a cancel claimed the op meanwhile.
+		 */
+		if (accept_multi && ior_threads_pool_accept_edge(pool, w)) {
+			int claimed = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0;
+			int32_t res = ior_threads_pool_accept_last(w, claimed ? -ECANCELED : 1);
+			count += ior_threads_pool_finish_guarded_res(pool, w, lt, res);
+			if (has_link) {
+				cancel = 1; // a failed linked op breaks the chain
+			}
+			w = after;
+			continue;
 		}
 		int gate = opcode == IOR_OP_POLL || accept_multi || (unready && !nowait);
 		if (gate) {
