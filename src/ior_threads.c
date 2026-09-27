@@ -156,33 +156,16 @@ static int ior_threads_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 	}
 
 	ior_ctx_threads *ctx = backend_ctx;
-	ior_threads_pool *pool = ctx->pool;
 
 	/*
-	 * The staging ring caps the unsubmitted batch: a full one is reported
-	 * first, as a submit is the cheaper remedy and this thread is the only
-	 * one that changes it. Then cap the ops in flight at the work-item pool
-	 * capacity so a submit always has a work item, and the completions
-	 * promised at the CQ size so every completion has a slot when it is
-	 * posted; the CQ slot is held until the completion is reaped. Only this
-	 * thread adds to outstanding, so a plain check will do; the poller thread
-	 * reserves CQ slots too, so that one is claimed atomically.
+	 * Only the staging ring caps what may be handed out, as io_uring's SQ
+	 * does: ops in flight are bounded by memory, and a completion that finds
+	 * the CQ full waits on the overflow list (see ior_threads_pool_post).
 	 */
-	if (ior_threads_ring_sq_space_left(&ctx->sq_ring) == 0) {
-		return -ENOSPC;
-	}
-	if (atomic_load(&pool->outstanding) >= pool->work_cap) {
-		return -EBUSY;
-	}
-	if (ior_threads_pool_cq_reserve(pool) < 0) {
-		return -EBUSY;
-	}
 	ior_sqe *sqe = ior_threads_ring_get_sqe(&ctx->sq_ring);
 	if (!sqe) {
-		ior_threads_pool_cq_release(pool, 1);
 		return -ENOSPC;
 	}
-	atomic_fetch_add(&pool->outstanding, 1);
 	*sqe_out = sqe;
 	return 0;
 }
@@ -206,8 +189,11 @@ static unsigned ior_threads_backend_cq_space_left(void *backend_ctx)
 {
 	ior_ctx_threads *ctx = backend_ctx;
 	uint32_t size = ctx->cq_ring.size;
-	uint32_t pending = atomic_load_explicit(&ctx->pool->cq_pending, memory_order_acquire);
-	return pending < size ? size - pending : 0;
+	uint32_t ready = ior_threads_ring_count(&ctx->cq_ring);
+	if (atomic_load_explicit(&ctx->pool->ovf_count, memory_order_acquire) || ready >= size) {
+		return 0;
+	}
+	return size - ready;
 }
 
 static int ior_threads_backend_submit(void *backend_ctx)
@@ -230,6 +216,24 @@ static int ior_threads_backend_submit(void *backend_ctx)
 	return (int) ior_threads_pool_notify(ctx->pool);
 }
 
+// Completions ready for the consumer: in the ring or on the overflow list.
+static uint32_t ior_threads_cq_ready(ior_ctx_threads *ctx)
+{
+	return ior_threads_ring_count(&ctx->cq_ring)
+			+ atomic_load_explicit(&ctx->pool->ovf_count, memory_order_acquire);
+}
+
+// The next completion, moving overflowed ones into the ring if it is empty.
+static ior_cqe *ior_threads_next_cqe(ior_ctx_threads *ctx)
+{
+	ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
+	if (!cqe) {
+		ior_threads_pool_flush_overflow(ctx->pool);
+		cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
+	}
+	return cqe;
+}
+
 /*
  * Wait for the completion event until at least `need` completions are in the
  * ring. A poster signals only while someone waits, once until the waiter it
@@ -244,7 +248,7 @@ static int ior_threads_wait_completions(ior_ctx_threads *ctx, uint32_t need, int
 {
 	atomic_fetch_add_explicit(&ctx->waiters, 1, memory_order_seq_cst);
 	int ret = 1;
-	if (ior_threads_ring_count(&ctx->cq_ring) < need) {
+	if (ior_threads_cq_ready(ctx) < need) {
 		ret = ior_threads_event_wait(&ctx->event, timeout_ms);
 		if (ret == 0) {
 			ior_threads_event_clear(&ctx->event);
@@ -279,7 +283,7 @@ static int ior_threads_backend_submit_and_wait(void *backend_ctx, unsigned wait_
 	}
 
 	// Wait for completions to become available
-	while (ior_threads_ring_count(&ctx->cq_ring) < wait_nr) {
+	while (ior_threads_cq_ready(ctx) < wait_nr) {
 		IOR_LOG_TRACE("event wait start");
 		int ret = ior_threads_wait_completions(ctx, wait_nr, -1);
 		IOR_LOG_TRACE("event wait done: ret=%d", ret);
@@ -299,7 +303,7 @@ static int ior_threads_backend_peek_cqe(void *backend_ctx, ior_cqe **cqe_out)
 
 	ior_ctx_threads *ctx = backend_ctx;
 
-	ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
+	ior_cqe *cqe = ior_threads_next_cqe(ctx);
 	if (!cqe) {
 		return -EAGAIN;
 	}
@@ -326,7 +330,7 @@ static int ior_threads_backend_wait_cqe(void *backend_ctx, ior_cqe **cqe_out)
 	 * signal drained on a previous iteration.
 	 */
 	for (;;) {
-		ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
+		ior_cqe *cqe = ior_threads_next_cqe(ctx);
 		if (cqe) {
 			*cqe_out = cqe;
 			return 0;
@@ -367,7 +371,7 @@ static int ior_threads_backend_wait_cqe_timeout(
 	 * once the deadline passes we report -ETIME (matching io_uring), not -EAGAIN.
 	 */
 	for (;;) {
-		ior_cqe *cqe = ior_threads_ring_peek_cqe(&ctx->cq_ring);
+		ior_cqe *cqe = ior_threads_next_cqe(ctx);
 		if (cqe) {
 			*cqe_out = cqe;
 			return 0;
@@ -405,8 +409,8 @@ static void ior_threads_backend_cqe_seen(void *backend_ctx, ior_cqe *cqe)
 
 	ior_ctx_threads *ctx = backend_ctx;
 	ior_threads_ring_cqe_seen(&ctx->cq_ring);
-	// The slot is free once the ring's head has moved past it.
-	ior_threads_pool_cq_release(ctx->pool, 1);
+	// Room for a completion that found the ring full.
+	ior_threads_pool_flush_overflow(ctx->pool);
 }
 
 static unsigned ior_threads_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqes, unsigned max)
@@ -416,6 +420,7 @@ static unsigned ior_threads_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **
 	}
 
 	ior_ctx_threads *ctx = backend_ctx;
+	ior_threads_pool_flush_overflow(ctx->pool);
 	return ior_threads_ring_peek_batch_cqe(&ctx->cq_ring, cqes, max);
 }
 
@@ -427,7 +432,7 @@ static void ior_threads_backend_cq_advance(void *backend_ctx, unsigned nr)
 
 	ior_ctx_threads *ctx = backend_ctx;
 	ior_threads_ring_advance(&ctx->cq_ring, nr);
-	ior_threads_pool_cq_release(ctx->pool, nr);
+	ior_threads_pool_flush_overflow(ctx->pool);
 }
 
 /* SQE preparation helpers */
@@ -645,7 +650,7 @@ static ior_fd_t ior_threads_backend_notify_fd(void *backend_ctx)
 	 * ior_notify_fd() promises: armed first and the ring looked at after it,
 	 * so a completion posted meanwhile is signalled by one side or both. */
 	if (!atomic_exchange_explicit(&ctx->notify_armed, 1, memory_order_seq_cst)
-			&& ior_threads_ring_count(&ctx->cq_ring) > 0) {
+			&& ior_threads_cq_ready(ctx) > 0) {
 		ior_threads_event_signal(&ctx->event);
 	}
 	return ior_threads_event_get_fd(&ctx->event);

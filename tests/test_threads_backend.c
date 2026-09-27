@@ -77,10 +77,9 @@ static int32_t reap_one(ior_ctx *ctx, void **tag, uint32_t *flags)
 }
 
 /*
- * The completion queue holds a slot for every submitted operation until its
- * completion is reaped: once it is full of unreaped completions, ior_get_sqe
- * returns NULL rather than letting a later completion find no room, and a
- * cancel submitted after reaping completes without waiting on the reaper.
+ * A completion queue full of unreaped completions refuses nothing: a cancel
+ * submitted then runs on the submitting thread, its completion waits on the
+ * overflow list without blocking it, and arrives after the ones before it.
  */
 static void test_cq_full_get_sqe(void **state)
 {
@@ -88,21 +87,17 @@ static void test_cq_full_get_sqe(void **state)
 	ior_ctx *ctx = init_threads(32, 32);
 
 	submit_nops(ctx, 32);
-	assert_null(ior_get_sqe(ctx));
-
-	// Nops complete on workers, in no particular order.
-	void *tag;
-	assert_int_equal(reap_one(ctx, &tag, NULL), 0);
-	assert_nop_tag(tag);
+	assert_int_equal(ior_submit_and_wait(ctx, 32), 0);
 
 	ior_sqe *sqe = ior_get_sqe(ctx);
 	assert_non_null(sqe);
 	ior_prep_cancel(ctx, sqe, (void *) (uintptr_t) 0xdead);
 	ior_sqe_set_data(ctx, sqe, CANCEL_TAG(0));
 	assert_int_equal(ior_submit(ctx), 1);
-	assert_null(ior_get_sqe(ctx));
 
-	for (int i = 1; i < 32; i++) {
+	// Nops complete on workers, in no particular order.
+	void *tag;
+	for (int i = 0; i < 32; i++) {
 		assert_int_equal(reap_one(ctx, &tag, NULL), 0);
 		assert_nop_tag(tag);
 	}
@@ -117,9 +112,9 @@ static void test_cq_full_get_sqe(void **state)
 
 /*
  * Teardown shape: more parked ops than half the completion queue, each
- * cancelled without reaping in between. A cancel is refused an SQE while the
- * queue is full and goes through once completions have been reaped; nothing
- * waits on the submitting thread.
+ * cancelled without reaping in between, so the cancels' and the ops'
+ * completions overflow the queue. Nothing is refused, nothing waits on the
+ * submitting thread, and every completion arrives.
  */
 static void test_cq_full_cancel_parked(void **state)
 {
@@ -142,35 +137,21 @@ static void test_cq_full_cancel_parked(void **state)
 	}
 	assert_true(ior_submit(ctx) > 0);
 
-	int cancels_done = 0, recvs_done = 0, refused = 0;
+	int cancels_done = 0, recvs_done = 0;
 	for (int i = 0; i < N; i++) {
 		ior_sqe *sqe = ior_get_sqe(ctx);
-		while (!sqe) {
-			assert_true(ior_submit(ctx) >= 0);
-			void *tag;
-			int32_t res = reap_one(ctx, &tag, NULL);
-			if ((uintptr_t) tag >= 0x2000) {
-				// -EALREADY: the recv was in its non-blocking attempt; it
-				// still ends -ECANCELED, the claim keeps it from parking.
-				assert_true(res == 0 || res == -EALREADY);
-				cancels_done++;
-			} else {
-				assert_int_equal(res, -ECANCELED);
-				recvs_done++;
-			}
-			refused++;
-			sqe = ior_get_sqe(ctx);
-		}
+		assert_non_null(sqe);
 		ior_prep_cancel(ctx, sqe, RECV_TAG(i));
 		ior_sqe_set_data(ctx, sqe, CANCEL_TAG(i));
 		assert_int_equal(ior_submit(ctx), 1);
 	}
-	assert_true(refused > 0);
 
 	while (cancels_done < N || recvs_done < N) {
 		void *tag;
 		int32_t res = reap_one(ctx, &tag, NULL);
 		if ((uintptr_t) tag >= 0x2000) {
+			// -EALREADY: the recv was in its non-blocking attempt; it still
+			// ends -ECANCELED, the claim keeps it from parking.
 			assert_true(res == 0 || res == -EALREADY);
 			cancels_done++;
 		} else {
@@ -185,9 +166,10 @@ static void test_cq_full_cancel_parked(void **state)
 }
 
 /*
- * A multishot poll whose edge finds no free completion slot ends with that
- * edge as its last completion (no IOR_CQE_F_MORE), in the slot the op holds,
- * and reports nothing afterwards; the slots are all free once reaped.
+ * A multishot poll whose edge finds the completion queue full ends with that
+ * edge as its last completion (no IOR_CQE_F_MORE), carried on the overflow
+ * list, and reports nothing afterwards, as io_uring ends a multishot on a
+ * full queue; the queue is all free once reaped.
  */
 static void test_cq_full_multishot_ends(void **state)
 {
@@ -202,18 +184,18 @@ static void test_cq_full_multishot_ends(void **state)
 	ior_sqe_set_data(ctx, sqe, POLL_TAG);
 	assert_int_equal(ior_submit(ctx), 1);
 
-	submit_nops(ctx, 31);
-	assert_null(ior_get_sqe(ctx));
+	submit_nops(ctx, 32);
+	assert_int_equal(ior_submit_and_wait(ctx, 32), 0);
 
 	assert_int_equal(send(sock[0], "x", 1, 0), 1);
 
-	// The edge is reported while every slot is still taken: wait for its
-	// completion to land before reaping anything.
-	assert_int_equal(ior_submit_and_wait(ctx, 32), 0);
+	// The edge is reported while the queue is full: wait for its completion
+	// to land before reaping anything.
+	assert_int_equal(ior_submit_and_wait(ctx, 33), 0);
 	void *tag;
 	uint32_t flags;
 	int got_poll = 0;
-	for (int i = 0; i < 32; i++) {
+	for (int i = 0; i < 33; i++) {
 		int32_t res = reap_one(ctx, &tag, &flags);
 		if (tag == POLL_TAG) {
 			assert_true(res & IOR_POLL_IN);

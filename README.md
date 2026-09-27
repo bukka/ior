@@ -221,8 +221,8 @@ int ior_queue_forget(ior_ctx *ctx);
 // Get a submission queue entry (NULL if none is available)
 ior_sqe *ior_get_sqe(ior_ctx *ctx);
 
-// The same, telling a full submission queue (-ENOSPC: submit) from a full
-// completion queue (-EBUSY: reap)
+// The same, with the reason for a refusal: a full submission queue
+// (-ENOSPC: submit), or no memory for the entry (-ENOMEM, IOCP)
 int ior_get_sqe_ex(ior_ctx *ctx, ior_sqe **sqe_out);
 
 // Submit all pending operations, with io_uring semantics on every backend:
@@ -418,19 +418,16 @@ and IOCP backends raise the submission queue to at least 32, the thread
 backend the completion queue too) and defaults the completion queue to twice
 the submission queue. Init writes the sizes used back to `ior_params`, so
 reset `sq_entries` and `cq_entries` before reusing the same `ior_params` for
-another context, or the first one's sizes carry over. `ior_get_sqe()` refuses an entry for one of two reasons,
-which `ior_get_sqe_ex()` tells apart: the submission queue holds
-`ior_sq_entries()` entries not yet submitted (`-ENOSPC`, so submit), or no
-completion queue slot is free for the operation's completion (`-EBUSY`, so
-reap). When a slot counts as taken differs per backend: on io_uring only a
-completion posted and not yet reaped takes one, the kernel buffering any
-overflow; the thread and IOCP backends never post into a full queue, so a
-slot is taken by `ior_get_sqe()` itself and held until the completion is
-reaped, plus one per multishot poll edge, which makes `ior_cq_entries()` the
-bound on operations in flight there (a completion queue set smaller than the
-submission queue limits even a single batch). A caller that counts operations in
-flight plus completions unreaped against `ior_cq_entries()` has the same
-bound on every backend.
+another context, or the first one's sizes carry over.
+
+As on io_uring, `ior_get_sqe()` refuses an entry only while the submission
+queue holds `ior_sq_entries()` entries not yet submitted (`-ENOSPC`, so
+submit). Nothing bounds the operations in flight but memory, and the
+completion queue bounds nothing either: a completion that finds it full
+waits outside it, in the order completions were posted, until reaping makes
+room (io_uring's kernel keeps it, `IORING_FEAT_NODROP`; the thread backend an
+overflow list; IOCP its completion port). A multishot poll edge that finds
+the queue full ends the poll on io_uring and the thread backend.
 
 ## API Design
 
