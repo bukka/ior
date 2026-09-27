@@ -470,7 +470,9 @@ static void test_waitpid_any(void **state)
 /*
  * A cancelled wait for any child takes nothing: it holds no worker, so the
  * cancel claims it (0), and the child it would have reaped is left to be
- * collected.
+ * collected. Where the wait is probed from a timer, a cancel that lands
+ * while a probe's waitpid(WNOHANG) runs finds it running (-EALREADY), as on
+ * io_uring; the probe then sees the cancel and ends it the same way.
  */
 static void test_waitpid_any_cancel(void **state)
 {
@@ -490,7 +492,8 @@ static void test_waitpid_any_cancel(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 
 	reap_tags(s->ctx, 2, res, 3);
-	assert_int_equal(res[(uintptr_t) TAG_CANCEL], 0);
+	int32_t cancel_res = res[(uintptr_t) TAG_CANCEL];
+	assert_true(cancel_res == 0 || cancel_res == -EALREADY);
 	assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECANCELED);
 	assert_int_equal(status, -1);
 
