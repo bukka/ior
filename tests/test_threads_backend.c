@@ -558,6 +558,41 @@ static void test_link_timeout_recv_queued(void **state)
 	test_close_fd(sock[1]);
 }
 
+/*
+ * A timeout's deadline runs from submit, as on io_uring, not from when a
+ * worker gets to it: one still waiting for a worker when it is due expires
+ * as soon as a worker takes it.
+ */
+static void test_timeout_counts_from_submit(void **state)
+{
+	(void) state;
+	ior_ctx *ctx = init_threads(64, 128);
+	for (int i = 0; i < BUSY_WORKERS; i++) {
+		ior_sqe *sqe = ior_get_sqe(ctx);
+		assert_non_null(sqe);
+		assert_return_code(ior_prep_work(ctx, sqe, hold_worker_fn, NULL), 0);
+		ior_sqe_set_data(ctx, sqe, (void *) 0x9);
+	}
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 200000000 }; // due before a worker is free
+	ior_prep_timeout(ctx, sqe, &ts, 0, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x1);
+	uint64_t start = test_monotonic_now_ns();
+	assert_int_equal(ior_submit(ctx), BUSY_WORKERS + 1);
+
+	for (int got = 0; got < BUSY_WORKERS + 1; got++) {
+		void *tag;
+		int32_t res = reap_one(ctx, &tag, NULL);
+		if (tag == (void *) 0x1) {
+			assert_int_equal(res, -ETIME);
+			// About 300 ms: when a worker is free, not 200 ms after that.
+			assert_true(test_monotonic_now_ns() - start < 450000000ULL);
+		}
+	}
+	ior_queue_exit(ctx);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -569,6 +604,7 @@ int main(void)
 		cmocka_unit_test(test_link_timeout_file_read),
 		cmocka_unit_test(test_link_timeout_file_read_queued),
 		cmocka_unit_test(test_link_timeout_recv_queued),
+		cmocka_unit_test(test_timeout_counts_from_submit),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);
