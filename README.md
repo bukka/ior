@@ -18,7 +18,12 @@ The goal is to provide maximum performance on platforms with native async I/O su
 - Socket send and receive operations
 - Socket accept and connect operations (`ior_prep_accept`,
   `ior_prep_connect`), readiness-driven on the thread pool and through
-  AcceptEx/ConnectEx on Windows
+  AcceptEx/ConnectEx on Windows; a multishot accept
+  (`ior_prep_accept_multishot`) posts one completion per connection, flagged
+  `IOR_CQE_F_MORE`, until cancelled - `IORING_ACCEPT_MULTISHOT` on io_uring,
+  an edge-triggered watch of the listener on the thread pool's poller, which
+  accepts until `EAGAIN` at every edge, a few AcceptEx kept outstanding on
+  Windows
 - Timer/timeout operations, relative or absolute on the monotonic, boot-time
   or wall clock (`IOR_TIMEOUT_ABS`, `IOR_TIMEOUT_BOOTTIME`,
   `IOR_TIMEOUT_REALTIME`); the timespec is copied at submit on every backend
@@ -284,6 +289,11 @@ void ior_prep_recv(ior_ctx *ctx, ior_sqe *sqe, int sockfd, void *buf,
 void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, int fd, struct sockaddr *addr,
                      socklen_t *addrlen, unsigned flags);
 
+// Accept connections until cancelled: one completion per accepted socket
+// with IOR_CQE_F_MORE in its flags, the last one (a cancel's -ECANCELED, an
+// error) without it. No peer address.
+void ior_prep_accept_multishot(ior_ctx *ctx, ior_sqe *sqe, int fd, unsigned flags);
+
 // Connect a socket: completes with 0 or a negative errno.
 void ior_prep_connect(ior_ctx *ctx, ior_sqe *sqe, int fd,
                       const struct sockaddr *addr, socklen_t addrlen);
@@ -426,8 +436,9 @@ submit). Nothing bounds the operations in flight but memory, and the
 completion queue bounds nothing either: a completion that finds it full
 waits outside it, in the order completions were posted, until reaping makes
 room (io_uring's kernel keeps it, `IORING_FEAT_NODROP`; the thread backend an
-overflow list; IOCP its completion port). A multishot poll edge that finds
-the queue full ends the poll on io_uring and the thread backend.
+overflow list; IOCP its completion port). A multishot poll edge, or a
+multishot accept's connection, that finds the queue full ends the operation
+on io_uring and the thread backend, the connection being its last completion.
 
 ## API Design
 

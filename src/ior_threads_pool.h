@@ -131,6 +131,14 @@ typedef struct ior_work {
 	int rw_plain; // positionless read/write: IOR_RW_* form the syscall takes
 	int connecting; // connect op: started, the next pass reads SO_ERROR
 	int pidfd; // waitpid op: the pidfd parked on the poller, -1 if none
+	/*
+	 * Multishot accept (see ior_threads_pool_accept_edge): the listener's
+	 * mode could not be taken over, so readiness is probed before each
+	 * accept; and what a declined edge left for the last completion, an
+	 * accepted descriptor (>= 0) or an error, IOR_ACCEPT_LAST_NONE if nothing.
+	 */
+	int accept_probe;
+	int32_t accept_last;
 	struct ior_work_token *cur_token; // token the running callback observes
 	uint64_t deadline_ns; // link-timeout deadline once computed (0 = none)
 	struct ior_threads_pool_lt_arb
@@ -239,6 +247,8 @@ struct ior_threads_pool {
 	pthread_mutex_t drain_lock;
 	pthread_cond_t drain_cond;
 };
+
+#define IOR_ACCEPT_LAST_NONE INT32_MIN
 
 // Thread pool configuration
 typedef struct ior_threads_pool_config {

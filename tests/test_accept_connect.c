@@ -6,7 +6,10 @@
  * through ior; the accepted socket must be usable for send/recv (on IOCP
  * that proves the accept context was updated), the peer address must be
  * filled in, a refused connect must fail with -ECONNREFUSED, and a pending
- * accept must be cancellable and bounded by a link timeout.
+ * accept must be cancellable and bounded by a link timeout. A multishot
+ * accept must post one IOR_CQE_F_MORE completion per connection, queued or
+ * arriving, apply its flags to each, end without the flag on a cancel, a
+ * link timeout or a full completion queue, and lose no connection.
  */
 #include "test_utils.h"
 #ifndef _WIN32
@@ -20,6 +23,7 @@
 #define TAG_SEND ((void *) 0x5)
 #define TAG_RECV ((void *) 0x6)
 #define TAG_ACCEPT2 ((void *) 0x7)
+#define TAG_MACCEPT ((void *) 0x8)
 
 typedef struct ac_state {
 	ior_ctx *ctx;
@@ -359,6 +363,419 @@ static void test_accept_flags(void **state)
 }
 #endif
 
+/* ================= Multishot accept ================= */
+
+typedef struct cqe_rec {
+	void *tag;
+	int32_t res;
+	uint32_t flags;
+} cqe_rec;
+
+// Reap one completion into *r within timeout_ms, or return -ETIME.
+static int reap_one(ior_ctx *ctx, cqe_rec *r, int timeout_ms)
+{
+	for (;;) {
+		ior_cqe *cqe = NULL;
+		ior_timespec to = { .tv_sec = timeout_ms / 1000, .tv_nsec = (timeout_ms % 1000) * 1000000L };
+		int ret = ior_wait_cqe_timeout(ctx, &cqe, &to);
+		if (ret == -EAGAIN || ret == -EINTR) {
+			continue;
+		}
+		if (ret == -ETIME) {
+			return -ETIME;
+		}
+		assert_return_code(ret, 0);
+		r->tag = ior_cqe_get_data(ctx, cqe);
+		r->res = ior_cqe_get_res(ctx, cqe);
+		r->flags = ior_cqe_get_flags(ctx, cqe);
+		ior_cqe_seen(ctx, cqe);
+		return 0;
+	}
+}
+
+// A connection of the multishot accept: an edge completion with a socket.
+static ior_fd_t reap_maccept(ior_ctx *ctx)
+{
+	cqe_rec r;
+	if (reap_one(ctx, &r, 3000) != 0) {
+		fail_msg("no connection reported");
+	}
+	assert_ptr_equal(r.tag, TAG_MACCEPT);
+	assert_true(r.flags & IOR_CQE_F_MORE);
+	return accepted_fd(r.res);
+}
+
+// The multishot accept's last completion, with res, and nothing else pending.
+static void reap_maccept_end(ior_ctx *ctx, int32_t res)
+{
+	cqe_rec r;
+	if (reap_one(ctx, &r, 3000) != 0) {
+		fail_msg("no last completion");
+	}
+	assert_ptr_equal(r.tag, TAG_MACCEPT);
+	assert_false(r.flags & IOR_CQE_F_MORE);
+	assert_int_equal(r.res, res);
+}
+
+static void assert_silent(ior_ctx *ctx, int timeout_ms)
+{
+	cqe_rec r;
+	assert_int_equal(reap_one(ctx, &r, timeout_ms), -ETIME);
+}
+
+static void submit_maccept(ac_state *s, unsigned flags, uint8_t sqe_flags)
+{
+	ior_sqe *a = ior_get_sqe(s->ctx);
+	assert_non_null(a);
+	ior_prep_accept_multishot(s->ctx, a, s->listener, flags);
+	ior_sqe_set_data(s->ctx, a, TAG_MACCEPT);
+	if (sqe_flags) {
+		ior_sqe_set_flags(s->ctx, a, sqe_flags);
+	}
+	assert_true(ior_submit(s->ctx) >= 0);
+}
+
+// A fresh client connected to the listener (blocking; loopback is at once).
+static ior_fd_t connect_client(ac_state *s)
+{
+	ior_fd_t c;
+	assert_return_code(test_make_tcp_socket(&c), 0);
+#ifdef _WIN32
+	assert_int_equal(connect((SOCKET) c, (const struct sockaddr *) &s->addr, (int) s->addrlen), 0);
+#else
+	assert_int_equal(connect(c, (const struct sockaddr *) &s->addr, s->addrlen), 0);
+#endif
+	return c;
+}
+
+static void cancel_maccept(ac_state *s, int by_fd)
+{
+	ior_sqe *c = ior_get_sqe(s->ctx);
+	assert_non_null(c);
+	if (by_fd) {
+		ior_prep_cancel_fd(s->ctx, c, s->listener);
+	} else {
+		ior_prep_cancel(s->ctx, c, TAG_MACCEPT);
+	}
+	ior_sqe_set_data(s->ctx, c, TAG_CANCEL);
+	assert_true(ior_submit(s->ctx) >= 0);
+}
+
+// A cancel's own completion and the accept's last, in whichever order.
+static void reap_cancelled(ior_ctx *ctx, int32_t cancel_res)
+{
+	int got_cancel = 0, got_end = 0;
+	while (!got_cancel || !got_end) {
+		cqe_rec r;
+		if (reap_one(ctx, &r, 3000) != 0) {
+			fail_msg("cancel or last completion missing");
+		}
+		if (r.tag == TAG_CANCEL) {
+			assert_int_equal(r.res, cancel_res);
+			got_cancel = 1;
+		} else {
+			assert_ptr_equal(r.tag, TAG_MACCEPT);
+			assert_false(r.flags & IOR_CQE_F_MORE);
+			assert_int_equal(r.res, -ECANCELED);
+			got_end = 1;
+		}
+	}
+}
+
+/*
+ * Connections arriving one by one: each is one edge completion, the
+ * accepted socket works for I/O both ways, and a cancel ends the operation
+ * with -ECANCELED and no IOR_CQE_F_MORE. The listener comes back blocking.
+ */
+static void test_accept_multishot_stream(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	int32_t res[MAX_TAG];
+
+	submit_maccept(s, 0, 0);
+	assert_silent(s->ctx, 20);
+
+	ior_fd_t clients[3];
+	ior_fd_t accepted[3];
+	for (int i = 0; i < 3; i++) {
+		clients[i] = connect_client(s);
+		accepted[i] = reap_maccept(s->ctx);
+	}
+	assert_silent(s->ctx, 20);
+
+	const char *msg = "over multishot";
+	unsigned len = (unsigned) strlen(msg);
+	char buf[32];
+	for (int dir = 0; dir < 2; dir++) {
+		ior_fd_t from = dir ? accepted[2] : clients[2];
+		ior_fd_t to = dir ? clients[2] : accepted[2];
+		memset(buf, 0, sizeof(buf));
+		ior_sqe *snd = ior_get_sqe(s->ctx);
+		assert_non_null(snd);
+		ior_prep_send(s->ctx, snd, from, msg, len, 0);
+		ior_sqe_set_data(s->ctx, snd, TAG_SEND);
+		ior_sqe *rcv = ior_get_sqe(s->ctx);
+		assert_non_null(rcv);
+		ior_prep_recv(s->ctx, rcv, to, buf, sizeof(buf), 0);
+		ior_sqe_set_data(s->ctx, rcv, TAG_RECV);
+		assert_true(ior_submit(s->ctx) >= 0);
+		reap_tags(s->ctx, 2, res);
+		assert_int_equal(res[(uintptr_t) TAG_SEND], (int32_t) len);
+		assert_int_equal(res[(uintptr_t) TAG_RECV], (int32_t) len);
+		assert_memory_equal(buf, msg, len);
+	}
+
+	cancel_maccept(s, 0);
+	reap_cancelled(s->ctx, 0);
+#ifndef _WIN32
+	// Restored by the thread backend, never touched elsewhere.
+	assert_false(fcntl(s->listener, F_GETFL, 0) & O_NONBLOCK);
+#endif
+	for (int i = 0; i < 3; i++) {
+		test_close_fd(accepted[i]);
+		test_close_fd(clients[i]);
+	}
+}
+
+/*
+ * Connections queued before the submit are all reported (one edge, several
+ * accepts on the thread backend), a later one too, and cancel by descriptor
+ * ends it.
+ */
+static void test_accept_multishot_backlog(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	ior_fd_t clients[6];
+	ior_fd_t accepted[6];
+
+	for (int i = 0; i < 5; i++) {
+		clients[i] = connect_client(s);
+	}
+	submit_maccept(s, 0, 0);
+	for (int i = 0; i < 5; i++) {
+		accepted[i] = reap_maccept(s->ctx);
+	}
+	assert_silent(s->ctx, 50);
+
+	clients[5] = connect_client(s);
+	accepted[5] = reap_maccept(s->ctx);
+
+	cancel_maccept(s, 1);
+	reap_cancelled(s->ctx, 0);
+	for (int i = 0; i < 6; i++) {
+		test_close_fd(accepted[i]);
+		test_close_fd(clients[i]);
+	}
+}
+
+#ifndef _WIN32
+// Every accepted socket gets exactly the flags asked for.
+static void test_accept_multishot_flags(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+
+	submit_maccept(s, IOR_ACCEPT_NONBLOCK | IOR_ACCEPT_CLOEXEC, 0);
+	for (int i = 0; i < 2; i++) {
+		ior_fd_t c = connect_client(s);
+		ior_fd_t a = reap_maccept(s->ctx);
+		assert_true(fcntl(a, F_GETFL, 0) & O_NONBLOCK);
+		assert_true(fcntl(a, F_GETFD, 0) & FD_CLOEXEC);
+		test_close_fd(a);
+		test_close_fd(c);
+	}
+	cancel_maccept(s, 0);
+	reap_cancelled(s->ctx, 0);
+
+	// And none: blocking, whatever the listener's mode is meanwhile.
+	submit_maccept(s, 0, 0);
+	ior_fd_t c = connect_client(s);
+	ior_fd_t a = reap_maccept(s->ctx);
+	assert_false(fcntl(a, F_GETFL, 0) & O_NONBLOCK);
+	assert_false(fcntl(a, F_GETFD, 0) & FD_CLOEXEC);
+	test_close_fd(a);
+	test_close_fd(c);
+	cancel_maccept(s, 0);
+	reap_cancelled(s->ctx, 0);
+}
+#endif
+
+/*
+ * A link timeout bounds the whole operation: a connection before the
+ * deadline is reported, then the accept ends -ECANCELED and the timeout
+ * -ETIME.
+ */
+static void test_accept_multishot_link_timeout(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+
+	ior_fd_t c = connect_client(s);
+	ior_sqe *a = ior_get_sqe(s->ctx);
+	assert_non_null(a);
+	ior_prep_accept_multishot(s->ctx, a, s->listener, 0);
+	ior_sqe_set_data(s->ctx, a, TAG_MACCEPT);
+	ior_sqe_set_flags(s->ctx, a, IOR_SQE_IO_LINK);
+	ior_sqe *t = ior_get_sqe(s->ctx);
+	assert_non_null(t);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+	ior_prep_link_timeout(s->ctx, t, &ts, 0);
+	ior_sqe_set_data(s->ctx, t, TAG_TMO);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	ior_fd_t accepted = reap_maccept(s->ctx);
+	int got_end = 0, got_tmo = 0;
+	while (!got_end || !got_tmo) {
+		cqe_rec r;
+		if (reap_one(s->ctx, &r, 3000) != 0) {
+			fail_msg("timeout or last completion missing");
+		}
+		if (r.tag == TAG_TMO) {
+			assert_int_equal(r.res, -ETIME);
+			got_tmo = 1;
+		} else {
+			assert_ptr_equal(r.tag, TAG_MACCEPT);
+			assert_false(r.flags & IOR_CQE_F_MORE);
+			assert_int_equal(r.res, -ECANCELED);
+			got_end = 1;
+		}
+	}
+	test_close_fd(accepted);
+	test_close_fd(c);
+}
+
+/*
+ * A cancel right behind the submit, with connections queued: whatever the
+ * accept reported before its -ECANCELED is the caller's, and the rest is
+ * still in the backlog for a one-shot accept. No connection is lost.
+ */
+static void test_accept_multishot_cancel_keeps_connections(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	int32_t res[MAX_TAG];
+	enum { N = 3 };
+	ior_fd_t clients[N];
+	ior_fd_t accepted[N];
+
+	for (int i = 0; i < N; i++) {
+		clients[i] = connect_client(s);
+	}
+	submit_maccept(s, 0, 0);
+	cancel_maccept(s, 0);
+
+	int n = 0;
+	int got_cancel = 0, got_end = 0;
+	while (!got_cancel || !got_end) {
+		cqe_rec r;
+		if (reap_one(s->ctx, &r, 3000) != 0) {
+			fail_msg("cancel or last completion missing");
+		}
+		if (r.tag == TAG_CANCEL) {
+			// -ENOENT only if the accept ended first, which it cannot here.
+			assert_true(r.res == 0 || r.res == -EALREADY);
+			got_cancel = 1;
+		} else {
+			assert_ptr_equal(r.tag, TAG_MACCEPT);
+			if (r.flags & IOR_CQE_F_MORE) {
+				assert_false(got_end);
+				assert_true(n < N);
+				accepted[n++] = accepted_fd(r.res);
+			} else {
+				assert_int_equal(r.res, -ECANCELED);
+				got_end = 1;
+			}
+		}
+	}
+	assert_silent(s->ctx, 20);
+
+	for (; n < N; n++) {
+		submit_accept(s, NULL, NULL, 0);
+		assert_true(ior_submit(s->ctx) >= 0);
+		reap_tags(s->ctx, 1, res);
+		accepted[n] = accepted_fd(res[(uintptr_t) TAG_ACCEPT]);
+	}
+	for (int i = 0; i < N; i++) {
+		test_close_fd(accepted[i]);
+		test_close_fd(clients[i]);
+	}
+}
+
+// Torn down with a multishot accept armed: exit must not hang.
+static void test_accept_multishot_pending_at_exit(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+
+	submit_maccept(s, 0, 0);
+	assert_silent(s->ctx, 20);
+
+	uint64_t start = test_monotonic_now_ns();
+	ior_queue_exit(s->ctx);
+	s->ctx = NULL;
+	assert_true(test_monotonic_now_ns() - start < 2000000000ULL);
+	assert_return_code(ior_queue_init(32, &s->ctx), 0);
+}
+
+/*
+ * A connection that finds the completion queue full ends the operation on
+ * io_uring and the thread backend: it is the last completion, with the
+ * socket and no IOR_CQE_F_MORE, and what is still queued waits for the next
+ * accept. Where exactly it ends is the kernel's on io_uring: one that caches
+ * completions before posting them (6.8) notices the full queue one
+ * connection later than the thread backend, which ends at cq + 1. IOCP
+ * keeps a few accepts out and has no such end.
+ */
+static void test_accept_multishot_cq_full(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	int32_t res[MAX_TAG];
+
+	if (ior_get_backend_type(s->ctx) == IOR_BACKEND_IOCP) {
+		skip();
+	}
+	unsigned cq = ior_cq_entries(s->ctx);
+	assert_true(cq >= 8 && cq <= 512);
+	unsigned n = cq + 4;
+	ior_fd_t *clients = calloc(n, sizeof(*clients));
+	ior_fd_t *accepted = calloc(n, sizeof(*accepted));
+	assert_non_null(clients);
+	assert_non_null(accepted);
+
+	submit_maccept(s, 0, 0);
+	for (unsigned i = 0; i < n; i++) {
+		clients[i] = connect_client(s);
+	}
+
+	// cq edges fill the queue; the next connection ends the operation.
+	unsigned got = 0;
+	for (;;) {
+		cqe_rec r;
+		if (reap_one(s->ctx, &r, 3000) != 0) {
+			fail_msg("last completion missing after %u connections", got);
+		}
+		assert_ptr_equal(r.tag, TAG_MACCEPT);
+		assert_true(got < n);
+		accepted[got++] = accepted_fd(r.res);
+		if (!(r.flags & IOR_CQE_F_MORE)) {
+			break;
+		}
+	}
+	assert_true(got >= cq + 1 && got <= cq + 3);
+	assert_silent(s->ctx, 20);
+
+	// The remaining connections are still there for one-shot accepts.
+	while (got < n) {
+		submit_accept(s, NULL, NULL, 0);
+		assert_true(ior_submit(s->ctx) >= 0);
+		reap_tags(s->ctx, 1, res);
+		accepted[got++] = accepted_fd(res[(uintptr_t) TAG_ACCEPT]);
+	}
+
+	for (unsigned i = 0; i < n; i++) {
+		test_close_fd(accepted[i]);
+		test_close_fd(clients[i]);
+	}
+	free(clients);
+	free(accepted);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -372,6 +789,17 @@ int main(void)
 #ifndef _WIN32
 		cmocka_unit_test_setup_teardown(test_accept_flags, setup_ac, teardown_ac),
 #endif
+		cmocka_unit_test_setup_teardown(test_accept_multishot_stream, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(test_accept_multishot_backlog, setup_ac, teardown_ac),
+#ifndef _WIN32
+		cmocka_unit_test_setup_teardown(test_accept_multishot_flags, setup_ac, teardown_ac),
+#endif
+		cmocka_unit_test_setup_teardown(test_accept_multishot_link_timeout, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(
+				test_accept_multishot_cancel_keeps_connections, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(
+				test_accept_multishot_pending_at_exit, setup_ac, teardown_ac),
+		cmocka_unit_test_setup_teardown(test_accept_multishot_cq_full, setup_ac, teardown_ac),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 }

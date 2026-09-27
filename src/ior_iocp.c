@@ -84,6 +84,7 @@ enum {
 	IOCP_OP_WORK, /* work object queued on the threadpool, callback not started */
 	IOCP_OP_WORK_RUNNING, /* callback executing */
 	IOCP_OP_POLL, /* registered with the poller */
+	IOCP_OP_ACCEPT_MULTI, /* multishot accept parent: its AcceptEx children are in flight */
 	IOCP_OP_WAIT, /* threadpool wait registered on a process handle */
 	IOCP_OP_SIGWAIT, /* listed for the console control handler */
 	IOCP_OP_DONE,
@@ -120,7 +121,8 @@ typedef struct ior_iocp_op {
 	// the op is held out of the poll set (poll_held, poller thread only)
 	// until the consumer marks that shadow's CQE seen, which sets
 	// poll_rearm. The shadow names its parent, with the parent's gen as it
-	// was, so a parent recycled meanwhile is left alone.
+	// was, so a parent recycled meanwhile is left alone. A multishot
+	// accept's children (below) name their parent the same way.
 	uint32_t poll_mask;
 	bool poll_multi;
 	bool cqe_more;
@@ -219,6 +221,20 @@ typedef struct ior_iocp_op {
 	socklen_t sa_len_val;
 	DWORD accept_recvd;
 	char accept_buf[2 * (sizeof(SOCKADDR_STORAGE) + 16)];
+
+	// IOR_OP_ACCEPT, multishot (accept_multi, see issue_accept_multi): the
+	// parent keeps a few AcceptEx requests outstanding, each a child op with
+	// the parent's user data, cqe_more set and poll_parent naming it. The
+	// parent's children are listed through accept_sibling, under
+	// timers.lock, since the timer thread cancels them when the parent's
+	// link timeout fires. accept_ending marks a parent on its way out
+	// (cancelled, timed out, a child failed): no child is replaced, and the
+	// last to complete posts the parent, with the error in error_code.
+	bool accept_multi;
+	bool accept_ending;
+	struct ior_iocp_op *accept_children;
+	struct ior_iocp_op *accept_sibling;
+	uint32_t accept_nchildren;
 
 	_Atomic int state; // IOCP_OP_*
 
@@ -784,6 +800,11 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->sa_len = NULL;
 	op->sa_len_val = 0;
 	op->accept_recvd = 0;
+	op->accept_multi = false;
+	op->accept_ending = false;
+	op->accept_children = NULL;
+	op->accept_sibling = NULL;
+	op->accept_nchildren = 0;
 	atomic_store(&op->state, IOCP_OP_FREE);
 
 	return op;
@@ -1652,6 +1673,164 @@ static void finish_socket_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 }
 
 /*
+ * ================= Multishot accept =================
+ *
+ * AcceptEx is one-shot, so a multishot accept (the parent op) keeps
+ * IOCP_ACCEPT_MULTI_DEPTH AcceptEx requests outstanding, each a child op on
+ * the live list (teardown finds its request there, and a collateral abort
+ * is re-issued as for any accept) but never a cancel's match: it names its
+ * parent. A child that accepted a connection is the caller's completion,
+ * with IOR_CQE_F_MORE, and is replaced by a new one; the parent itself
+ * completes only once it is on its way out and its last child is in, so a
+ * connection accepted before the parent's completion always precedes it.
+ */
+#define IOCP_ACCEPT_MULTI_DEPTH 4
+
+// Under timers.lock.
+static void accept_multi_link_locked(ior_iocp_op *parent, ior_iocp_op *child)
+{
+	child->accept_sibling = parent->accept_children;
+	parent->accept_children = child;
+	parent->accept_nchildren++;
+}
+
+// Under timers.lock.
+static void accept_multi_unlink_locked(ior_iocp_op *parent, ior_iocp_op *child)
+{
+	for (ior_iocp_op **pp = &parent->accept_children; *pp; pp = &(*pp)->accept_sibling) {
+		if (*pp == child) {
+			*pp = child->accept_sibling;
+			child->accept_sibling = NULL;
+			parent->accept_nchildren--;
+			return;
+		}
+	}
+}
+
+/*
+ * Put one more AcceptEx out for a parent. Returns 0 once the child's request
+ * is in flight, or its failure is on its way through the port (a synthetic
+ * completion, which then takes the parent out), -ENOMEM with no op to be had.
+ */
+static int accept_multi_spawn(ior_ctx_iocp *ctx, ior_iocp_op *parent)
+{
+	ior_iocp_op *child = alloc_op(ctx);
+	if (!child) {
+		return -ENOMEM;
+	}
+	child->opcode = IOR_OP_ACCEPT;
+	child->fd = parent->fd;
+	child->user_data = parent->user_data;
+	child->accept_flags = parent->accept_flags;
+	child->cqe_more = true;
+	child->poll_parent = parent;
+	child->poll_parent_gen = parent->gen;
+
+	EnterCriticalSection(&ctx->timers.lock);
+	accept_multi_link_locked(parent, child);
+	LeaveCriticalSection(&ctx->timers.lock);
+	live_add(ctx, child);
+	return issue_accept(ctx, child);
+}
+
+/*
+ * Take a parent out (timers.lock held): no child is replaced from now on,
+ * the outstanding ones are cancelled, and the last of them to come in posts
+ * the parent with error (see accept_multi_child_done). Nothing to do for a
+ * parent already on its way out, which keeps what took it out. Every child
+ * is marked before the first CancelIoEx, since AFD aborts them all with the
+ * first one and a marked child's abort is reported rather than re-issued.
+ */
+static void accept_multi_end_locked(ior_ctx_iocp *ctx, ior_iocp_op *parent, DWORD error)
+{
+	if (atomic_load(&parent->state) != IOCP_OP_ACCEPT_MULTI || parent->accept_ending) {
+		return;
+	}
+	parent->accept_ending = true;
+	parent->error_code = error;
+	for (ior_iocp_op *c = parent->accept_children; c; c = c->accept_sibling) {
+		int expected = IOCP_OP_IO;
+		atomic_compare_exchange_strong(&c->state, &expected, IOCP_OP_IO_CANCEL);
+	}
+	for (ior_iocp_op *c = parent->accept_children; c; c = c->accept_sibling) {
+		if (atomic_load(&c->state) == IOCP_OP_IO_CANCEL) {
+			cancel_overlapped_io(ctx, c);
+		}
+	}
+}
+
+/*
+ * Start a multishot accept: the parent holds an active_count slot for its
+ * own completion, posted by the consumer with post_armed_op, and puts its
+ * children out. Without memory for a single child it completes at once.
+ */
+static int issue_accept_multi(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	atomic_fetch_add(&ctx->active_count, 1);
+	atomic_store(&op->state, IOCP_OP_ACCEPT_MULTI);
+	for (int i = 0; i < IOCP_ACCEPT_MULTI_DEPTH; i++) {
+		if (accept_multi_spawn(ctx, op) < 0) {
+			break;
+		}
+	}
+	if (op->accept_nchildren == 0) {
+		post_armed_op(ctx, op, ERROR_NOT_ENOUGH_MEMORY);
+	}
+	return 0;
+}
+
+/*
+ * A child has been dequeued (its slot given back, finish_socket_op run).
+ * Returns true if its CQE is the caller's: a connection it accepted while
+ * its parent is in flight, even one on its way out (the connection is real,
+ * and the parent's completion is still behind it). A failure takes the
+ * parent out, the first one's error being the parent's result (-ECANCELED
+ * for its own cancellation); a parent without memory for a replacement
+ * ends the same way once no child is left. A child of a parent the
+ * teardown completed is nobody's, and its socket goes with it (free_op).
+ */
+static bool accept_multi_child_done(ior_ctx_iocp *ctx, ior_iocp_op *child)
+{
+	ior_iocp_op *parent = child->poll_parent;
+	timer_mgr *tm = &ctx->timers;
+
+	EnterCriticalSection(&tm->lock);
+	bool alive = parent->gen == child->poll_parent_gen
+			&& atomic_load(&parent->state) == IOCP_OP_ACCEPT_MULTI;
+	bool deliver = false;
+	bool replace = false;
+	if (alive) {
+		accept_multi_unlink_locked(parent, child);
+		deliver = child->error_code == ERROR_SUCCESS;
+		if (!deliver) {
+			accept_multi_end_locked(ctx, parent, child->error_code);
+		}
+		replace = deliver && !parent->accept_ending;
+	}
+	LeaveCriticalSection(&tm->lock);
+	if (!alive) {
+		return false;
+	}
+
+	if (replace && accept_multi_spawn(ctx, parent) < 0) {
+		EnterCriticalSection(&tm->lock);
+		if (parent->accept_nchildren == 0) {
+			accept_multi_end_locked(ctx, parent, ERROR_NOT_ENOUGH_MEMORY);
+		}
+		LeaveCriticalSection(&tm->lock);
+	}
+
+	EnterCriticalSection(&tm->lock);
+	bool last = parent->accept_nchildren == 0;
+	DWORD error = parent->error_code;
+	LeaveCriticalSection(&tm->lock);
+	if (last) {
+		post_armed_op(ctx, parent, error);
+	}
+	return deliver;
+}
+
+/*
  * ================= Work op support =================
  *
  * The callback runs on a private Win32 threadpool and delivers its completion
@@ -2090,7 +2269,7 @@ static void iocp_poll_edge_seen(ior_ctx_iocp *ctx, ior_iocp_op *edge)
 /* The consumer's release of a CQE: re-arm the poll behind an edge, then free. */
 static void consumer_free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
-	if (op->poll_parent) {
+	if (op->poll_parent && op->opcode == IOR_OP_POLL) {
 		iocp_poll_edge_seen(ctx, op);
 	}
 	free_op(ctx, op);
@@ -2676,6 +2855,7 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			bool is_poll = guarded->opcode == IOR_OP_POLL;
 			bool is_wait = guarded->opcode == IOR_OP_WAITPID;
 			bool is_sigwait = guarded->opcode == IOR_OP_SIGWAIT;
+			bool is_accept_multi = guarded->opcode == IOR_OP_ACCEPT && guarded->accept_multi;
 			bool work_queued = false;
 			DWORD lt_error = ERROR_TIMEOUT;
 			if (guarded->opcode == IOR_OP_WORK) {
@@ -2696,6 +2876,10 @@ static DWORD WINAPI timer_thread_main(LPVOID arg)
 			}
 			if (token_cancel) {
 				atomic_store_explicit(&guarded->token.cancelled, 1, memory_order_release);
+			} else if (is_accept_multi) {
+				// Its children's aborts come in through the port; the last
+				// one posts the parent as cancelled (accept_multi_child_done).
+				accept_multi_end_locked(ctx, guarded, ERROR_OPERATION_ABORTED);
 			} else if (!is_wait && !is_sigwait) {
 				// Still under timers.lock: the consumer resolves the pair
 				// under it before the guarded op can be reaped and recycled,
@@ -2976,6 +3160,17 @@ static int iocp_cancel_one(ior_ctx_iocp *ctx, ior_iocp_op *op)
 			iocp_poller_wake(&ctx->poller);
 			return 0;
 
+		case IOCP_OP_ACCEPT_MULTI: {
+			// Its children are cancelled; the last to come in posts it as
+			// -ECANCELED. One already on its way out (a child failed, its
+			// link timeout fired) completes on its own with what took it out.
+			EnterCriticalSection(&ctx->timers.lock);
+			bool ending = op->accept_ending;
+			accept_multi_end_locked(ctx, op, ERROR_OPERATION_ABORTED);
+			LeaveCriticalSection(&ctx->timers.lock);
+			return ending ? -EALREADY : 0;
+		}
+
 		case IOCP_OP_WAIT:
 			return iocp_waitpid_abort(ctx, op) ? 0 : -ENOENT;
 
@@ -3008,6 +3203,9 @@ static int issue_cancel(ior_ctx_iocp *ctx, ior_iocp_op *c)
 			if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE
 					|| state == IOCP_OP_IO_CANCEL) {
 				continue; // IO_CANCEL: already being cancelled, its CQE is on its way
+			}
+			if (op->poll_parent) {
+				continue; // a multishot accept's child: its parent is the op
 			}
 			if (!iocp_cancel_match(op, c)) {
 				continue;
@@ -3229,7 +3427,9 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 				break;
 
 			case IOR_OP_ACCEPT:
-				ret = issue_accept(ctx, op);
+				// A multishot accept's deadline is watched by the timer
+				// thread, which takes its children down.
+				ret = op->accept_multi ? issue_accept_multi(ctx, op) : issue_accept(ctx, op);
 				break;
 
 			case IOR_OP_CONNECT:
@@ -3585,6 +3785,11 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		if (state == IOCP_OP_IO || state == IOCP_OP_IO_CANCEL) {
 			atomic_store(&op->state, IOCP_OP_IO_CANCEL);
 			CancelIoEx((HANDLE) op->fd, &op->overlapped);
+		} else if (state == IOCP_OP_ACCEPT_MULTI) {
+			// A multishot accept's slot is its own: post it now. Its
+			// children are cancelled by this pass like any request, and
+			// dropped when they arrive, as children of a completed parent.
+			post_armed_op(ctx, op, ERROR_OPERATION_ABORTED);
 		}
 	}
 
@@ -4170,6 +4375,11 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 	if ((op->opcode == IOR_OP_ACCEPT || op->opcode == IOR_OP_CONNECT) && !op->submit_res) {
 		finish_socket_op(ctx, op);
 	}
+	if (op->opcode == IOR_OP_ACCEPT && op->poll_parent && !accept_multi_child_done(ctx, op)) {
+		// Not the caller's: a failed child, or one whose parent completed.
+		free_op(ctx, op);
+		return -EAGAIN;
+	}
 	op_to_cqe(op);
 
 	int ret = ready_queue_push(&ctx->ready, op);
@@ -4608,6 +4818,12 @@ static void ior_iocp_backend_prep_accept(
 	op->accept_flags = flags;
 }
 
+static void ior_iocp_backend_prep_accept_multishot(ior_sqe *sqe, ior_fd_t fd, unsigned flags)
+{
+	ior_iocp_backend_prep_accept(sqe, fd, NULL, NULL, flags);
+	((ior_iocp_op *) sqe)->accept_multi = true;
+}
+
 static void ior_iocp_backend_prep_connect(
 		ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
 {
@@ -4788,6 +5004,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_poll_add = ior_iocp_backend_prep_poll_add,
 	.prep_poll_multishot = ior_iocp_backend_prep_poll_multishot,
 	.prep_accept = ior_iocp_backend_prep_accept,
+	.prep_accept_multishot = ior_iocp_backend_prep_accept_multishot,
 	.prep_connect = ior_iocp_backend_prep_connect,
 	.prep_cancel = ior_iocp_backend_prep_cancel,
 	.prep_cancel_fd = ior_iocp_backend_prep_cancel_fd,

@@ -52,6 +52,10 @@ static inline int ior_fixed_file_bad(uint8_t opcode, uint8_t sqe_flags, uint32_t
  * the poll persists, one completion per readiness edge. */
 #define IOR_POLL_ADD_MULTI (1U << 0)
 
+/* Set in an accept op's ioprio by prep_accept_multishot (io_uring's own
+ * encoding): the accept persists, one completion per connection. */
+#define IOR_ACCEPT_MULTISHOT (1U << 0)
+
 /* Backend-specific SQE structures */
 #ifdef IOR_HAVE_URING
 #include <liburing.h>
@@ -192,6 +196,7 @@ typedef struct ior_backend_ops {
 	void (*prep_poll_multishot)(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 	void (*prep_accept)(
 			ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags);
+	void (*prep_accept_multishot)(ior_sqe *sqe, ior_fd_t fd, unsigned flags);
 	void (*prep_connect)(ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen);
 	void (*prep_cancel)(ior_sqe *sqe, uint64_t user_data);
 	void (*prep_cancel_fd)(ior_sqe *sqe, ior_fd_t fd);

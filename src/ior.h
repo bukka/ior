@@ -122,7 +122,8 @@ typedef struct ior_timespec {
 #define IOR_OP_TIMER 3
 /** Move data between descriptors (ior_prep_splice). */
 #define IOR_OP_SPLICE 4
-/** Accept a connection (ior_prep_accept); completes with the new socket. */
+/** Accept a connection (ior_prep_accept, ior_prep_accept_multishot);
+ *  completes with the new socket. */
 #define IOR_OP_ACCEPT 5
 /** Connect a socket (ior_prep_connect). */
 #define IOR_OP_CONNECT 6
@@ -275,7 +276,8 @@ typedef struct ior_timespec {
  * @{
  */
 /** More completions follow from the same operation: a multishot poll
- *  (ior_prep_poll_multishot) posts one per readiness edge and stays armed.
+ *  (ior_prep_poll_multishot) posts one per readiness edge, a multishot
+ *  accept (ior_prep_accept_multishot) one per connection, and stays armed.
  *  A completion without this bit is the operation's last. */
 #define IOR_CQE_F_MORE (1U << 1)
 /** @} */
@@ -420,8 +422,9 @@ void ior_queue_exit(ior_ctx *ctx);
  * blocks on a lock one of the parent's threads may have held at the fork,
  * ior's own threads included, and leaves open the descriptors such a thread
  * was creating or changing at that moment: on the thread backend the
- * multishot polls' dup(2)s when the fork lands while the poller thread
- * reports readiness, and the poller's own descriptors when it lands while
+ * multishot polls' and accepts' dup(2)s when the fork lands while the poller
+ * thread reports readiness (and a socket a multishot accept was accepting
+ * right then), and the poller's own descriptors when it lands while
  * a worker is still creating the poller for the first poll; on io_uring
  * the pidfds and signalfds of pending waits when it lands while a worker or
  * timer thread retires a work job. Memory is released as far as the child
@@ -782,6 +785,48 @@ void ior_prep_recv(
  */
 void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *addr,
 		socklen_t *addrlen, unsigned flags);
+
+/**
+ * Prepare a persistent accept on a listening socket (like io_uring's
+ * multishot ACCEPT, IORING_ACCEPT_MULTISHOT).
+ *
+ * Like ior_prep_accept(), but the operation stays armed: it posts a
+ * completion for every connection it accepts, with the accepted socket as
+ * res (as ior_prep_accept() reports it, @p flags applied to each) and
+ * IOR_CQE_F_MORE among its flags, until it is cancelled (ior_prep_cancel(),
+ * ior_prep_cancel_fd(), a fired link timeout, ior_queue_exit()) or fails;
+ * that posts its last completion, without IOR_CQE_F_MORE, carrying
+ * -ECANCELED or the error (-EMFILE, say). Every completion carries the
+ * operation's user data. No peer address is reported, since one buffer
+ * would be overwritten per connection; ask the accepted socket
+ * (getpeername(2)).
+ *
+ * Connections accepted before the last completion still arrive, with
+ * IOR_CQE_F_MORE, ahead of it: reap until the completion without the flag,
+ * and close what you do not want. On io_uring and the thread backend the
+ * operation also ends on its own when a connection finds the completion
+ * queue full: that connection is its last completion, with the socket as
+ * res (>= 0) and no IOR_CQE_F_MORE, as io_uring ends a multishot accept.
+ * IOCP keeps a few accepts outstanding, and ends only when no memory is
+ * left. Re-arm by submitting a new operation.
+ *
+ * io_uring uses IORING_ACCEPT_MULTISHOT (Linux 5.19). The thread backend
+ * watches the listener edge-triggered on its poller, as a multishot poll,
+ * taking a blocking listener's mode over meanwhile (see ior_prep_accept()),
+ * and accepts on the poller thread until the backlog is empty at every
+ * edge. IOCP keeps four AcceptEx outstanding, each with a socket created
+ * ahead of the listener's family and protocol, and issues another after
+ * each completion. A link timeout bounds the whole operation as it does a
+ * multishot poll; do not link another entry behind it.
+ *
+ * @param ctx    I/O context.
+ * @param sqe    Entry from ior_get_sqe().
+ * @param fd     Listening socket.
+ * @param flags  IOR_ACCEPT_NONBLOCK, IOR_ACCEPT_CLOEXEC, or 0, applied to
+ *               every accepted socket; any other bit fails the entry at
+ *               submit with -EINVAL (see ior_submit()).
+ */
+void ior_prep_accept_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, unsigned flags);
 
 /**
  * Prepare a connect (like io_uring's CONNECT).

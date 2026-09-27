@@ -25,6 +25,7 @@
 #define TAG_POLL ((void *) 0x2)
 #define TAG_SIG ((void *) 0x3)
 #define TAG_WAIT ((void *) 0x4)
+#define TAG_ACCEPT ((void *) 0x5)
 
 static void open_fds(char *out)
 {
@@ -111,6 +112,11 @@ static void test_forget_after_fork(void **state)
 		_exit(5);
 	}
 
+	ior_fd_t listener;
+	struct sockaddr_storage laddr;
+	socklen_t laddrlen;
+	assert_return_code(test_make_listener(&listener, &laddr, &laddrlen), 0);
+
 	char base[MAX_FDS];
 	open_fds(base);
 
@@ -140,6 +146,12 @@ static void test_forget_after_fork(void **state)
 	assert_return_code(ior_prep_waitpid(ctx, sqe, kid, &status, 0), 0);
 	submit(ctx, sqe, TAG_WAIT);
 
+	// A multishot accept: the thread backend's poller watches a dup of the
+	// listener for it, as for the poll.
+	sqe = ior_get_sqe(ctx);
+	ior_prep_accept_multishot(ctx, sqe, listener, IOR_ACCEPT_CLOEXEC);
+	submit(ctx, sqe, TAG_ACCEPT);
+
 	// Let the thread backend park the waits and its poller take the poll.
 	usleep(100000);
 
@@ -149,8 +161,11 @@ static void test_forget_after_fork(void **state)
 	// whatever order (a poll(2) poller reports the poll again and again).
 	assert_int_equal(write(p[1], "x", 1), 1);
 	assert_return_code(kill(getpid(), SIGUSR1), 0);
-	int got_poll = 0, got_sig = 0, got_wait = 0;
-	while (!got_poll || !got_sig || !got_wait) {
+	ior_fd_t client;
+	assert_return_code(test_make_tcp_socket(&client), 0);
+	assert_int_equal(connect(client, (const struct sockaddr *) &laddr, laddrlen), 0);
+	int got_poll = 0, got_sig = 0, got_wait = 0, got_accept = 0;
+	while (!got_poll || !got_sig || !got_wait || !got_accept) {
 		ior_cqe *cqe = NULL;
 		ior_timespec to = { .tv_sec = 5, .tv_nsec = 0 };
 		int ret;
@@ -162,6 +177,10 @@ static void test_forget_after_fork(void **state)
 		if (tag == TAG_POLL) {
 			assert_true(res & IOR_POLL_IN);
 			got_poll = 1;
+		} else if (tag == TAG_ACCEPT) {
+			assert_true(res >= 0);
+			close(res);
+			got_accept = 1;
 		} else if (tag == TAG_SIG) {
 			assert_int_equal(res, SIGUSR1);
 			got_sig = 1;
@@ -176,6 +195,8 @@ static void test_forget_after_fork(void **state)
 
 	ior_queue_exit(ctx);
 	pthread_sigmask(SIG_SETMASK, &saved, NULL);
+	close(client);
+	close(listener);
 	close(p[0]);
 	close(p[1]);
 }
