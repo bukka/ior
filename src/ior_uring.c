@@ -1678,6 +1678,9 @@ static void ior_uring_backend_prep_poll_add(ior_sqe *sqe, ior_fd_t fd, uint32_t 
 
 /* The kernel's own flag marks the edge completions of a multishot poll. */
 _Static_assert(IOR_CQE_F_MORE == IORING_CQE_F_MORE, "IOR_CQE_F_MORE must match");
+/* The kernel's hint on accept (6.10) and recv (5.19) completions, passed through. */
+_Static_assert(IOR_CQE_F_SOCK_NONEMPTY == IORING_CQE_F_SOCK_NONEMPTY,
+		"IOR_CQE_F_SOCK_NONEMPTY must match");
 _Static_assert(IOR_POLL_ADD_MULTI == IORING_POLL_ADD_MULTI, "IOR_POLL_ADD_MULTI must match");
 
 static void ior_uring_backend_prep_poll_multishot(ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask)

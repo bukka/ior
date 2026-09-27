@@ -15,6 +15,9 @@
 #ifndef _WIN32
 #include <netinet/in.h>
 #endif
+#ifdef __linux__
+#include <sys/utsname.h>
+#endif
 
 #define TAG_ACCEPT ((void *) 0x1)
 #define TAG_CONNECT ((void *) 0x2)
@@ -493,6 +496,63 @@ static void reap_cancelled(ior_ctx *ctx, int32_t cancel_res)
 }
 
 /*
+ * Whether IOR_CQE_F_SOCK_NONEMPTY is exact on this backend for a one-shot
+ * accept (multi == 0) or a multishot's connections: the thread backend and
+ * IOCP probe the listener, IOCP only for a one-shot accept, and io_uring
+ * reports it from Linux 6.10.
+ */
+static int nonempty_exact(ior_ctx *ctx, int multi)
+{
+	ior_backend_type backend = ior_get_backend_type(ctx);
+	if (backend == IOR_BACKEND_THREADS) {
+		return 1;
+	}
+	if (backend == IOR_BACKEND_IOCP) {
+		return !multi;
+	}
+#ifdef __linux__
+	struct utsname u;
+	int major = 0, minor = 0;
+	if (uname(&u) == 0 && sscanf(u.release, "%d.%d", &major, &minor) == 2) {
+		return major > 6 || (major == 6 && minor >= 10);
+	}
+#endif
+	return 0;
+}
+
+/*
+ * IOR_CQE_F_SOCK_NONEMPTY on a one-shot accept: set with another connection
+ * queued behind the accepted one, clear on the last.
+ */
+static void test_accept_sock_nonempty(void **state)
+{
+	ac_state *s = (ac_state *) *state;
+	ior_fd_t c1 = connect_client(s);
+	ior_fd_t c2 = connect_client(s);
+	int exact = nonempty_exact(s->ctx, 0);
+
+	for (int i = 0; i < 2; i++) {
+		submit_accept(s, NULL, NULL, 0);
+		assert_true(ior_submit(s->ctx) >= 0);
+		cqe_rec r;
+		if (reap_one(s->ctx, &r, 3000) != 0) {
+			fail_msg("accept %d missing", i);
+		}
+		assert_ptr_equal(r.tag, TAG_ACCEPT);
+		ior_fd_t a = accepted_fd(r.res);
+		if (exact) {
+			assert_int_equal(
+					r.flags & IOR_CQE_F_SOCK_NONEMPTY, i == 0 ? IOR_CQE_F_SOCK_NONEMPTY : 0);
+		} else if (i == 1) {
+			assert_false(r.flags & IOR_CQE_F_SOCK_NONEMPTY);
+		}
+		test_close_fd(a);
+	}
+	test_close_fd(c1);
+	test_close_fd(c2);
+}
+
+/*
  * Connections arriving one by one: each is one edge completion, the
  * accepted socket works for I/O both ways, and a cancel ends the operation
  * with -ECANCELED and no IOR_CQE_F_MORE. The listener comes back blocking.
@@ -562,8 +622,22 @@ static void test_accept_multishot_backlog(void **state)
 		clients[i] = connect_client(s);
 	}
 	submit_maccept(s, 0, 0);
+	int exact = nonempty_exact(s->ctx, 1);
 	for (int i = 0; i < 5; i++) {
-		accepted[i] = reap_maccept(s->ctx);
+		cqe_rec r;
+		if (reap_one(s->ctx, &r, 3000) != 0) {
+			fail_msg("connection %d not reported", i);
+		}
+		assert_ptr_equal(r.tag, TAG_MACCEPT);
+		assert_true(r.flags & IOR_CQE_F_MORE);
+		accepted[i] = accepted_fd(r.res);
+		// Another is queued behind each but the last.
+		if (exact) {
+			assert_int_equal(
+					r.flags & IOR_CQE_F_SOCK_NONEMPTY, i < 4 ? IOR_CQE_F_SOCK_NONEMPTY : 0);
+		} else if (i == 4) {
+			assert_false(r.flags & IOR_CQE_F_SOCK_NONEMPTY);
+		}
 	}
 	assert_silent(s->ctx, 50);
 
@@ -955,6 +1029,7 @@ int main(void)
 #ifndef _WIN32
 		cmocka_unit_test_setup_teardown(test_accept_flags, setup_ac, teardown_ac),
 #endif
+		cmocka_unit_test_setup_teardown(test_accept_sock_nonempty, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(test_accept_multishot_stream, setup_ac, teardown_ac),
 		cmocka_unit_test_setup_teardown(test_accept_multishot_backlog, setup_ac, teardown_ac),
 #ifndef _WIN32
