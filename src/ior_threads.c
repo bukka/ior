@@ -657,6 +657,11 @@ static int ior_threads_backend_notify_clear(void *backend_ctx)
 		return -EINVAL;
 	}
 	ior_ctx_threads *ctx = backend_ctx;
+	/* Not handed out yet: the event is ior's own wakeup, and consuming it
+	 * could take a signal a waiting thread was sent. */
+	if (!atomic_load_explicit(&ctx->notify_armed, memory_order_acquire)) {
+		return -EINVAL;
+	}
 	int ret = ior_threads_event_clear(&ctx->event);
 	return ret < 0 ? ret : 0;
 }

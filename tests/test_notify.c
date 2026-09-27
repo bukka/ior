@@ -176,6 +176,16 @@ static void test_notify_clear_then_more(void **state)
 	reap_peek(s, 1, (void *) 0x5);
 }
 
+// Clearing a descriptor that was never requested is refused on every backend.
+static void test_notify_clear_unrequested(void **state)
+{
+	(void) state;
+	ior_ctx *ctx;
+	assert_return_code(ior_queue_init(32, &ctx), 0);
+	assert_int_equal(ior_notify_clear(ctx), -EINVAL);
+	ior_queue_exit(ctx);
+}
+
 // A completion posted before the first ior_notify_fd() call is announced
 // by that call (a fresh context that has not requested the descriptor yet).
 static void test_notify_late_request(void **state)
@@ -233,6 +243,7 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_notify_timer, setup_notify, teardown_notify),
 		cmocka_unit_test_setup_teardown(test_notify_clear_then_more, setup_notify, teardown_notify),
 		cmocka_unit_test(test_notify_late_request),
+		cmocka_unit_test(test_notify_clear_unrequested),
 		cmocka_unit_test_setup_teardown(test_notify_mixed_wait, setup_notify, teardown_notify),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
