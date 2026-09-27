@@ -345,26 +345,45 @@ static void test_cq_reserve_race(void **state)
 	atomic_store(&f.stop, 1);
 	pthread_join(t, NULL);
 
-	// A live poll ends with -ECANCELED; one reported ended must be gone.
+	/*
+	 * A poll reported ended must be gone (-ENOENT). One the test still counts
+	 * as live may have ended by itself meanwhile, an edge finding the queue
+	 * full, its last completion posted but not reaped yet: then the cancel
+	 * finds nothing either, and that completion carries the readiness. Else
+	 * the cancel takes it (0) and it ends with -ECANCELED. The two
+	 * completions may arrive in either order.
+	 */
 	ior_sqe *sqe = ior_get_sqe(ctx);
 	assert_non_null(sqe);
 	ior_prep_cancel(ctx, sqe, POLL_TAG);
 	ior_sqe_set_data(ctx, sqe, CANCEL_TAG(0));
+	int armed_at_cancel = poll_armed;
 	assert_int_equal(ior_submit(ctx), 1);
 	int cancel_seen = 0;
+	int32_t cancel_res = 0;
+	int32_t poll_last = 0;
 	while (!cancel_seen || poll_armed) {
 		void *tag;
 		uint32_t flags;
 		int32_t res = reap_one(ctx, &tag, &flags);
 		if (tag == CANCEL_TAG(0)) {
-			assert_int_equal(res, poll_armed ? 0 : -ENOENT);
+			cancel_res = res;
 			cancel_seen = 1;
 		} else {
 			assert_ptr_equal(tag, POLL_TAG);
 			if (!(flags & IOR_CQE_F_MORE)) {
 				poll_armed = 0;
+				poll_last = res;
 			}
 		}
+	}
+	if (!armed_at_cancel) {
+		assert_int_equal(cancel_res, -ENOENT);
+	} else if (cancel_res == 0) {
+		assert_int_equal(poll_last, -ECANCELED);
+	} else {
+		assert_int_equal(cancel_res, -ENOENT);
+		assert_true(poll_last > 0);
 	}
 
 	// Every slot is free again.
