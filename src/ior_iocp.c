@@ -226,6 +226,13 @@ typedef struct ior_iocp_op {
 	struct ior_iocp_op *next_free;
 } ior_iocp_op;
 
+/* A block of ops; the pool grows by adding one and never shrinks. */
+typedef struct iocp_op_chunk {
+	struct iocp_op_chunk *next;
+	uint32_t count;
+	ior_iocp_op ops[];
+} iocp_op_chunk;
+
 /* Ready queue for buffering completed operations */
 typedef struct ready_queue {
 	ior_iocp_op **ops; // Dynamic array
@@ -329,9 +336,10 @@ static LONG g_qpc_freq_init = 0; // 0 = not done, 1 = done
 typedef struct ior_ctx_iocp {
 	HANDLE iocp_handle;
 
-	// Operation pool (pre-allocated)
-	ior_iocp_op *op_pool;
-	uint32_t pool_size;
+	// Operation pool: grown in chunks as more ops are staged or in flight,
+	// which nothing bounds but memory, as on io_uring.
+	iocp_op_chunk *op_chunks;
+	uint32_t pool_size; // ops in all chunks
 
 	// Free list (protected because timer thread may free ops on PQCS failure/teardown)
 	CRITICAL_SECTION pool_lock;
@@ -639,30 +647,40 @@ static handle_set_entry *handle_set_insert_locked(handle_set *set, HANDLE h)
 
 /* ================= Op pool ================= */
 
-static int init_op_pool(ior_ctx_iocp *ctx, uint32_t size)
+/* Add a chunk of size ops to the free list (pool_lock held, or at init). */
+static int grow_op_pool(ior_ctx_iocp *ctx, uint32_t size)
 {
-	ctx->op_pool = calloc(size, sizeof(ior_iocp_op));
-	if (!ctx->op_pool) {
+	iocp_op_chunk *chunk = calloc(1, sizeof(*chunk) + (size_t) size * sizeof(ior_iocp_op));
+	if (!chunk) {
 		return -ENOMEM;
 	}
-
-	ctx->pool_size = size;
-	ctx->free_count = size;
-
-	ctx->free_list_head = &ctx->op_pool[0];
-	for (uint32_t i = 0; i < size - 1; i++) {
-		ctx->op_pool[i].next_free = &ctx->op_pool[i + 1];
+	chunk->count = size;
+	chunk->next = ctx->op_chunks;
+	ctx->op_chunks = chunk;
+	for (uint32_t i = 0; i < size; i++) {
+		chunk->ops[i].next_free = ctx->free_list_head;
+		ctx->free_list_head = &chunk->ops[i];
 	}
-	ctx->op_pool[size - 1].next_free = NULL;
-
+	ctx->pool_size += size;
+	ctx->free_count += size;
 	return 0;
+}
+
+static void free_op_pool(ior_ctx_iocp *ctx)
+{
+	while (ctx->op_chunks) {
+		iocp_op_chunk *next = ctx->op_chunks->next;
+		free(ctx->op_chunks);
+		ctx->op_chunks = next;
+	}
 }
 
 static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 {
 	EnterCriticalSection(&ctx->pool_lock);
 
-	if (!ctx->free_list_head) {
+	// Doubling, so growth stays rare; only memory bounds the ops.
+	if (!ctx->free_list_head && grow_op_pool(ctx, ctx->pool_size) < 0) {
 		LeaveCriticalSection(&ctx->pool_lock);
 		return NULL;
 	}
@@ -2023,8 +2041,10 @@ static void consumer_free_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
  * Resolve readiness for the poll op at active index i, on the poller thread
  * (the op's active_count slot is held). A one-shot op completes and leaves
  * the set. A multishot op reports the readiness through a shadow op and
- * stays, unless the pool is exhausted, in which case this readiness is its
- * last result (as io_uring ends a multishot when the CQ is full). WSAPoll
+ * stays, unless no op can be had (no memory), in which case this readiness
+ * is its last result. io_uring and the thread backend end a multishot on a
+ * full completion queue; here its edges cannot pile up to begin with, the
+ * op being held until the consumer has seen its last one. WSAPoll
  * is level-triggered and would report the same readiness again at once, so
  * the op is held out of the set until the consumer has seen the edge; a
  * timed hold is no use here, WSAPoll rounding any timeout up to the system
@@ -2920,22 +2940,26 @@ static int issue_cancel(ior_ctx_iocp *ctx, ior_iocp_op *c)
 		ret = -EBADF;
 	} else {
 		ret = -ENOENT;
-		for (uint32_t i = 0; i < ctx->pool_size; i++) {
-			ior_iocp_op *op = &ctx->op_pool[i];
-			if (op == c) {
-				continue;
-			}
-			int state = atomic_load(&op->state);
-			if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE
-					|| state == IOCP_OP_IO_CANCEL) {
-				continue; // IO_CANCEL: already being cancelled, its CQE is on its way
-			}
-			if (!iocp_cancel_match(op, c)) {
-				continue;
-			}
-			ret = iocp_cancel_one(ctx, op);
-			if (ret != -ENOENT) {
-				break;
+		// The poller thread may grow the pool meanwhile (a multishot edge):
+		// a chunk is linked in whole, at the head, its ops free and skipped.
+		for (iocp_op_chunk *chunk = ctx->op_chunks; chunk && ret == -ENOENT; chunk = chunk->next) {
+			for (uint32_t i = 0; i < chunk->count; i++) {
+				ior_iocp_op *op = &chunk->ops[i];
+				if (op == c) {
+					continue;
+				}
+				int state = atomic_load(&op->state);
+				if (state == IOCP_OP_FREE || state == IOCP_OP_LINKED || state == IOCP_OP_DONE
+						|| state == IOCP_OP_IO_CANCEL) {
+					continue; // IO_CANCEL: already being cancelled, its CQE is on its way
+				}
+				if (!iocp_cancel_match(op, c)) {
+					continue;
+				}
+				ret = iocp_cancel_one(ctx, op);
+				if (ret != -ENOENT) {
+					break;
+				}
 			}
 		}
 	}
@@ -3274,11 +3298,12 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	atomic_store(&ctx->completed_cnt, 0);
 
 	/*
-	 * An op holds its pool entry from get_sqe until its completion is reaped,
-	 * so the pool is the completion queue's size: the in-flight bound, as on
-	 * the thread backend, and the ready queue can never be full.
+	 * An op holds its pool entry from get_sqe until its completion is reaped.
+	 * The pool starts at the completion queue's size and grows as needed:
+	 * completions beyond the ready queue wait in the port, which bounds
+	 * nothing, as io_uring's kernel keeps an overflowing completion.
 	 */
-	ret = init_op_pool(ctx, cq_entries);
+	ret = grow_op_pool(ctx, cq_entries);
 	if (ret < 0) {
 		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
@@ -3291,7 +3316,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 
 	ret = init_sq_ring(ctx, sq_entries);
 	if (ret < 0) {
-		free(ctx->op_pool);
+		free_op_pool(ctx);
 		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
@@ -3317,7 +3342,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 	if (!ctx->timers.heap) {
 		DeleteCriticalSection(&ctx->timers.lock);
 		free(ctx->sq_array);
-		free(ctx->op_pool);
+		free_op_pool(ctx);
 		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
@@ -3335,7 +3360,7 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 		free(ctx->timers.heap);
 		DeleteCriticalSection(&ctx->timers.lock);
 		free(ctx->sq_array);
-		free(ctx->op_pool);
+		free_op_pool(ctx);
 		DeleteCriticalSection(&ctx->sched_lock);
 		DeleteCriticalSection(&ctx->pool_lock);
 		ready_queue_destroy(&ctx->ready);
@@ -3400,10 +3425,12 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	// Signal waits: each abort posts -ECANCELED (a handler that wins the
 	// race posts the signal instead), then the context leaves the handler's
 	// list, so no event reaches it any more.
-	for (uint32_t i = 0; i < ctx->pool_size; i++) {
-		ior_iocp_op *op = &ctx->op_pool[i];
-		if (atomic_load(&op->state) == IOCP_OP_SIGWAIT) {
-			(void) iocp_sigwait_abort(ctx, op);
+	for (iocp_op_chunk *chunk = ctx->op_chunks; chunk; chunk = chunk->next) {
+		for (uint32_t i = 0; i < chunk->count; i++) {
+			ior_iocp_op *op = &chunk->ops[i];
+			if (atomic_load(&op->state) == IOCP_OP_SIGWAIT) {
+				(void) iocp_sigwait_abort(ctx, op);
+			}
 		}
 	}
 	iocp_sig_unregister(ctx);
@@ -3415,10 +3442,12 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 		 * and the drain below waiting. Each abort posts -ECANCELED (a
 		 * callback that wins the race posts the real result instead).
 		 */
-		for (uint32_t i = 0; i < ctx->pool_size; i++) {
-			ior_iocp_op *op = &ctx->op_pool[i];
-			if (atomic_load(&op->state) == IOCP_OP_WAIT) {
-				(void) iocp_waitpid_abort(ctx, op);
+		for (iocp_op_chunk *chunk = ctx->op_chunks; chunk; chunk = chunk->next) {
+			for (uint32_t i = 0; i < chunk->count; i++) {
+				ior_iocp_op *op = &chunk->ops[i];
+				if (atomic_load(&op->state) == IOCP_OP_WAIT) {
+					(void) iocp_waitpid_abort(ctx, op);
+				}
 			}
 		}
 		CloseThreadpoolCleanupGroupMembers(ctx->work_cleanup, FALSE, NULL);
@@ -3502,12 +3531,14 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	 * requests. A new kind of op that is counted but not forced here would
 	 * hang teardown instead of spinning out.
 	 */
-	for (uint32_t i = 0; i < ctx->pool_size; i++) {
-		ior_iocp_op *op = &ctx->op_pool[i];
-		int state = atomic_load(&op->state);
-		if (state == IOCP_OP_IO || state == IOCP_OP_IO_CANCEL) {
-			atomic_store(&op->state, IOCP_OP_IO_CANCEL);
-			CancelIoEx((HANDLE) op->fd, &op->overlapped);
+	for (iocp_op_chunk *chunk = ctx->op_chunks; chunk; chunk = chunk->next) {
+		for (uint32_t i = 0; i < chunk->count; i++) {
+			ior_iocp_op *op = &chunk->ops[i];
+			int state = atomic_load(&op->state);
+			if (state == IOCP_OP_IO || state == IOCP_OP_IO_CANCEL) {
+				atomic_store(&op->state, IOCP_OP_IO_CANCEL);
+				CancelIoEx((HANDLE) op->fd, &op->overlapped);
+			}
 		}
 	}
 
@@ -3572,9 +3603,7 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 	if (ctx->sq_array) {
 		free(ctx->sq_array);
 	}
-	if (ctx->op_pool) {
-		free(ctx->op_pool);
-	}
+	free_op_pool(ctx);
 
 	DeleteCriticalSection(&ctx->sched_lock);
 	DeleteCriticalSection(&ctx->pool_lock);
@@ -3599,11 +3628,10 @@ static int ior_iocp_backend_get_sqe(void *backend_ctx, ior_sqe **sqe_out)
 		return -ENOSPC;
 	}
 
-	// The pool is the completion queue's size: none free means every
-	// completion slot is taken by an op in flight or a completion unreaped.
+	// Only memory bounds the ops, as on io_uring: the pool grows.
 	ior_iocp_op *op = alloc_op(ctx);
 	if (!op) {
-		return -EBUSY;
+		return -ENOMEM;
 	}
 
 	if (sq_enqueue(ctx, op) < 0) {
@@ -3632,11 +3660,9 @@ static unsigned ior_iocp_backend_sq_space_left(void *backend_ctx)
 
 static unsigned ior_iocp_backend_cq_space_left(void *backend_ctx)
 {
+	// Room in the ready queue; completions beyond it wait in the port.
 	ior_ctx_iocp *ctx = backend_ctx;
-	EnterCriticalSection(&ctx->pool_lock);
-	unsigned left = ctx->free_count;
-	LeaveCriticalSection(&ctx->pool_lock);
-	return left;
+	return ctx->ready.count < ctx->ready.size ? ctx->ready.size - ctx->ready.count : 0;
 }
 
 /*
@@ -4378,9 +4404,6 @@ static unsigned ior_iocp_backend_peek_batch_cqe(void *backend_ctx, ior_cqe **cqe
 
 	ior_ctx_iocp *ctx = backend_ctx;
 
-	if (max > ctx->pool_size) {
-		max = ctx->pool_size;
-	}
 	if (max > ctx->ready.size) {
 		max = ctx->ready.size;
 	}

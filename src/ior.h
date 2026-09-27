@@ -346,10 +346,9 @@ struct ior_params {
 	uint32_t sq_entries;
 	/**
 	 * [in,out] Completion queue size; 0 lets the backend choose (2x SQ). On
-	 * success, the size actually used (see ior_cq_entries()).
-	 * On the thread and IOCP backends it also caps the operations in flight,
-	 * as each holds a slot until its completion is reaped: size it above the
-	 * number of operations expected to stay parked.
+	 * success, the size actually used (see ior_cq_entries()). It bounds
+	 * neither the operations in flight nor what may be submitted: a
+	 * completion that finds it full waits until reaping makes room.
 	 */
 	uint32_t cq_entries;
 	/** IOR_SETUP_* setup flags. */
@@ -448,11 +447,12 @@ int ior_queue_forget(ior_ctx *ctx);
  * Describe the operation with an ior_prep_*() helper, optionally attach
  * ior_sqe_set_data()/ior_sqe_set_flags(), then publish it with ior_submit().
  *
- * An entry is refused when the submission queue is full of entries not yet
- * submitted (ior_submit() makes room), or when no completion queue slot is
- * free for the operation's completion (reaping makes room: ior_cqe_seen(),
- * ior_cq_advance()). See ior_get_sqe_ex() for which of the two it was, and
- * ior_cq_space_left() for when a slot counts as taken on each backend.
+ * An entry is refused only when the submission queue is full of entries not
+ * yet submitted (ior_submit() makes room), as io_uring_get_sqe() is. Nothing
+ * else bounds the operations in flight but memory, on every backend: a
+ * completion that finds the completion queue full waits, in the order it was
+ * posted, until reaping makes room (io_uring's IORING_FEAT_NODROP), so a
+ * caller that submits without reaping holds that memory.
  *
  * @param ctx  I/O context.
  * @return A pointer to an SQE, or NULL if no entry is available.
@@ -467,8 +467,9 @@ ior_sqe *ior_get_sqe(ior_ctx *ctx);
  * @param ctx      I/O context.
  * @param sqe_out  [out] Receives the SQE on success, NULL otherwise.
  * @return 0 on success; -ENOSPC if the submission queue is full (call
- *         ior_submit(), then retry); -EBUSY if no completion queue slot is
- *         free (reap completions, then retry); -EINVAL for bad arguments.
+ *         ior_submit(), then retry); -ENOMEM if no memory could be had for
+ *         the entry (IOCP, whose entry is its operation); -EINVAL for bad
+ *         arguments.
  */
 int ior_get_sqe_ex(ior_ctx *ctx, ior_sqe **sqe_out);
 
@@ -976,11 +977,10 @@ void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_ma
  * completes at once with its mask as the last completion.
  *
  * The operation may also end on its own, with a positive res and no
- * IOR_CQE_F_MORE, when a completion cannot be posted: io_uring does so when
- * the completion queue is full. The thread and IOCP backends do so when every
- * completion slot is taken (see ior_cq_space_left()), which counts the ops in
- * flight as well as unreaped completions, so parked operations can end a
- * multishot poll with the ring empty.
+ * IOR_CQE_F_MORE, when an edge finds the completion queue full: io_uring and
+ * the thread backend end it then. IOCP holds the poll out of its wait until
+ * the consumer has seen the previous edge, so its edges cannot pile up, and
+ * it ends only when no memory is left.
  * Re-arm by submitting a new poll.
  *
  * io_uring uses IORING_POLL_ADD_MULTI. The thread backend watches the
@@ -1278,11 +1278,9 @@ uint32_t ior_get_features(ior_ctx *ctx);
 unsigned ior_sq_entries(ior_ctx *ctx);
 
 /**
- * Size of the completion queue, as the backend settled on it.
- *
- * On the thread and IOCP backends this also bounds the operations in flight,
- * since each holds a completion slot from ior_get_sqe() until its completion
- * is reaped (see ior_cq_space_left()).
+ * Size of the completion queue, as the backend settled on it: how many
+ * completions wait for the reaper in it. It bounds nothing else; completions
+ * beyond it wait outside it, in order.
  *
  * @param ctx  I/O context.
  * @return The number of completion queue entries, or 0 for a NULL context.
@@ -1291,7 +1289,7 @@ unsigned ior_cq_entries(ior_ctx *ctx);
 
 /**
  * Submission queue entries still free: the number of ior_get_sqe() calls that
- * will succeed before ior_submit() is needed, if completion slots allow.
+ * will succeed before ior_submit() is needed.
  *
  * @param ctx  I/O context.
  * @return The free entry count, or 0 for a NULL context.
@@ -1299,23 +1297,13 @@ unsigned ior_cq_entries(ior_ctx *ctx);
 unsigned ior_sq_space_left(ior_ctx *ctx);
 
 /**
- * Completion queue slots not taken. While it is above zero ior_get_sqe() does
- * not refuse for lack of a completion slot (-EBUSY from ior_get_sqe_ex());
- * reaping completions frees slots.
- *
- * Which slots count as taken differs: on io_uring only completions posted and
- * not yet reaped take one, since the kernel buffers completions beyond the
- * queue size and ior refuses new entries only while the queue is full. The
- * thread and IOCP backends never post into a full queue: a slot is taken by
- * ior_get_sqe() for the operation's final completion and held until that
- * completion is reaped, and each multishot poll edge takes one as it is
- * posted, so operations in flight count too. On those backends this value is
- * therefore also how many more operations may be put in flight; a caller
- * that keeps its own count of operations in flight plus completions unreaped
- * has the same bound on every backend.
+ * Completion queue entries free: how many more completions fit before one
+ * has to wait outside the queue for a reap, as io_uring's CQ ring reports it.
+ * 0 while completions are waiting outside. Informational: it refuses nothing,
+ * and operations in flight do not count.
  *
  * @param ctx  I/O context.
- * @return The free slot count, or 0 for a NULL context.
+ * @return The free entry count, or 0 for a NULL context.
  */
 unsigned ior_cq_space_left(ior_ctx *ctx);
 
