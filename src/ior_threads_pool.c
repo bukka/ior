@@ -80,8 +80,78 @@ static ior_work *ior_threads_pool_work_alloc(ior_threads_pool *pool)
 	return w;
 }
 
+/* ===== Cancel lookup (work_lock held) ===== */
+
+static uint32_t ior_threads_pool_ud_slot(const ior_threads_pool *pool, uint64_t user_data)
+{
+	uint64_t v = user_data;
+	v ^= v >> 33;
+	v *= 0xff51afd7ed558ccdULL;
+	v ^= v >> 33;
+	return (uint32_t) v & pool->index_mask;
+}
+
+static uint32_t ior_threads_pool_fd_slot(const ior_threads_pool *pool, int fd)
+{
+	return ((uint32_t) fd * 0x9E3779B1u) & pool->index_mask;
+}
+
+static int ior_threads_pool_op_has_fd(uint8_t opcode);
+
+/*
+ * Make w findable by a cancel: by its user data, and by its descriptor when
+ * the op takes one. Every allocated item is indexed, whatever its state, as
+ * the scan it replaces looked at every item: a cancel filters by state.
+ */
+static void ior_threads_pool_index_add(ior_threads_pool *pool, ior_work *w)
+{
+	ior_work **head = &pool->ud_index[ior_threads_pool_ud_slot(pool, w->sqe.threads.user_data)];
+	w->ud_prev = NULL;
+	w->ud_next = *head;
+	if (*head) {
+		(*head)->ud_prev = w;
+	}
+	*head = w;
+
+	w->fd_indexed = ior_threads_pool_op_has_fd(w->sqe.threads.opcode);
+	if (w->fd_indexed) {
+		head = &pool->fd_index[ior_threads_pool_fd_slot(pool, w->sqe.threads.fd)];
+		w->fd_prev = NULL;
+		w->fd_next = *head;
+		if (*head) {
+			(*head)->fd_prev = w;
+		}
+		*head = w;
+	}
+}
+
+static void ior_threads_pool_index_remove(ior_threads_pool *pool, ior_work *w)
+{
+	if (w->ud_prev) {
+		w->ud_prev->ud_next = w->ud_next;
+	} else {
+		pool->ud_index[ior_threads_pool_ud_slot(pool, w->sqe.threads.user_data)] = w->ud_next;
+	}
+	if (w->ud_next) {
+		w->ud_next->ud_prev = w->ud_prev;
+	}
+
+	if (w->fd_indexed) {
+		if (w->fd_prev) {
+			w->fd_prev->fd_next = w->fd_next;
+		} else {
+			pool->fd_index[ior_threads_pool_fd_slot(pool, w->sqe.threads.fd)] = w->fd_next;
+		}
+		if (w->fd_next) {
+			w->fd_next->fd_prev = w->fd_prev;
+		}
+		w->fd_indexed = 0;
+	}
+}
+
 static void ior_threads_pool_work_release(ior_threads_pool *pool, ior_work *w)
 {
+	ior_threads_pool_index_remove(pool, w);
 	atomic_store_explicit(&w->state, IOR_WORK_FREE, memory_order_release);
 	w->next = pool->work_free;
 	pool->work_free = w;
@@ -490,12 +560,18 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	}
 
 	pool->work_items = calloc(pool->work_cap, sizeof(*pool->work_items));
+	uint32_t index_cap = ior_threads_pool_round_up_pow2(pool->work_cap);
+	pool->index_mask = index_cap - 1;
+	pool->ud_index = calloc(index_cap, sizeof(*pool->ud_index));
+	pool->fd_index = calloc(index_cap, sizeof(*pool->fd_index));
 	uint32_t drain_cap = ior_threads_pool_round_up_pow2(pool->work_cap * 2);
 	pool->drain_mask = drain_cap - 1;
 	pool->drain_done = calloc(drain_cap, sizeof(*pool->drain_done));
-	if (!pool->work_items || !pool->drain_done
+	if (!pool->work_items || !pool->ud_index || !pool->fd_index || !pool->drain_done
 			|| pthread_mutex_init(&pool->drain_lock, NULL) != 0) {
 		free(pool->drain_done);
+		free(pool->fd_index);
+		free(pool->ud_index);
 		free(pool->work_items);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
@@ -505,6 +581,8 @@ ior_threads_pool *ior_threads_pool_create_ex(
 	if (pthread_cond_init(&pool->drain_cond, NULL) != 0) {
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
+		free(pool->fd_index);
+		free(pool->ud_index);
 		free(pool->work_items);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
@@ -530,6 +608,8 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pthread_cond_destroy(&pool->drain_cond);
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
+		free(pool->fd_index);
+		free(pool->ud_index);
 		free(pool->work_items);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
@@ -555,6 +635,8 @@ ior_threads_pool *ior_threads_pool_create_ex(
 		pthread_cond_destroy(&pool->drain_cond);
 		pthread_mutex_destroy(&pool->drain_lock);
 		free(pool->drain_done);
+		free(pool->fd_index);
+		free(pool->ud_index);
 		free(pool->work_items);
 		pthread_mutex_destroy(&pool->arm_lock);
 		pthread_mutex_destroy(&pool->work_lock);
@@ -610,6 +692,7 @@ uint32_t ior_threads_pool_notify(ior_threads_pool *pool)
 	while (p != cached) {
 		ior_work *w = ior_threads_pool_work_alloc(pool);
 		w->sqe = sqes[p & ctx->sq_ring.mask];
+		ior_threads_pool_index_add(pool, w);
 		p++;
 		uint8_t opcode = w->sqe.threads.opcode;
 		/* The caller's timespec is promised only until submit returns, as
@@ -802,6 +885,8 @@ void ior_threads_pool_destroy(ior_threads_pool *pool)
 	pthread_cond_destroy(&pool->drain_cond);
 	pthread_mutex_destroy(&pool->drain_lock);
 	free(pool->drain_done);
+	free(pool->fd_index);
+	free(pool->ud_index);
 	free(pool->work_items);
 	pthread_mutex_destroy(&pool->arm_lock);
 	pthread_mutex_destroy(&pool->work_lock);
@@ -2309,8 +2394,11 @@ static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self)
 	ior_work *done = NULL;
 
 	pthread_mutex_lock(&pool->work_lock);
-	for (uint32_t i = 0; i < pool->work_cap; i++) {
-		ior_work *w = &pool->work_items[i];
+	// Only the items with the cancel's key: by descriptor or by user data.
+	int by_fd = (c->threads.cancel_flags & IOR_CANCEL_BY_FD) != 0;
+	ior_work *w = by_fd ? pool->fd_index[ior_threads_pool_fd_slot(pool, c->threads.fd)]
+						: pool->ud_index[ior_threads_pool_ud_slot(pool, c->threads.addr)];
+	for (; w; w = by_fd ? w->fd_next : w->ud_next) {
 		if (w == self) {
 			continue;
 		}
