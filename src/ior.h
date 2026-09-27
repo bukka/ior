@@ -697,7 +697,13 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *     does for a running request, and the guarded op completes with its own
  *     result once it ends. Its memory stays in use until then.
  *
- * The deadline runs from submit, including any wait for a free worker.
+ * The deadline runs from submit. On the thread backend a work callback, a
+ * signal wait or a process wait heading its chain is ended at the deadline
+ * even while it still waits for a free worker. Any other op (a read, a
+ * write, a send or a receive) only learns whether it can wait without its
+ * worker once one takes it, so one still waiting for a worker at its
+ * deadline is ended then, late: it never starts, completing with
+ * -ECANCELED and this link timeout with -ETIME.
  *
  * A read or write of a pollable descriptor (a socket, a pipe) waiting for
  * readiness is cancelled at the deadline; one of a regular file runs to

@@ -438,6 +438,75 @@ static void test_link_timeout_file_read(void **state)
 	free(content);
 }
 
+#define BUSY_WORKERS 32 // the worker pool's default cap
+
+static int32_t hold_worker_fn(ior_work_token *token, void *arg)
+{
+	(void) token;
+	(void) arg;
+	usleep(300000);
+	return 0;
+}
+
+/*
+ * A read of a regular file still waiting for a worker at its link timeout's
+ * deadline never starts, as a socket op that would park does not: it
+ * completes with -ECANCELED and the timeout with -ETIME once a worker takes
+ * it, and the file is not read.
+ */
+static void test_link_timeout_file_read_queued(void **state)
+{
+	(void) state;
+	enum { SIZE = 1 << 20 };
+	char *content = malloc(SIZE);
+	assert_non_null(content);
+	memset(content, 'f', SIZE);
+	char *path = create_temp_file(content, SIZE);
+	assert_non_null(path);
+	ior_fd_t fd = test_open_fd(path);
+	assert_true(test_fd_is_valid(fd));
+	memset(content, 0, SIZE);
+
+	ior_ctx *ctx = init_threads(64, 128);
+	for (int i = 0; i < BUSY_WORKERS; i++) {
+		ior_sqe *sqe = ior_get_sqe(ctx);
+		assert_non_null(sqe);
+		assert_return_code(ior_prep_work(ctx, sqe, hold_worker_fn, NULL), 0);
+		ior_sqe_set_data(ctx, sqe, (void *) 0x9);
+	}
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_read(ctx, sqe, fd, content, SIZE, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x1);
+	ior_sqe_set_flags(ctx, sqe, IOR_SQE_IO_LINK);
+	sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; // 50 ms
+	ior_prep_link_timeout(ctx, sqe, &ts, 0);
+	ior_sqe_set_data(ctx, sqe, (void *) 0x2);
+	assert_int_equal(ior_submit(ctx), BUSY_WORKERS + 2);
+
+	int32_t res_read = 0, res_lt = 0;
+	for (int i = 0; i < BUSY_WORKERS + 2; i++) {
+		void *tag;
+		int32_t res = reap_one(ctx, &tag, NULL);
+		if (tag == (void *) 0x1) {
+			res_read = res;
+		} else if (tag == (void *) 0x2) {
+			res_lt = res;
+		}
+	}
+	assert_int_equal(res_read, -ECANCELED);
+	assert_int_equal(res_lt, -ETIME);
+	assert_int_equal(content[0], 0); // never read
+
+	ior_queue_exit(ctx);
+	test_close_fd(fd);
+	remove_temp_file(path);
+	free(path);
+	free(content);
+}
+
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
@@ -447,6 +516,7 @@ int main(void)
 		cmocka_unit_test(test_cq_full_multishot_ends),
 		cmocka_unit_test(test_cq_reserve_race),
 		cmocka_unit_test(test_link_timeout_file_read),
+		cmocka_unit_test(test_link_timeout_file_read_queued),
 	};
 
 	return cmocka_run_group_tests(tests, NULL, NULL);

@@ -1363,6 +1363,7 @@ typedef struct ior_threads_pool_lt_arb {
 	ior_work *w; // the guarded op, valid under work_lock while ARMED
 	ior_work *lt;
 	int stoppable; // the op ends once its token is flagged (a signal wait)
+	uint64_t deadline_ns; // when the timer fires
 	_Atomic int state; // IOR_LT_*
 	_Atomic int refs;
 } ior_threads_pool_lt_arb;
@@ -1484,6 +1485,8 @@ static void ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *w, ior
 			? w->deadline_ns
 			: ior_worker_pool_deadline_ns(ts, lt->sqe.threads.timeout_flags);
 
+	arb->deadline_ns = deadline_ns;
+
 	if (ior_worker_pool_arm_timer(
 				pool->wp, deadline_ns, ior_threads_pool_lt_fired, ior_threads_pool_lt_dropped, arb)
 			< 0) {
@@ -1563,6 +1566,30 @@ static uint64_t ior_threads_pool_lt_finish(ior_threads_pool *pool, ior_work *lt,
 	}
 	ior_threads_pool_finish_res(pool, lt, res);
 	return 1;
+}
+
+/*
+ * Claim w for its deadline if that has passed before w started, as the timer
+ * does when it finds w not started (see ior_threads_pool_lt_fired): w then
+ * never starts and completes with -ECANCELED, its link timeout with -ETIME.
+ * For an op armed by the worker that reached it, whose deadline may have
+ * gone by while it waited for a worker: the timer, already due, would
+ * otherwise race the worker, which would usually start the op first.
+ */
+static void ior_threads_pool_lt_arb_expire_due(ior_threads_pool *pool, ior_work *w)
+{
+	ior_threads_pool_lt_arb *arb = w->arb;
+	if (!arb || ior_worker_pool_monotonic_ns() < arb->deadline_ns) {
+		return;
+	}
+	pthread_mutex_lock(&pool->work_lock);
+	int state = atomic_load_explicit(&w->state, memory_order_acquire);
+	if (atomic_load_explicit(&arb->state, memory_order_acquire) == IOR_LT_ARMED
+			&& (state == IOR_WORK_QUEUED || state == IOR_WORK_LINKED)
+			&& atomic_compare_exchange_strong(&w->state, &state, IOR_WORK_CANCELLED)) {
+		atomic_store_explicit(&arb->state, IOR_LT_FIRED, memory_order_release);
+	}
+	pthread_mutex_unlock(&pool->work_lock);
 }
 
 /*
@@ -2004,6 +2031,8 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		 */
 		if (lt && !may_park && !w->arb) {
 			ior_threads_pool_lt_arb_arm(pool, w, lt);
+			// Queued past its deadline, it never starts, as a parked op would not.
+			ior_threads_pool_lt_arb_expire_due(pool, w);
 		}
 		if (ior_threads_pool_enter(w, may_park ? IOR_WORK_TRYING : IOR_WORK_RUNNING) < 0) {
 			memset(&cqe, 0, sizeof(cqe));
