@@ -547,6 +547,12 @@ static void ior_threads_backend_prep_accept(
 	sqe->threads.rw_flags = flags;
 }
 
+static void ior_threads_backend_prep_accept_multishot(ior_sqe *sqe, ior_fd_t fd, unsigned flags)
+{
+	ior_threads_backend_prep_accept(sqe, fd, NULL, NULL, flags);
+	sqe->threads.ioprio = IOR_ACCEPT_MULTISHOT;
+}
+
 static void ior_threads_backend_prep_connect(
 		ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
 {
@@ -713,6 +719,7 @@ const ior_backend_ops ior_threads_ops = {
 	.prep_poll_add = ior_threads_backend_prep_poll_add,
 	.prep_poll_multishot = ior_threads_backend_prep_poll_multishot,
 	.prep_accept = ior_threads_backend_prep_accept,
+	.prep_accept_multishot = ior_threads_backend_prep_accept_multishot,
 	.prep_connect = ior_threads_backend_prep_connect,
 	.prep_cancel = ior_threads_backend_prep_cancel,
 	.prep_cancel_fd = ior_threads_backend_prep_cancel_fd,

@@ -42,6 +42,9 @@ static int ior_threads_pool_timer_valid(const ior_work *work);
 static void ior_threads_pool_finish_op(ior_threads_pool *pool, ior_work *work, const ior_cqe *cqe);
 static void ior_threads_pool_finish_res(ior_threads_pool *pool, ior_work *work, int32_t res);
 static int ior_threads_pool_cancel(ior_threads_pool *pool, ior_work *self);
+static int ior_threads_pool_fd_ready(int fd, short events);
+static int ior_threads_pool_accept(
+		int fd, struct sockaddr *addr, socklen_t *addrlen, unsigned flags);
 static uint64_t ior_threads_pool_lt_deadline(const ior_work *lt);
 static int ior_threads_pool_lt_guards(uint8_t opcode);
 static void ior_threads_pool_lt_arb_arm(ior_threads_pool *pool, ior_work *w, ior_work *lt);
@@ -584,8 +587,91 @@ static uint64_t ior_threads_pool_finish_parked(ior_threads_pool *pool, ior_work 
 	return count;
 }
 
+// A persistent accept (ior_prep_accept_multishot).
+static int ior_threads_pool_accept_multi(const ior_sqe *sqe)
+{
+	return sqe->threads.opcode == IOR_OP_ACCEPT && (sqe->threads.ioprio & IOR_ACCEPT_MULTISHOT);
+}
+
 /*
- * Resolve an op handed off to the poller thread: a poll op, or a
+ * An edge on a multishot accept's listener, on the poller thread (and once
+ * on the worker, before the op is handed over): accept until the backlog is
+ * empty, one completion per connection, flagged IOR_CQE_F_MORE. Returns
+ * non-zero to decline the edge, which ends the op:
+ * on an error (EMFILE, say), kept as the last completion's result, and when
+ * a connection finds the completion queue full, as io_uring ends a multishot
+ * accept then; that descriptor is kept and becomes the last completion,
+ * which the op's item carries on the overflow list (see
+ * ior_threads_pool_accept_last). A listener whose mode could not be taken
+ * over is probed before each accept, since accept(2) would wait on it.
+ */
+static int ior_threads_pool_accept_edge(ior_threads_pool *pool, ior_work *w)
+{
+	const ior_sqe *sqe = &w->sqe;
+	for (;;) {
+		if (w->accept_probe && !ior_threads_pool_fd_ready(sqe->threads.fd, POLLIN)) {
+			return 0;
+		}
+		int nfd = ior_threads_pool_accept(sqe->threads.fd, NULL, NULL, sqe->threads.rw_flags);
+		if (nfd == -EINTR) {
+			continue;
+		}
+		if (nfd == -EAGAIN || nfd == -EWOULDBLOCK) {
+			return 0; // the backlog is empty: wait for the next edge
+		}
+		if (nfd == -ECONNABORTED) {
+			// A connection the peer reset while it was queued, where accept(2)
+			// reports that (FreeBSD documents it; Linux and macOS hand the
+			// dead socket over): nobody's, and no fault of the listener's;
+			// on to the next one.
+			continue;
+		}
+		if (nfd < 0) {
+			w->accept_last = nfd;
+			return 1;
+		}
+		ior_cqe cqe;
+		memset(&cqe, 0, sizeof(cqe));
+		cqe.threads.user_data = sqe->threads.user_data;
+		cqe.threads.res = nfd;
+		cqe.threads.flags = IOR_CQE_F_MORE;
+		if (ior_threads_pool_post(pool, NULL, &cqe) < 0) {
+			w->accept_last = nfd;
+			return 1;
+		}
+		IOR_LOG_TRACE("multishot accept: fd=%d accepted %d", sqe->threads.fd, nfd);
+	}
+}
+
+/*
+ * The last result of a multishot accept, from what the poller ended it with:
+ * the descriptor or error a declined edge kept (the poller reports the
+ * readiness it declined). A cancel or the deadline wins over a kept
+ * descriptor, which is closed: the cancel has promised -ECANCELED, and a
+ * connection is lost only when the completion queue was full at the same
+ * moment. A positive result with nothing kept is a descriptor the poller
+ * found nothing to watch on (not a socket), ended at once: the last result
+ * is one accept attempt's.
+ */
+static int32_t ior_threads_pool_accept_last(ior_work *w, int32_t res)
+{
+	int32_t kept = w->accept_last;
+	w->accept_last = IOR_ACCEPT_LAST_NONE;
+	if (res < 0) {
+		if (kept >= 0) {
+			close(kept);
+		}
+		return res;
+	}
+	if (kept != IOR_ACCEPT_LAST_NONE) {
+		return kept;
+	}
+	return ior_threads_pool_accept(w->sqe.threads.fd, NULL, NULL, w->sqe.threads.rw_flags);
+}
+
+/*
+ * Resolve an op handed off to the poller thread: a poll op, a multishot
+ * accept, or a
  * read/write/send/recv gated on readiness. The chain layout is recovered from
  * the work item itself: an immediately following LINK_TIMEOUT is the guarding
  * pair, anything after belongs to the chain remainder, which resumes on the
@@ -609,6 +695,9 @@ static int ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 	if (more) {
 		if (atomic_load_explicit(&w->state, memory_order_acquire) != IOR_WORK_POLLING) {
 			return 0;
+		}
+		if (ior_threads_pool_accept_multi(&w->sqe)) {
+			return ior_threads_pool_accept_edge(pool, w);
 		}
 		ior_cqe cqe;
 		memset(&cqe, 0, sizeof(cqe));
@@ -634,6 +723,12 @@ static int ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 		close(pidfd);
 	}
 
+	// A multishot accept ends here, whatever the poller ended it with.
+	int accept_multi = ior_threads_pool_accept_multi(&w->sqe);
+	if (accept_multi) {
+		res = ior_threads_pool_accept_last(w, res);
+	}
+
 	/*
 	 * Ready ops resume on a worker. So does a process wait whose watch
 	 * failed (ESRCH for a child that exited meanwhile, say): the worker
@@ -641,7 +736,7 @@ static int ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 	 */
 	int resume = res > 0
 			|| (w->sqe.threads.opcode == IOR_OP_WAITPID && res != -ECANCELED && res != -ETIME);
-	if (resume && w->sqe.threads.opcode != IOR_OP_POLL) {
+	if (resume && w->sqe.threads.opcode != IOR_OP_POLL && !accept_multi) {
 		pthread_mutex_lock(&pool->work_lock);
 		w->ready = 1;
 		int ret = ior_threads_pool_dispatch_locked(pool, w);
@@ -924,6 +1019,8 @@ int ior_threads_pool_notify(ior_threads_pool *pool)
 		w->rw_plain = IOR_RW_NOWAIT;
 		w->connecting = 0;
 		w->pidfd = -1;
+		w->accept_probe = 0;
+		w->accept_last = IOR_ACCEPT_LAST_NONE;
 		if (opcode == IOR_OP_WORK || opcode == IOR_OP_SIGWAIT) {
 			atomic_init(&w->token.cancelled, 0);
 			w->token.shutdown = &pool->wp->shutdown;
@@ -1958,27 +2055,53 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		}
 
 		/*
-		 * Readiness gate: poll ops always wait on the poller. An rw op runs
+		 * Readiness gate: poll ops always wait on the poller, and so does a
+		 * multishot accept, which accepts there at every edge. An rw op runs
 		 * at once and parks below if it would block, which needs a syscall
 		 * that reports rather than waits: a per-call non-blocking form where
 		 * there is one, else the descriptor's own mode, taken over for the
 		 * op's lifetime. Where neither is possible a readiness probe stands
 		 * in, and an unready descriptor is parked without attempting the
-		 * syscall at all.
+		 * syscall at all (a multishot accept probes before each accept).
 		 */
 	retry:;
 		short events = ior_threads_pool_rw_events(&w->sqe);
 		int nowait = ior_threads_pool_rw_nowait(&w->sqe);
+		int accept_multi = ior_threads_pool_accept_multi(&w->sqe);
 		int unready = 0;
 		if (events && !w->ready && ior_threads_pool_rw_needs_mode(w)
 				&& ior_threads_pool_fdmode_acquire(pool, w) < 0) {
-			unready = !ior_threads_pool_fd_ready(w->sqe.threads.fd, events);
+			if (accept_multi) {
+				w->accept_probe = 1;
+			} else {
+				unready = !ior_threads_pool_fd_ready(w->sqe.threads.fd, events);
+			}
 		}
-		int gate = opcode == IOR_OP_POLL || (unready && !nowait);
+		/*
+		 * A multishot accept first accepts what is queued already, here, as
+		 * a one-shot accept tries before it parks: so a descriptor accept(2)
+		 * refuses (not a socket, a socket not listening: -EINVAL) fails the
+		 * op at once instead of parking it on the poller for good, and the
+		 * backlog at submit is reported without a poller round trip. A
+		 * declined pass ends the op as a declined edge would, with what it
+		 * kept, unless a cancel claimed the op meanwhile.
+		 */
+		if (accept_multi && ior_threads_pool_accept_edge(pool, w)) {
+			int claimed = ior_threads_pool_enter(w, IOR_WORK_RUNNING) < 0;
+			int32_t res = ior_threads_pool_accept_last(w, claimed ? -ECANCELED : 1);
+			count += ior_threads_pool_finish_guarded_res(pool, w, lt, res);
+			if (has_link) {
+				cancel = 1; // a failed linked op breaks the chain
+			}
+			w = after;
+			continue;
+		}
+		int gate = opcode == IOR_OP_POLL || accept_multi || (unready && !nowait);
 		if (gate) {
 			uint32_t mask = opcode == IOR_OP_POLL ? w->sqe.threads.poll_events
 												  : (events == POLLIN ? IOR_POLL_IN : IOR_POLL_OUT);
-			if (opcode == IOR_OP_POLL && (w->sqe.threads.len & IOR_POLL_ADD_MULTI)) {
+			if ((opcode == IOR_OP_POLL && (w->sqe.threads.len & IOR_POLL_ADD_MULTI))
+					|| accept_multi) {
 				mask |= IOR_THREADS_POLLER_MULTI;
 			}
 			int ret = ior_threads_pool_hand_to_poller(pool, w, lt, w->sqe.threads.fd, mask);

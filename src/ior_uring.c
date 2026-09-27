@@ -1697,6 +1697,17 @@ static void ior_uring_backend_prep_accept(
 	io_uring_prep_accept(s, (int) fd, addr, addrlen, (int) flags);
 }
 
+/* IORING_ACCEPT_MULTISHOT (5.19): the kernel posts a completion per
+ * connection with IORING_CQE_F_MORE and ends the op, without it, on an error
+ * or when a connection finds the completion queue full. */
+_Static_assert(IOR_ACCEPT_MULTISHOT == IORING_ACCEPT_MULTISHOT, "IOR_ACCEPT_MULTISHOT must match");
+
+static void ior_uring_backend_prep_accept_multishot(ior_sqe *sqe, ior_fd_t fd, unsigned flags)
+{
+	struct io_uring_sqe *s = &sqe->uring.sqe;
+	io_uring_prep_multishot_accept(s, (int) fd, NULL, NULL, (int) flags);
+}
+
 static void ior_uring_backend_prep_connect(
 		ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
 {
@@ -2040,6 +2051,7 @@ const ior_backend_ops ior_uring_ops = {
 	.prep_poll_add = ior_uring_backend_prep_poll_add,
 	.prep_poll_multishot = ior_uring_backend_prep_poll_multishot,
 	.prep_accept = ior_uring_backend_prep_accept,
+	.prep_accept_multishot = ior_uring_backend_prep_accept_multishot,
 	.prep_checked = ior_uring_backend_prep_checked,
 	.prep_connect = ior_uring_backend_prep_connect,
 	.prep_cancel = ior_uring_backend_prep_cancel,

@@ -317,6 +317,16 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
 	}
 }
 
+void ior_prep_accept_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, unsigned flags)
+{
+	if (ctx && sqe) {
+		ctx->ops->prep_accept_multishot(sqe, fd, flags);
+		if (ctx->ops->prep_checked) {
+			ctx->ops->prep_checked(ctx->backend_ctx);
+		}
+	}
+}
+
 void ior_prep_connect(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
 {
