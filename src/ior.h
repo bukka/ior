@@ -691,18 +691,20 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  *   - if the guarded op finishes first, it reports its normal result and this
  *     link timeout completes with res == -ECANCELED;
  *   - if @p ts elapses while the guarded op runs and cannot be stopped (a
- *     work callback, a signal wait blocked in sigwait(3) where there is no
- *     sigtimedwait), this link
+ *     work callback, a read or write of a regular file on a worker, a signal
+ *     wait blocked in sigwait(3) where there is no sigtimedwait), this link
  *     timeout completes at the deadline with res == -EALREADY, as io_uring's
  *     does for a running request, and the guarded op completes with its own
  *     result once it ends. Its memory stays in use until then.
  *
  * The deadline runs from submit, including any wait for a free worker.
  *
- * On the threads backend, cancellation is effective for read/write/send/recv on
- * pollable descriptors (sockets, pipes); a guarded op on a regular file runs to
- * completion uncancelled. If the guarded op is cancelled with ior_prep_cancel()
- * instead, both it and this link timeout complete with -ECANCELED.
+ * A read or write of a pollable descriptor (a socket, a pipe) waiting for
+ * readiness is cancelled at the deadline; one of a regular file runs to
+ * completion, as on io_uring, where a cached read even completes at submit,
+ * before its link timeout is armed. If the guarded op is cancelled with
+ * ior_prep_cancel() instead, both it and this link timeout complete with
+ * -ECANCELED.
  *
  * @p ts is read by the submit that takes the entry, as for ior_prep_timeout().
  *
