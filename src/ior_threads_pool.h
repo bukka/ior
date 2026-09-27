@@ -102,6 +102,16 @@ typedef struct ior_work {
 	struct ior_work *next; // free-list link (scratch link while allocated)
 	struct ior_work *chain; // next op in an IO_LINK chain (NULL at tail)
 	/*
+	 * Cancel lookup while allocated (see ior_threads_pool_index_add): the
+	 * items with this one's user data, and those on its descriptor if the
+	 * op takes one (fd_indexed). Guarded by work_lock.
+	 */
+	struct ior_work *ud_next;
+	struct ior_work *ud_prev;
+	struct ior_work *fd_next;
+	struct ior_work *fd_prev;
+	int fd_indexed;
+	/*
 	 * Fields a worker writes while it owns the op, kept together (and off the
 	 * neighbouring item's SQE) so the submitter's alloc and copy do not share
 	 * cache lines with them.
@@ -155,6 +165,14 @@ struct ior_threads_pool {
 	 */
 	pthread_mutex_t work_lock;
 	ior_work *work_items; // pool array [work_cap]
+	/*
+	 * Allocated items by user data and by descriptor, so a cancel looks at
+	 * the items it may match rather than at every one. index_mask + 1 buckets,
+	 * a power of two at least work_cap. Protected by work_lock.
+	 */
+	ior_work **ud_index;
+	ior_work **fd_index;
+	uint32_t index_mask;
 
 	/*
 	 * Serializes arming a timer op (with the worker's post-arm cancel check)
