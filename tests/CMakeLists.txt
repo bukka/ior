@@ -90,6 +90,16 @@ if(NOT WIN32)
             )
         endif()
     endforeach()
+
+    # Forking a multi-threaded process is slow under TSan: test_fork forks a
+    # hundred times while ior's threads run, which takes about 30 s there.
+    # Each child has an alarm of its own, so a hang still fails it.
+    if(IOR_ENABLE_TSAN)
+        set_tests_properties(test_fork PROPERTIES TIMEOUT 120)
+        if(IOR_HAVE_URING AND IOR_HAVE_THREADS)
+            set_tests_properties(test_fork_threads PROPERTIES TIMEOUT 120)
+        endif()
+    endif()
 endif()
 
 # Thread backend tests (only if thread backend is compiled)
