@@ -23,7 +23,10 @@ The goal is to provide maximum performance on platforms with native async I/O su
   `IOR_CQE_F_MORE`, until cancelled - `IORING_ACCEPT_MULTISHOT` on io_uring,
   an edge-triggered watch of the listener on the thread pool's poller, which
   accepts until `EAGAIN` at every edge, a few AcceptEx kept outstanding on
-  Windows
+  Windows; an accept's completion carries `IOR_CQE_F_SOCK_NONEMPTY` when
+  another connection is queued behind it (io_uring from Linux 6.10, a
+  zero-timeout poll elsewhere), and on io_uring a receive's when more data
+  waits
 - Timer/timeout operations, relative or absolute on the monotonic, boot-time
   or wall clock (`IOR_TIMEOUT_ABS`, `IOR_TIMEOUT_BOOTTIME`,
   `IOR_TIMEOUT_REALTIME`); the timespec is copied at submit on every backend

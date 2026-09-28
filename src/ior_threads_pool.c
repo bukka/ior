@@ -594,6 +594,22 @@ static int ior_threads_pool_accept_multi(const ior_sqe *sqe)
 }
 
 /*
+ * IOR_CQE_F_SOCK_NONEMPTY for an accept's completion: another connection is
+ * queued if the listener still reads ready. One poll(2) with no wait per
+ * accepted connection, which io_uring gets for free from the protocol
+ * (Linux 6.10); an error counts as nothing queued, the hint being optional.
+ */
+static uint32_t ior_threads_pool_accept_nonempty(int fd)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	int pret;
+	do {
+		pret = poll(&pfd, 1, 0);
+	} while (pret < 0 && errno == EINTR);
+	return pret > 0 && (pfd.revents & POLLIN) ? IOR_CQE_F_SOCK_NONEMPTY : 0;
+}
+
+/*
  * An edge on a multishot accept's listener, on the poller thread (and once
  * on the worker, before the op is handed over): accept until the backlog is
  * empty, one completion per connection, flagged IOR_CQE_F_MORE. Returns
@@ -634,7 +650,7 @@ static int ior_threads_pool_accept_edge(ior_threads_pool *pool, ior_work *w)
 		memset(&cqe, 0, sizeof(cqe));
 		cqe.threads.user_data = sqe->threads.user_data;
 		cqe.threads.res = nfd;
-		cqe.threads.flags = IOR_CQE_F_MORE;
+		cqe.threads.flags = IOR_CQE_F_MORE | ior_threads_pool_accept_nonempty(sqe->threads.fd);
 		if (ior_threads_pool_post(pool, NULL, &cqe) < 0) {
 			w->accept_last = nfd;
 			return 1;
@@ -2493,6 +2509,9 @@ static void ior_threads_pool_process_single_sqe(
 			cqe->threads.res = ior_threads_pool_accept(sqe->threads.fd,
 					(struct sockaddr *) (uintptr_t) sqe->threads.addr,
 					(socklen_t *) (uintptr_t) sqe->threads.off, sqe->threads.rw_flags);
+			if (cqe->threads.res >= 0) {
+				cqe->threads.flags = ior_threads_pool_accept_nonempty(sqe->threads.fd);
+			}
 			IOR_LOG_TRACE("accept end: res=%d", cqe->threads.res);
 			break;
 		}

@@ -280,6 +280,18 @@ typedef struct ior_timespec {
  *  accept (ior_prep_accept_multishot) one per connection, and stays armed.
  *  A completion without this bit is the operation's last. */
 #define IOR_CQE_F_MORE (1U << 1)
+/** The socket has more waiting after this completion: another connection
+ *  queued on the listener behind an accept (ior_prep_accept(),
+ *  ior_prep_accept_multishot()), more data to read behind a receive
+ *  (ior_prep_recv()). A hint, never a promise: it is set where the backend
+ *  can tell at no great cost, and a completion without it says nothing.
+ *  Accept: io_uring from Linux 6.10, the thread backend (a zero-timeout
+ *  poll of the listener after each accept), IOCP for a one-shot accept
+ *  (WSAPoll, likewise); a multishot accept's connections on IOCP never
+ *  carry it, its outstanding AcceptEx taking what is queued. Receive:
+ *  io_uring only (IORING_CQE_F_SOCK_NONEMPTY, Linux 5.19). Lets a caller
+ *  accept or read again at once instead of waiting for -EAGAIN. */
+#define IOR_CQE_F_SOCK_NONEMPTY (1U << 2)
 /** @} */
 
 /** Asynchronous I/O backend implementation. */
@@ -775,6 +787,9 @@ void ior_prep_recv(
  * else puts it in non-blocking mode: accepted without the flag, it is a
  * blocking descriptor the backend will take at its word.
  *
+ * IOR_CQE_F_SOCK_NONEMPTY among the completion's flags says another
+ * connection is queued already (a hint; see the flag).
+ *
  * @param ctx      I/O context.
  * @param sqe      Entry from ior_get_sqe().
  * @param fd       Listening socket.
@@ -803,7 +818,9 @@ void ior_prep_accept(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, struct sockaddr *a
  *
  * Connections accepted before the last completion still arrive, with
  * IOR_CQE_F_MORE, ahead of it: reap until the completion without the flag,
- * and close what you do not want. On io_uring and the thread backend the
+ * and close what you do not want; one may carry IOR_CQE_F_SOCK_NONEMPTY,
+ * another connection being queued behind it (a hint; see the flag). On
+ * io_uring and the thread backend the
  * operation also ends on its own when a connection finds the completion
  * queue full: that connection is its last completion, with the socket as
  * res (>= 0) and no IOR_CQE_F_MORE, as io_uring ends a multishot accept.

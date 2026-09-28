@@ -126,6 +126,7 @@ typedef struct ior_iocp_op {
 	uint32_t poll_mask;
 	bool poll_multi;
 	bool cqe_more;
+	bool cqe_nonempty; // IOR_CQE_F_SOCK_NONEMPTY: a one-shot accept found more queued
 	bool poll_held;
 	_Atomic uint32_t poll_rearm;
 	struct ior_iocp_op *poll_parent;
@@ -748,6 +749,7 @@ static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
 	op->poll_mask = 0;
 	op->poll_multi = false;
 	op->cqe_more = false;
+	op->cqe_nonempty = false;
 	op->poll_held = false;
 	atomic_store(&op->poll_rearm, 0);
 	op->poll_parent = NULL;
@@ -1663,6 +1665,15 @@ static void finish_socket_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 					memcpy(op->sa, ra, (size_t) n);
 				}
 				*op->sa_len = (socklen_t) ra_len;
+			}
+			if (op->error_code == ERROR_SUCCESS && !op->poll_parent) {
+				// IOR_CQE_F_SOCK_NONEMPTY for a one-shot accept: the listener
+				// reads ready while a connection is queued (a poll with no
+				// wait; an error counts as nothing queued, the hint being
+				// optional). Not for a multishot's child: its siblings take
+				// what is queued as it arrives.
+				WSAPOLLFD pfd = { .fd = ls, .events = POLLRDNORM };
+				op->cqe_nonempty = WSAPoll(&pfd, 1, 0) > 0 && (pfd.revents & POLLRDNORM);
 			}
 		}
 		if (op->error_code != ERROR_SUCCESS) {
@@ -2593,7 +2604,8 @@ static int issue_poll(ior_ctx_iocp *ctx, ior_iocp_op *op)
 static void op_to_cqe(ior_iocp_op *op)
 {
 	op->cqe.iocp.user_data = op->user_data;
-	op->cqe.iocp.flags = op->cqe_more ? IOR_CQE_F_MORE : 0;
+	op->cqe.iocp.flags = (op->cqe_more ? IOR_CQE_F_MORE : 0)
+			| (op->cqe_nonempty ? IOR_CQE_F_SOCK_NONEMPTY : 0);
 
 	if (op->submit_res) {
 		op->cqe.iocp.res = op->submit_res;
