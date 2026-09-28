@@ -295,6 +295,21 @@ int bench_make_tcp_socket(ior_fd_t *fd)
 	return 0;
 }
 
+int bench_connect(ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	int ret;
+	do {
+		ret = connect(fd, addr, addrlen);
+	} while (ret < 0 && errno == EINTR);
+	return ret < 0 ? -errno : 0;
+}
+
+void bench_sleep_us(uint32_t us)
+{
+	struct timespec ts = { .tv_sec = us / 1000000, .tv_nsec = (long) (us % 1000000) * 1000 };
+	while (nanosleep(&ts, &ts) < 0 && errno == EINTR) { }
+}
+
 const char *bench_default_workspace(void)
 {
 	return "/tmp/ior";

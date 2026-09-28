@@ -217,6 +217,19 @@ int bench_fd_is_valid(ior_fd_t fd)
 	return fd != NULL && fd != INVALID_HANDLE_VALUE;
 }
 
+int bench_connect(ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	if (connect((SOCKET) fd, addr, (int) addrlen) == SOCKET_ERROR) {
+		return -EIO;
+	}
+	return 0;
+}
+
+void bench_sleep_us(uint32_t us)
+{
+	Sleep((us + 999) / 1000);
+}
+
 int bench_wait_readable(ior_fd_t fd, int timeout_ms)
 {
 	WSAPOLLFD pfd = { .fd = (SOCKET) fd, .events = POLLRDNORM };

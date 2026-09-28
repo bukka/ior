@@ -93,6 +93,16 @@ int bench_make_listener(ior_fd_t *fd, struct sockaddr_storage *addr, socklen_t *
 int bench_make_tcp_socket(ior_fd_t *fd);
 
 /*
+ * Connect a socket from bench_make_tcp_socket() to addr, blocking: on
+ * loopback the handshake is done when it returns. Returns 0 or a negative
+ * errno-style code.
+ */
+int bench_connect(ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen);
+
+/* Sleep for about us microseconds (Windows rounds up to a millisecond). */
+void bench_sleep_us(uint32_t us);
+
+/*
  * Close a connected socket with a reset (SO_LINGER, zero timeout) so it leaves
  * no TIME_WAIT behind: connection churn would otherwise exhaust the ephemeral
  * port range within seconds.

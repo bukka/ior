@@ -27,7 +27,9 @@ typedef int (*scenario_fn)(const bench_options *, bench_metrics *, const char **
 
 static void usage(const char *prog)
 {
-	printf("Usage: %s <socket|file|mixed|work|cancel|connect|sigwait|poll|all> [options]\n", prog);
+	printf("Usage: %s <socket|file|mixed|work|cancel|connect|sigwait|poll|accept|all> "
+		   "[options]\n",
+			prog);
 	printf("       %s --smoke\n\n", prog);
 	printf("Scenarios:\n");
 	printf("  socket   real loopback TCP request/response (PHP-style guarded recv)\n");
@@ -40,21 +42,29 @@ static void usage(const char *prog)
 	printf("           optionally cancelled under way (POSIX only)\n");
 	printf("  poll     readiness-driven receive: a multishot poll per connection, recvs\n");
 	printf("           issued on its edges, the polls cancelled at the end\n");
+	printf("  accept   a multishot accept fed bursts of connections, reaped once per\n");
+	printf("           pass into a capped buffer: arrival-to-reap latency per connection\n");
 	printf("  all      run socket (none+linked), file, mixed, work (none+linked), cancel,\n");
-	printf("           connect, sigwait (none+linked) and poll (none+linked)\n\n");
+	printf("           connect, sigwait (none+linked), poll (none+linked) and accept\n\n");
 	printf("Run length (default: --duration 2.0):\n");
 	printf("  --duration SEC     run each scenario for SEC seconds\n");
 	printf("  --ops N            instead, stop after N completed units of work\n\n");
 	printf("Workload:\n");
 	printf("  --conns N          socket/cancel/connect/poll: concurrent connections (default "
-		   "64)\n");
+		   "64);\n");
+	printf("                     accept: connections per burst\n");
 	printf("  --files N          file/mixed: number of files (default 8/4)\n");
 	printf("  --depth N          file/mixed/work/sigwait: operations in flight (default\n");
-	printf("                     32/64/64/8)\n");
+	printf("                     32/64/64/8); accept: buffer cap past which the multishot\n");
+	printf("                     is cancelled, re-armed below half (default 32, 0 = none)\n");
 	printf("  --msg-size B       socket/cancel/poll: payload bytes per direction (default 256)\n");
 	printf("  --block-size B     file/mixed: bytes per read/write (default 4096)\n");
 	printf("  --file-size B      file/mixed: size of each temp file (default 16MiB)\n");
-	printf("  --work-us U        work: CPU spin per callback in microseconds (default 5)\n");
+	printf("  --work-us U        work: CPU spin per callback in microseconds (default 5);\n");
+	printf("                     accept: a pass between reaps in microseconds (default 5,\n");
+	printf("                     0 = reap as soon as anything completes)\n");
+	printf("  --takes N          accept: connections taken from the buffer per pass\n");
+	printf("                     (default 0 = all)\n");
 	printf("  --timer none|linked  socket/work/sigwait/poll: guard ops with a linked timeout\n");
 	printf("                     (default none)\n");
 	printf("  --timeout-ms M     socket/work/sigwait/poll: guard timeout in ms (default 5000)\n");
@@ -99,6 +109,7 @@ static void defaults(bench_options *o)
 	o->notify = 0;
 	o->waits = 0;
 	o->sigwaits = 0;
+	o->takes = 0;
 }
 
 /* Run one scenario, print results, and return the number of correctness errors
@@ -225,6 +236,16 @@ static int run_smoke(void)
 	o.timer_mode = BENCH_TIMER_LINKED;
 	errors += run_one(bench_run_poll, "poll", "timer=linked", &o, 0);
 
+	/* accept: bursts into a multishot accept, the buffer capped so the
+	 * multishot is cancelled and re-armed under way */
+	defaults(&o);
+	o.conns = 64;
+	o.depth = 16;
+	o.takes = 8;
+	o.ops = 512;
+	o.duration_s = 0;
+	errors += run_one(bench_run_accept, "accept", "cap=16 takes=8", &o, 0);
+
 	printf("\nsmoke result: %s (errors=%llu)\n", errors ? "FAIL" : "PASS",
 			(unsigned long long) errors);
 	return errors ? 1 : 0;
@@ -290,6 +311,8 @@ int main(int argc, char **argv)
 			o.waits = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--sigwaits") == 0) {
 			o.sigwaits = (uint32_t) parse_u64(NEXT());
+		} else if (strcmp(a, "--takes") == 0) {
+			o.takes = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--sq-entries") == 0) {
 			o.sq_entries = (uint32_t) parse_u64(NEXT());
 		} else if (strcmp(a, "--workspace") == 0) {
@@ -365,6 +388,11 @@ int main(int argc, char **argv)
 	} else if (strcmp(scenario, "poll") == 0) {
 		const char *label = o.timer_mode == BENCH_TIMER_LINKED ? "timer=linked" : "timer=none";
 		errors = run_one(bench_run_poll, "poll", label, &o, csv);
+	} else if (strcmp(scenario, "accept") == 0) {
+		char label[64];
+		snprintf(label, sizeof(label), "burst=%u cap=%u takes=%u pass=%uus", o.conns, o.depth,
+				o.takes, o.work_us);
+		errors = run_one(bench_run_accept, "accept", label, &o, csv);
 	} else if (strcmp(scenario, "all") == 0) {
 		bench_options so = o;
 		so.timer_mode = BENCH_TIMER_NONE;
@@ -392,6 +420,7 @@ int main(int argc, char **argv)
 		errors += run_one(bench_run_poll, "poll", "timer=none", &so, csv);
 		so.timer_mode = BENCH_TIMER_LINKED;
 		errors += run_one(bench_run_poll, "poll", "timer=linked", &so, csv);
+		errors += run_one(bench_run_accept, "accept", NULL, &o, csv);
 	} else {
 		fprintf(stderr, "unknown scenario: %s\n", scenario);
 		usage(argv[0]);

@@ -36,7 +36,10 @@ typedef struct bench_options {
 	uint32_t msg_size; /* socket/mixed payload size in bytes */
 	uint64_t file_size; /* file scenario: size of each temp file */
 	uint32_t block_size; /* file scenario: bytes per read/write op */
-	uint32_t work_us; /* work scenario: CPU spin per callback, microseconds */
+	uint32_t work_us; /* work scenario: CPU spin per callback, microseconds;
+						 accept scenario: length of a pass between reaps */
+	uint32_t takes; /* accept scenario: connections taken from the buffer per
+					   pass (0 = all) */
 
 	bench_timer_mode timer_mode; /* socket/work scenario timer guard */
 	uint32_t timeout_ms; /* guard timeout (generous; firing is an error) */
@@ -86,6 +89,7 @@ int bench_run_cancel(const bench_options *opts, bench_metrics *m, const char **b
 int bench_run_connect(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_sigwait(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 int bench_run_poll(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
+int bench_run_accept(const bench_options *opts, bench_metrics *m, const char **backend_name_out);
 
 #ifdef __cplusplus
 }
