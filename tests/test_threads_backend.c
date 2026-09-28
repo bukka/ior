@@ -382,10 +382,12 @@ static void test_cq_reserve_race(void **state)
  * io-wq request does, so its link timeout cannot cancel it: the timeout
  * completes at the deadline with -EALREADY and the read with all it read.
  * Should the read not have started by the deadline, it never does
- * (-ECANCELED) and the timeout reports -ETIME. The timeout never waits for
- * the read to report it was first (-ECANCELED). (io_uring reads a cached
- * file inline at submit, before its link timeout is armed, hence a thread
- * backend test.)
+ * (-ECANCELED) and the timeout reports -ETIME. A read that is done before
+ * the timer thread reaches the deadline (a fast page cache, a late wakeup
+ * on a loaded runner) cancels the timeout instead (-ECANCELED), as any
+ * guarded op that finishes first does; that run then says nothing about
+ * the -EALREADY path. (io_uring reads a cached file inline at submit,
+ * before its link timeout is armed, hence a thread backend test.)
  */
 static void test_link_timeout_file_read(void **state)
 {
@@ -426,6 +428,8 @@ static void test_link_timeout_file_read(void **state)
 	}
 	if (res_lt == -ETIME) {
 		assert_int_equal(res_read, -ECANCELED);
+	} else if (res_lt == -ECANCELED) {
+		assert_int_equal(res_read, SIZE); // the read outran the timer
 	} else {
 		assert_int_equal(res_lt, -EALREADY);
 		assert_int_equal(res_read, SIZE);
