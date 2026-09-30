@@ -644,6 +644,52 @@ static void test_waitpid_stopped_continued(void **state)
 	collect(k, status, WCONTINUED);
 }
 
+/*
+ * A stopped child is nothing to a wait that did not ask (no WUNTRACED): a
+ * wait for it stays pending, and a wait for any child or for its group
+ * reports an exited sibling instead, even the older one behind it on the
+ * kernel's list. macOS's waitid reports a stopped child whatever is asked,
+ * and would hand it out in place of the sibling; ior must not.
+ */
+static void test_waitpid_any_stopped(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+	int32_t res[MAX_TAG];
+	int status[3] = { -1, -1, -1 };
+	memset(res, 0, sizeof(res));
+
+	kid *e = spawn_child(s, 6, 300);
+	kid *k = spawn_child(s, 0, 5000); // newer: ahead of e on the kernel's list
+	assert_return_code(setpgid(k->pid, k->pid), 0);
+	assert_return_code(setpgid(e->pid, k->pid), 0);
+	kill(k->pid, SIGSTOP);
+	sleep_ms(400); // e has exited, k is stopped with its stop uncollected
+
+	submit_wait(s, k->pid, &status[0], 0, TAG_WAIT, 0);
+	submit_wait(s, -1, &status[1], 0, TAG_WAIT2, 0);
+	submit_wait(s, -k->pid, &status[2], 0, TAG_TMO, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 2, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT2], (int32_t) e->pid);
+	assert_int_equal(res[(uintptr_t) TAG_TMO], (int32_t) e->pid);
+	assert_int_equal(status[2], status[1]);
+	check_reported(s, res[(uintptr_t) TAG_WAIT2], status[1]);
+
+	// The wait on the stopped child itself has nothing to report...
+	ior_cqe *cqe = NULL;
+	ior_timespec to = { .tv_sec = 0, .tv_nsec = 200 * 1000000L };
+	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
+	assert_int_equal(status[0], -1);
+
+	// ...until the child is gone.
+	kill(k->pid, SIGKILL);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
+	assert_true(WIFSIGNALED(status[0]));
+	assert_int_equal(WTERMSIG(status[0]), SIGKILL);
+	collect(k, status[0], 0);
+}
+
 /* A wait for a process group reports the child that leads it. */
 static void test_waitpid_group(void **state)
 {
@@ -714,6 +760,7 @@ int main(int argc, char **argv)
 		cmocka_unit_test_setup_teardown(test_waitpid_any_cancel, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_link_timeout_unwatched, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_stopped_continued, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_any_stopped, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_group, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any_at_exit, setup_wp, teardown_wp),
 #endif

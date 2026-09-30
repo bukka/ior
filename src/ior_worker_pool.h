@@ -167,6 +167,9 @@ uint64_t ior_worker_pool_monotonic_ns(void);
  * changed, with its waitpid(2) status rebuilt in *status (if non-NULL), 0
  * when nothing has, or -errno (-ECHILD for no such child). The child stays
  * waitable, so the same probe reports it again until the caller collects it.
+ * A stop or continue the options did not ask for is not reported (macOS's
+ * waitid reports stopped children unasked), and does not hide an exited
+ * sibling from a wait for any child or a group.
  */
 int32_t ior_waitpid_probe(pid_t pid, int *status, int options);
 
