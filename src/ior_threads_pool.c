@@ -748,7 +748,7 @@ static int ior_threads_pool_poll_done(void *owner, void *req, int res, int more)
 	/*
 	 * Ready ops resume on a worker. So does a process wait whose watch
 	 * failed (ESRCH for a child that exited meanwhile, say): the worker
-	 * collects the state, or probes for it from the timer.
+	 * reads the state, or probes for it from the timer.
 	 */
 	int resume = res > 0
 			|| (w->sqe.threads.opcode == IOR_OP_WAITPID && res != -ECANCELED && res != -ETIME);
@@ -1816,11 +1816,11 @@ static int ior_threads_pool_probe_arm(ior_threads_pool *pool, ior_work *w)
 }
 
 /*
- * Timer side of a probed process wait. waitpid(WNOHANG) cannot block; with
- * nothing to report the wait goes back on the timer, at an interval that
- * doubles up to IOR_WAITPID_PROBE_MAX_NS and never past its link timeout's
- * deadline, which ends it as the poller's would. A cancel that claimed it
- * (0), or came during the probe (-EALREADY), ends it unreaped.
+ * Timer side of a probed process wait. The probe cannot block and collects
+ * nothing; with nothing to report the wait goes back on the timer, at an
+ * interval that doubles up to IOR_WAITPID_PROBE_MAX_NS and never past its
+ * link timeout's deadline, which ends it as the poller's would. A cancel
+ * that claimed it (0), or came during the probe (-EALREADY), ends it.
  */
 static void ior_threads_pool_probe_fired(void *owner, void *arg)
 {
@@ -1833,11 +1833,7 @@ static void ior_threads_pool_probe_fired(void *owner, void *arg)
 		pid_t pid = (pid_t) (int64_t) w->sqe.threads.off;
 		int *status = (int *) (uintptr_t) w->sqe.threads.addr;
 		int options = (int) w->sqe.threads.len;
-		pid_t r;
-		do {
-			r = waitpid(pid, status, options | WNOHANG);
-		} while (r < 0 && errno == EINTR);
-		res = r < 0 ? -errno : r;
+		res = ior_waitpid_probe(pid, status, options);
 		if (res == 0) {
 			if (w->deadline_ns && ior_worker_pool_monotonic_ns() >= w->deadline_ns) {
 				res = -ETIME;
@@ -1857,15 +1853,16 @@ static void ior_threads_pool_probe_fired(void *owner, void *arg)
 }
 
 /*
- * One pass of a WAITPID op on a worker, entered as TRYING. It first asks
- * waitpid(2) without waiting, which also answers WNOHANG. If nothing has
- * changed yet, a single child is watched without a thread and the op parks
- * on the poller (*parked), coming back here with w->ready once the child
- * exited so the state can be collected. What the platform cannot watch (any
- * child, a process group, stop and continue reports, no pidfd) or a watch
- * that failed to deliver parks on the timer instead, which probes it (see
- * ior_threads_pool_probe_fired): no worker waits, a cancel takes it back
- * without reaping, and teardown does not wait for the child.
+ * One pass of a WAITPID op on a worker, entered as TRYING. It first probes
+ * without waiting (waitid with WNOWAIT, so the child is never collected),
+ * which also answers WNOHANG. If nothing has changed yet, a single child is
+ * watched without a thread and the op parks on the poller (*parked), coming
+ * back here with w->ready once the child exited so its state can be read.
+ * What the platform cannot watch (any child, a process group, stop and
+ * continue reports, no pidfd) or a watch that failed to deliver parks on
+ * the timer instead, which probes it (see ior_threads_pool_probe_fired): no
+ * worker waits, a cancel takes it back, and teardown does not wait for the
+ * child.
  */
 static int32_t ior_threads_pool_waitpid(
 		ior_threads_pool *pool, ior_work *w, ior_work *lt, int *parked)
@@ -1874,9 +1871,9 @@ static int32_t ior_threads_pool_waitpid(
 	int *status = (int *) (uintptr_t) w->sqe.threads.addr;
 	int options = (int) w->sqe.threads.len;
 
-	pid_t r = waitpid(pid, status, options | WNOHANG);
+	int32_t r = ior_waitpid_probe(pid, status, options);
 	if (r != 0 || (options & WNOHANG)) {
-		return r < 0 ? -errno : r;
+		return r;
 	}
 	if (!w->ready && pid > 0 && options == 0) {
 		int ret = ior_threads_pool_watch_proc(pool, w, lt, pid);
@@ -2017,7 +2014,7 @@ static void ior_threads_pool_process_chain(ior_threads_pool *pool, ior_work *hea
 		// work items and may hand them to another thread).
 		ior_work *after = lt ? lt->chain : next;
 
-		// A process wait: collect, park on the poller, or probe from the timer.
+		// A process wait: probe, park on the poller, or probe from the timer.
 		if (opcode == IOR_OP_WAITPID) {
 			// Resumed by the poller: the deadline was handed over to it.
 			if (lt && !w->arb && !w->ready) {

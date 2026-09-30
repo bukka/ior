@@ -145,7 +145,7 @@ typedef struct ior_timespec {
 /** Cancel a submitted operation (ior_prep_cancel, ior_prep_cancel_fd). */
 #define IOR_OP_ASYNC_CANCEL 14
 /** Wait for a process state change (ior_prep_waitpid); completes with its
- *  pid. */
+ *  pid, the process left for the caller to collect. */
 #define IOR_OP_WAITPID 15
 /** Wait for a signal (ior_prep_sigwait); completes with its number. */
 #define IOR_OP_SIGWAIT 16
@@ -875,35 +875,46 @@ void ior_prep_connect(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, const struct sockaddr *addr, socklen_t addrlen);
 
 /**
- * Prepare a wait for a process state change (like waitpid(2)).
+ * Prepare a wait for a process state change (like waitpid(2) with WNOWAIT).
  *
  * Completes with the pid of the process whose state changed as res (> 0),
  * its wait status stored in @p status (if non-NULL) as waitpid(2) stores it,
  * or a negative errno: -ECHILD when @p pid is not a child of the caller (or
- * was reaped already), -ECANCELED when cancelled. With WNOHANG in
+ * was collected already), -ECANCELED when cancelled. With WNOHANG in
  * @p options the op never waits and completes with 0 when nothing has
- * changed. The process is reaped by ior, so it competes with any waitpid(2)
- * the caller runs and with WAITPID ops on -1, as waitpid calls do among
- * themselves.
+ * changed.
+ *
+ * ior never collects the process: the completion reports a child that is
+ * waitable, and it stays so until the caller collects it, with
+ * waitpid(WNOHANG) for the reported pid and the options it asked with, or
+ * a wait of its own. Until then every wait that covers the child reports
+ * it again, so two waits on it both complete, and a caller whose collect
+ * finds it gone (-ECHILD or 0: another waiter took it) resubmits. A
+ * completion nobody acts on, a cancelled or timed out op, and
+ * ior_queue_exit() all leave the child as it is, and no pid is freed for
+ * reuse until the caller collects it.
  *
  * No wait occupies a thread, whatever it asks for: a cancel takes it back
- * without reaping anything (0, the op -ECANCELED), a link timeout ends it at
- * its deadline the same way, and ior_queue_exit() does not wait for the
- * child. io_uring asks the kernel (IORING_OP_WAITID, Linux 6.7). Elsewhere a
- * wait for one child (@p pid > 0, no options) is watched: a pidfd poll on
- * io_uring, the thread backend's poller (a pidfd on Linux, EVFILT_PROC on
- * kqueue), a wait on the process handle on IOCP. Every other request (-1
- * for any child, a process group, WUNTRACED or WCONTINUED, or a platform
- * without a process watch) is probed with waitpid(WNOHANG) from a timer,
+ * (0, the op -ECANCELED), a link timeout ends it at its deadline the same
+ * way, and ior_queue_exit() does not wait for the child. io_uring asks the
+ * kernel (IORING_OP_WAITID with WNOWAIT, Linux 6.7). Elsewhere a wait for
+ * one child (@p pid > 0, no options) is watched: a pidfd poll on io_uring,
+ * the thread backend's poller (a pidfd on Linux, EVFILT_PROC on kqueue), a
+ * wait on the process handle on IOCP. Every other request (-1 for any
+ * child, a process group, WUNTRACED or WCONTINUED, or a platform without a
+ * process watch) is probed with waitid(WNOHANG | WNOWAIT) from a timer,
  * first at once and then at intervals doubling from 1 ms to 20 ms, so it
- * sees a change up to that much later than waitpid(2) would.
+ * sees a change up to that much later than waitpid(2) would. A stop or
+ * continue report is pending the same way until a wait with WUNTRACED or
+ * WCONTINUED collects it.
  *
  * Windows accepts only @p pid > 0 (-ENOTSUP otherwise), ignores @p options
  * and stores the exit code in @p status. Any process can be waited for
- * there, not only a child; -ECHILD means no such process. The op opens the
- * process by id when submitted, so keep a handle to it open until the
- * completion arrives: once a process has exited and its last handle is
- * closed, its id may be given to another process.
+ * there, not only a child; -ECHILD means no such process. There is nothing
+ * to collect: the op opens the process by id when submitted, so keep a
+ * handle to it open until the completion arrives, since once a process has
+ * exited and its last handle is closed, its id may be given to another
+ * process.
  *
  * @param ctx      I/O context.
  * @param sqe      Entry from ior_get_sqe().

@@ -192,6 +192,9 @@ static void test_forget_after_fork(void **state)
 	}
 	assert_true(WIFEXITED(status));
 	assert_int_equal(WEXITSTATUS(status), 5);
+	// Reported, not collected: the child is still ours to collect.
+	assert_int_equal(waitpid(kid, &status, WNOHANG), kid);
+	assert_int_equal(WEXITSTATUS(status), 5);
 
 	ior_queue_exit(ctx);
 	pthread_sigmask(SIG_SETMASK, &saved, NULL);

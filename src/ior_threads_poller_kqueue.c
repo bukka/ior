@@ -402,7 +402,7 @@ static void ior_poller_node_sync(
 	if (node->proc) {
 		/* One NOTE_EXIT registration serves every request on the pid. A
 		 * process that is already gone (ESRCH) fails them all; the owner
-		 * collects its state with waitpid. */
+		 * reads its state with waitid. */
 		struct kevent kev;
 		if (node->reqs && !(node->reg & IOR_THREADS_POLLER_PROC)) {
 			EV_SET(&kev, node->fd, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, node);

@@ -11,6 +11,10 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <limits.h>
+#include <string.h>
 
 static void *ior_worker_pool_worker_thread_func(void *arg);
 static void *ior_worker_pool_timer_thread_func(void *arg);
@@ -39,6 +43,70 @@ static uint64_t ior_worker_pool_clock_ns(clockid_t clock)
 	struct timespec ts;
 	clock_gettime(clock, &ts);
 	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+int ior_wait_status_from_siginfo(const siginfo_t *si)
+{
+	switch (si->si_code) {
+		case CLD_EXITED:
+			return (si->si_status & 0xff) << 8;
+		case CLD_KILLED:
+			return si->si_status & 0x7f;
+		case CLD_DUMPED:
+			return (si->si_status & 0x7f) | 0x80;
+		case CLD_STOPPED:
+		case CLD_TRAPPED:
+			return ((si->si_status & 0xff) << 8) | 0x7f;
+		case CLD_CONTINUED:
+			/* No portable macro builds it: what WIFCONTINUED tests for. */
+#if defined(__linux__) || defined(__NetBSD__)
+			return 0xffff;
+#elif defined(__APPLE__)
+			return (SIGCONT << 8) | 0x7f;
+#else
+			return 0x13;
+#endif
+		default:
+			return 0;
+	}
+}
+
+int32_t ior_waitpid_probe(pid_t pid, int *status, int options)
+{
+	if (pid == INT_MIN) {
+		return -ECHILD; // no group has that id
+	}
+	idtype_t idtype = pid > 0 ? P_PID : pid == -1 ? P_ALL : P_PGID;
+	id_t id = pid > 0 ? (id_t) pid : pid < -1 ? (id_t) -pid : (id_t) getpgrp();
+	/* waitpid's options as waitid's (WUNTRACED and WSTOPPED differ on
+	 * some platforms); what is neither goes through as is on Linux
+	 * (__WALL, __WCLONE, __WNOTHREAD). */
+	int wo = WEXITED | WNOHANG | WNOWAIT;
+	if (options & WUNTRACED) {
+		wo |= WSTOPPED;
+	}
+	if (options & WCONTINUED) {
+		wo |= WCONTINUED;
+	}
+#ifdef __linux__
+	wo |= options & ~(WNOHANG | WUNTRACED | WCONTINUED);
+#endif
+	siginfo_t si;
+	memset(&si, 0, sizeof(si)); // si_pid is unspecified when nothing changed
+	int r;
+	do {
+		r = waitid(idtype, id, &si, wo);
+	} while (r < 0 && errno == EINTR);
+	if (r < 0) {
+		return -errno;
+	}
+	if (si.si_pid == 0) {
+		return 0;
+	}
+	if (status) {
+		*status = ior_wait_status_from_siginfo(&si);
+	}
+	return (int32_t) si.si_pid;
 }
 
 uint64_t ior_worker_pool_monotonic_ns(void)

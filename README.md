@@ -40,7 +40,8 @@ The goal is to provide maximum performance on platforms with native async I/O su
   6.7, else a pidfd poll), a parked op on the thread pool's poller (pidfd or
   `EVFILT_PROC`), a threadpool wait on the process handle on Windows; what
   nothing can watch (any child, a process group, stop and continue reports)
-  is probed from a timer, so no wait holds a thread
+  is probed from a timer, so no wait holds a thread. Nothing is collected
+  (`WNOWAIT`): the child stays waitable for the caller
 - Signal waits (`ior_prep_sigwait`): a signalfd poll on io_uring, a worker
   in `sigtimedwait` on the thread pool, the console control events
   (`SIGINT`, `SIGBREAK`) on Windows
@@ -317,13 +318,15 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts,
 void ior_prep_poll_add(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 void ior_prep_poll_multishot(ior_ctx *ctx, ior_sqe *sqe, ior_fd_t fd, uint32_t poll_mask);
 
-// Wait for a process like waitpid(2): completes with its pid, the wait
-// status in *status (the exit code on Windows), or -ECHILD. No wait holds a
-// thread: a cancel or a link timeout takes it back without reaping, and
-// ior_queue_exit() does not wait for the child. -1, a process group and
-// WUNTRACED/WCONTINUED are probed every 1-20 ms where the kernel cannot wait
-// for them (io_uring before Linux 6.7, the thread pool). Windows takes only
-// pid > 0.
+// Wait for a process like waitpid(2) with WNOWAIT: completes with its pid,
+// the wait status in *status (the exit code on Windows), or -ECHILD. The
+// child is never collected by ior; it stays waitable, and is reported again
+// by any wait that covers it, until the caller collects it with
+// waitpid(WNOHANG). No wait holds a thread: a cancel or a link timeout
+// takes it back, and ior_queue_exit() does not wait for the child. -1, a
+// process group and WUNTRACED/WCONTINUED are probed every 1-20 ms where the
+// kernel cannot wait for them (io_uring before Linux 6.7, the thread pool).
+// Windows takes only pid > 0.
 int ior_prep_waitpid(ior_ctx *ctx, ior_sqe *sqe, ior_pid_t pid, int *status,
                      int options);
 
