@@ -675,11 +675,11 @@ static void test_waitpid_any_stopped(void **state)
 	assert_int_equal(status[2], status[1]);
 	check_reported(s, res[(uintptr_t) TAG_WAIT2], status[1]);
 
-	// The wait on the stopped child itself has nothing to report...
+	// The wait on the stopped child itself has nothing to report (its
+	// status is not read here: the op is in flight and may write it)...
 	ior_cqe *cqe = NULL;
 	ior_timespec to = { .tv_sec = 0, .tv_nsec = 200 * 1000000L };
 	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
-	assert_int_equal(status[0], -1);
 
 	// ...until the child is gone.
 	kill(k->pid, SIGKILL);
