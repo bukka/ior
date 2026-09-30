@@ -415,10 +415,10 @@ static void ior_uring_probe_dropped(void *owner, void *arg);
 /*
  * Timer side of a probed process wait. Claimed like a job a worker starts
  * (QUEUED -> RUNNING), so a cancel or a link timeout that got there first
- * wins and the child is left alone. waitpid(WNOHANG) cannot block; with
- * nothing to report the wait goes back to QUEUED and the timer, at an
- * interval that doubles up to IOR_WAITPID_PROBE_MAX_NS. A cancel that came
- * during the probe (-EALREADY) ends it then, unreaped.
+ * wins. The probe cannot block and collects nothing; with nothing to
+ * report the wait goes back to QUEUED and the timer, at an interval that
+ * doubles up to IOR_WAITPID_PROBE_MAX_NS. A cancel that came during the
+ * probe (-EALREADY) ends it then.
  */
 static void ior_uring_probe_fired(void *owner, void *arg)
 {
@@ -430,11 +430,7 @@ static void ior_uring_probe_fired(void *owner, void *arg)
 		ior_uring_job_release(job); // cancelled; its completions are out
 		return;
 	}
-	pid_t r;
-	do {
-		r = waitpid(job->wait_pid, job->wait_status, job->wait_options | WNOHANG);
-	} while (r < 0 && errno == EINTR);
-	int32_t res = r < 0 ? -errno : r;
+	int32_t res = ior_waitpid_probe(job->wait_pid, job->wait_status, job->wait_options);
 
 	if (res == 0 && !(job->wait_options & WNOHANG)) {
 		if (atomic_load_explicit(&job->token.cancelled, memory_order_acquire)) {
@@ -758,34 +754,15 @@ static int32_t ior_uring_collect_signal(const ior_uring_wait *wait)
 	return (int32_t) ssi.ssi_signo;
 }
 
-// The waitpid(2) status of what waitid(2) reported.
-static int ior_uring_status_from_siginfo(const siginfo_t *si)
-{
-	switch (si->si_code) {
-		case CLD_EXITED:
-			return (si->si_status & 0xff) << 8;
-		case CLD_KILLED:
-			return si->si_status & 0x7f;
-		case CLD_DUMPED:
-			return (si->si_status & 0x7f) | 0x80;
-		case CLD_STOPPED:
-		case CLD_TRAPPED:
-			return ((si->si_status & 0xff) << 8) | 0x7f;
-		case CLD_CONTINUED:
-			return 0xffff;
-		default:
-			return 0;
-	}
-}
-
 /*
  * Turn the completions of wait records among cqes[] into waitpid and
  * sigwait results, in place (the CQ ring is mapped writable and the kernel
- * never reads a CQE back): a readable pidfd means the child exited, so
- * waitpid(2) collects its state now, on the reaping thread, a readable
- * signalfd is read for its signal, and a WAITID's siginfo becomes the pid and
- * its status; a failed or cancelled op keeps its error. The caller's user data is restored either
- * way and the record retired, so seeing the same CQE again finds nothing to do.
+ * never reads a CQE back): a readable pidfd means the child exited, so its
+ * state is read now, on the reaping thread, without collecting it, a
+ * readable signalfd is read for its signal, and a WAITID's siginfo becomes
+ * the pid and its status; a failed or cancelled op keeps its error. The
+ * caller's user data is restored either way and the record retired, so
+ * seeing the same CQE again finds nothing to do.
  */
 static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cqes, unsigned n)
 {
@@ -809,8 +786,7 @@ static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cq
 				break;
 			case IOR_URING_WAIT_PIDFD:
 				if (res >= 0) {
-					pid_t r = waitpid(wait->pid, wait->status, WNOHANG);
-					res = r < 0 ? -errno : r;
+					res = ior_waitpid_probe(wait->pid, wait->status, 0);
 				}
 				break;
 			case IOR_URING_WAIT_WAITID:
@@ -818,7 +794,7 @@ static void ior_uring_resolve_waits(ior_ctx_uring *ctx, struct io_uring_cqe **cq
 				if (res >= 0) {
 					res = wait->si.si_pid;
 					if (res > 0 && wait->status) {
-						*wait->status = ior_uring_status_from_siginfo(&wait->si);
+						*wait->status = ior_wait_status_from_siginfo(&wait->si);
 					}
 				}
 				break;
@@ -1839,13 +1815,13 @@ static int32_t ior_uring_waitpid_job(ior_work_token *token, void *arg)
 
 /*
  * Every wait the kernel can do goes to IORING_OP_WAITID where it has one
- * (6.7): no thread, and a cancel or a link timeout takes it back without
- * reaping. Otherwise one child with nothing else asked gets a pidfd poll,
- * which does the same, and anything else (any child, a group, WNOHANG, job
- * control, no pidfd) is probed from the timer thread (see
- * ior_uring_probe_fired). Nothing is consumed here: prep has no completion
- * to carry an answer, and an op that is never submitted, or fails to prep,
- * must leave the child as it found it.
+ * (6.7), asked with WNOWAIT: no thread, nothing collected, and a cancel or
+ * a link timeout takes it back. Otherwise one child with nothing else asked
+ * gets a pidfd poll, which does the same, and anything else (any child, a
+ * group, WNOHANG, job control, no pidfd) is probed from the timer thread
+ * (see ior_uring_probe_fired). Nothing is consumed here either: prep has no
+ * completion to carry an answer, and an op that is never submitted, or
+ * fails to prep, must leave the child as it found it.
  */
 static int ior_uring_backend_prep_waitpid(
 		void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
@@ -1867,7 +1843,7 @@ static int ior_uring_backend_prep_waitpid(
 		wait->status = status;
 		wait->ksqe = s;
 		// WUNTRACED is WSTOPPED; waitid asks for exits explicitly.
-		io_uring_prep_waitid(s, idtype, id, &wait->si, options | WEXITED, 0);
+		io_uring_prep_waitid(s, idtype, id, &wait->si, options | WEXITED | WNOWAIT, 0);
 		wait->next = ctx->waits_pending;
 		ctx->waits_pending = wait;
 		return 0;
@@ -1879,8 +1855,8 @@ static int ior_uring_backend_prep_waitpid(
 		/*
 		 * Is it a child at all? pidfd_open watches any process, and a poll
 		 * on one that is nobody's child would never answer -ECHILD; asked
-		 * with WNOWAIT the question reaps nothing, so an exited child stays
-		 * collectable (its pidfd is readable at once).
+		 * with WNOWAIT the question collects nothing, so an exited child
+		 * stays waitable (its pidfd is readable at once).
 		 */
 		siginfo_t info;
 		memset(&info, 0, sizeof(info));

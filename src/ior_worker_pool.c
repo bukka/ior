@@ -11,6 +11,14 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <limits.h>
+#include <string.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/sysctl.h>
+#endif
 
 static void *ior_worker_pool_worker_thread_func(void *arg);
 static void *ior_worker_pool_timer_thread_func(void *arg);
@@ -39,6 +47,182 @@ static uint64_t ior_worker_pool_clock_ns(clockid_t clock)
 	struct timespec ts;
 	clock_gettime(clock, &ts);
 	return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+}
+
+int ior_wait_status_from_siginfo(const siginfo_t *si)
+{
+	switch (si->si_code) {
+		case CLD_EXITED:
+			return (si->si_status & 0xff) << 8;
+		case CLD_KILLED:
+			return si->si_status & 0x7f;
+		case CLD_DUMPED:
+			return (si->si_status & 0x7f) | 0x80;
+		case CLD_STOPPED:
+		case CLD_TRAPPED:
+			return ((si->si_status & 0xff) << 8) | 0x7f;
+		case CLD_CONTINUED:
+			/* No portable macro builds it: what WIFCONTINUED tests for. */
+#if defined(__linux__) || defined(__NetBSD__)
+			return 0xffff;
+#elif defined(__APPLE__)
+			return (SIGCONT << 8) | 0x7f;
+#else
+			return 0x13;
+#endif
+		default:
+			return 0;
+	}
+}
+
+/*
+ * Whether waitpid(2) with options would report what waitid(2) put in si.
+ * macOS reports a stopped child whatever the options ask: its kernel tests
+ * WSTOPPED with the pre-UNIX03 value 0177, which every option bit overlaps,
+ * so WEXITED alone matches. A stop or continue nobody asked for is nothing.
+ */
+static int ior_waitpid_probe_wanted(const siginfo_t *si, int options)
+{
+	if (si->si_code == CLD_STOPPED && !(options & WUNTRACED)) {
+		return 0;
+	}
+	if (si->si_code == CLD_CONTINUED && !(options & WCONTINUED)) {
+		return 0;
+	}
+	return 1;
+}
+
+#ifdef __APPLE__
+/*
+ * waitid(P_ALL or P_PGID) answers with the first child on the kernel's list
+ * that has anything to say, and on macOS a stopped child always has (see
+ * ior_waitpid_probe_wanted), so it hides an exited sibling behind it. When
+ * that happens the children the wait covers are probed one by one: the
+ * process's children from proc_listchildpids() for any child, the members
+ * of the group from sysctl(KERN_PROC_PGRP) that this process is the parent
+ * of for a group; both list zombies. Returns as ior_waitpid_probe(), with si
+ * filled in for the child reported.
+ */
+static int32_t ior_waitpid_probe_each(idtype_t idtype, id_t id, siginfo_t *si, int wo, int options)
+{
+	pid_t *pids = NULL;
+	struct kinfo_proc *procs = NULL;
+	int n;
+	if (idtype == P_ALL) {
+		int cap = proc_listchildpids(getpid(), NULL, 0);
+		for (;;) {
+			cap = cap > 0 ? cap + 16 : 64;
+			pids = malloc((size_t) cap * sizeof(*pids));
+			if (!pids) {
+				return -ENOMEM;
+			}
+			n = proc_listchildpids(getpid(), pids, cap * (int) sizeof(*pids));
+			if (n < cap) {
+				break;
+			}
+			free(pids); // maybe more than fit: ask again with room
+		}
+		if (n < 0) {
+			n = 0;
+		}
+	} else {
+		int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PGRP, (int) id };
+		size_t len = 0;
+		for (;;) {
+			if (sysctl(mib, 4, NULL, &len, NULL, 0) < 0) {
+				return 0; // no such group: nothing in it to report
+			}
+			len += 4 * sizeof(*procs); // room for arrivals since the sizing
+			procs = malloc(len);
+			if (!procs) {
+				return -ENOMEM;
+			}
+			if (sysctl(mib, 4, procs, &len, NULL, 0) == 0) {
+				break;
+			}
+			free(procs);
+			procs = NULL;
+			if (errno != ENOMEM) {
+				return 0;
+			}
+		}
+		n = (int) (len / sizeof(*procs));
+	}
+	pid_t me = getpid();
+	int32_t found = 0;
+	for (int i = 0; i < n && found == 0; i++) {
+		pid_t pid;
+		if (pids) {
+			pid = pids[i];
+		} else if (procs[i].kp_eproc.e_ppid == me) {
+			pid = procs[i].kp_proc.p_pid;
+		} else {
+			continue;
+		}
+		memset(si, 0, sizeof(*si));
+		int r;
+		do {
+			r = waitid(P_PID, (id_t) pid, si, wo);
+		} while (r < 0 && errno == EINTR);
+		if (r == 0 && si->si_pid != 0 && ior_waitpid_probe_wanted(si, options)) {
+			found = (int32_t) si->si_pid;
+		}
+	}
+	free(pids);
+	free(procs);
+	return found;
+}
+#endif
+
+int32_t ior_waitpid_probe(pid_t pid, int *status, int options)
+{
+	if (pid == INT_MIN) {
+		return -ECHILD; // no group has that id
+	}
+	idtype_t idtype = pid > 0 ? P_PID : pid == -1 ? P_ALL : P_PGID;
+	id_t id = pid > 0 ? (id_t) pid : pid < -1 ? (id_t) -pid : (id_t) getpgrp();
+	/* waitpid's options as waitid's (WUNTRACED and WSTOPPED differ on
+	 * some platforms); what is neither goes through as is on Linux
+	 * (__WALL, __WCLONE, __WNOTHREAD). */
+	int wo = WEXITED | WNOHANG | WNOWAIT;
+	if (options & WUNTRACED) {
+		wo |= WSTOPPED;
+	}
+	if (options & WCONTINUED) {
+		wo |= WCONTINUED;
+	}
+#ifdef __linux__
+	wo |= options & ~(WNOHANG | WUNTRACED | WCONTINUED);
+#endif
+	siginfo_t si;
+	memset(&si, 0, sizeof(si)); // si_pid is unspecified when nothing changed
+	int r;
+	do {
+		r = waitid(idtype, id, &si, wo);
+	} while (r < 0 && errno == EINTR);
+	if (r < 0) {
+		return -errno;
+	}
+	if (si.si_pid == 0) {
+		return 0;
+	}
+	if (!ior_waitpid_probe_wanted(&si, options)) {
+		if (idtype == P_PID) {
+			return 0;
+		}
+#ifdef __APPLE__
+		int32_t found = ior_waitpid_probe_each(idtype, id, &si, wo, options);
+		if (found <= 0) {
+			return found;
+		}
+#else
+		return 0;
+#endif
+	}
+	if (status) {
+		*status = ior_wait_status_from_siginfo(&si);
+	}
+	return (int32_t) si.si_pid;
 }
 
 uint64_t ior_worker_pool_monotonic_ns(void)

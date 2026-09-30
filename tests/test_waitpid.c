@@ -8,6 +8,9 @@
  * batch of them, cancellation, a link timeout, teardown with a wait still
  * pending, and on POSIX the waitpid extras: WNOHANG, a killed child, any
  * child (-1) on a worker, and -ECHILD for a process that is not a child.
+ * ior reports a child and never collects it, so on POSIX every report is
+ * followed by the test's own waitpid(WNOHANG), which must find the child
+ * with the status ior gave.
  */
 #include "test_utils.h"
 #ifdef _WIN32
@@ -28,7 +31,7 @@
 typedef struct kid {
 	ior_pid_t pid;
 	int code;
-	int reaped;
+	int reaped; /* collected by the test (Windows: reported) */
 #ifdef _WIN32
 	HANDLE handle; /* keeps the pid from being recycled under the test */
 #endif
@@ -123,7 +126,7 @@ static int teardown_wp(void **state)
 	if (s->ctx) {
 		ior_queue_exit(s->ctx);
 	}
-	// Whatever ior did not reap is killed and collected here.
+	// Whatever the test did not collect is killed and collected here.
 	for (int i = 0; i < s->nkids; i++) {
 		kid *k = &s->kids[i];
 #ifdef _WIN32
@@ -181,14 +184,41 @@ static void submit_wait(
 	}
 }
 
-/* A reported pid must be one of ours, with the status it exited with. */
-static kid *check_reaped(wp_state *s, int32_t res, int status)
+#ifndef _WIN32
+/*
+ * Collect a child ior reported: it must still be waitable, and its state
+ * must be what the report said. Nothing to collect on Windows.
+ */
+static void collect(kid *k, int status, int options)
+{
+	int st = -1;
+	assert_int_equal(k->reaped, 0);
+	assert_int_equal(waitpid(k->pid, &st, options | WNOHANG), k->pid);
+	assert_int_equal(st, status);
+	if (!(options & (WUNTRACED | WCONTINUED))) {
+		k->reaped = 1;
+	}
+}
+#else
+static void collect(kid *k, int status, int options)
+{
+	(void) status;
+	(void) options;
+	assert_int_equal(k->reaped, 0);
+	k->reaped = 1;
+}
+#endif
+
+/*
+ * A reported pid must be one of ours, with the status it exited with, and
+ * still ours to collect.
+ */
+static kid *check_reported(wp_state *s, int32_t res, int status)
 {
 	kid *k = find_kid(s, res);
 	assert_non_null(k);
-	assert_int_equal(k->reaped, 0);
-	k->reaped = 1;
 	assert_exited(k, status);
+	collect(k, status, 0);
 	return k;
 }
 
@@ -201,7 +231,7 @@ static void sleep_ms(int ms)
 #endif
 }
 
-// Already exited when the op is submitted: collected without waiting.
+// Already exited when the op is submitted: reported without waiting.
 static void test_waitpid_exited(void **state)
 {
 	wp_state *s = (wp_state *) *state;
@@ -213,7 +243,7 @@ static void test_waitpid_exited(void **state)
 	submit_wait(s, k->pid, &status, 0, TAG_WAIT, 0);
 	assert_true(ior_submit(s->ctx) >= 0);
 	reap_tags(s->ctx, 1, res, 3);
-	check_reaped(s, res[(uintptr_t) TAG_WAIT], status);
+	check_reported(s, res[(uintptr_t) TAG_WAIT], status);
 }
 
 // Exits while the op is pending: nothing completes before, the pid after.
@@ -231,7 +261,7 @@ static void test_waitpid_pending(void **state)
 	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
 
 	reap_tags(s->ctx, 1, res, 3);
-	check_reaped(s, res[(uintptr_t) TAG_WAIT], status);
+	check_reported(s, res[(uintptr_t) TAG_WAIT], status);
 }
 
 // A NULL status is allowed.
@@ -245,6 +275,11 @@ static void test_waitpid_null_status(void **state)
 	assert_true(ior_submit(s->ctx) >= 0);
 	reap_tags(s->ctx, 1, res, 3);
 	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
+#ifndef _WIN32
+	int status = -1;
+	assert_int_equal(waitpid(k->pid, &status, WNOHANG), k->pid);
+	assert_exited(k, status);
+#endif
 	k->reaped = 1;
 }
 
@@ -269,7 +304,7 @@ static void test_waitpid_many(void **state)
 	for (int i = 0; i < n; i++) {
 		int32_t r = res[(uintptr_t) TAG_BATCH + i];
 		assert_int_equal(r, (int32_t) s->kids[i].pid);
-		check_reaped(s, r, status[i]);
+		check_reported(s, r, status[i]);
 	}
 }
 
@@ -307,7 +342,7 @@ static void test_waitpid_cancel(void **state)
 			return;
 		}
 		assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
-		k->reaped = 1;
+		collect(k, status, 0);
 		return;
 	}
 	reap_tags(s->ctx, 1, res, 3);
@@ -426,7 +461,7 @@ static void test_waitpid_wnohang(void **state)
 	submit_wait(s, k->pid, &status, WNOHANG, TAG_WAIT2, 0);
 	assert_true(ior_submit(s->ctx) >= 0);
 	reap_tags(s->ctx, 1, res, 3);
-	check_reaped(s, res[(uintptr_t) TAG_WAIT2], status);
+	check_reported(s, res[(uintptr_t) TAG_WAIT2], status);
 }
 
 // A killed child reports the signal.
@@ -444,12 +479,16 @@ static void test_waitpid_signaled(void **state)
 
 	reap_tags(s->ctx, 1, res, 3);
 	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
-	k->reaped = 1;
 	assert_true(WIFSIGNALED(status));
 	assert_int_equal(WTERMSIG(status), SIGKILL);
+	collect(k, status, 0);
 }
 
-// -1 collects any child: two ops, two children, each reported once.
+/*
+ * -1 reports any child. Two children, two waits in turn: the first reports
+ * one of them, which the test collects, and the second the other, since an
+ * exited child is reported until collected.
+ */
 static void test_waitpid_any(void **state)
 {
 	wp_state *s = (wp_state *) *state;
@@ -459,20 +498,83 @@ static void test_waitpid_any(void **state)
 	spawn_child(s, 1, 0);
 	spawn_child(s, 2, 100);
 	submit_wait(s, -1, &status[0], 0, TAG_WAIT, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 1, res, 3);
+	kid *a = check_reported(s, res[(uintptr_t) TAG_WAIT], status[0]);
+
 	submit_wait(s, -1, &status[1], 0, TAG_WAIT2, 0);
 	assert_true(ior_submit(s->ctx) >= 0);
-	reap_tags(s->ctx, 2, res, 3);
-	kid *a = check_reaped(s, res[(uintptr_t) TAG_WAIT], status[0]);
-	kid *b = check_reaped(s, res[(uintptr_t) TAG_WAIT2], status[1]);
+	reap_tags(s->ctx, 1, res, 3);
+	kid *b = check_reported(s, res[(uintptr_t) TAG_WAIT2], status[1]);
 	assert_ptr_not_equal(a, b);
 }
 
 /*
+ * A report is not a collection: an exited child is reported by every wait
+ * that asks about it, whether at once (WNOHANG) or pending, with the same
+ * status each time, until the caller collects it, after which a wait for
+ * it is -ECHILD.
+ */
+static void test_waitpid_reported_again(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+	int32_t res[MAX_TAG];
+	int status[3] = { -1, -1, -1 };
+
+	kid *k = spawn_child(s, 9, 0);
+	sleep_ms(100);
+	submit_wait(s, k->pid, &status[0], WNOHANG, TAG_WAIT, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
+	assert_exited(k, status[0]);
+
+	submit_wait(s, k->pid, &status[1], 0, TAG_WAIT2, 0);
+	submit_wait(s, -1, &status[2], 0, TAG_TMO, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 2, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT2], (int32_t) k->pid);
+	assert_int_equal(res[(uintptr_t) TAG_TMO], (int32_t) k->pid);
+	assert_int_equal(status[1], status[0]);
+	assert_int_equal(status[2], status[0]);
+	collect(k, status[0], 0);
+
+	submit_wait(s, k->pid, &status[1], 0, TAG_WAIT, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], -ECHILD);
+}
+
+/*
+ * Two waits pending on the same live child both complete when it exits,
+ * whether the child is watched (one pid, no options) or probed, and the
+ * child is still there to collect once.
+ */
+static void test_waitpid_two_waiters(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+	int32_t res[MAX_TAG];
+	int status[2] = { -1, -1 };
+
+	kid *k = spawn_child(s, 4, 200);
+	assert_return_code(setpgid(k->pid, k->pid), 0);
+	submit_wait(s, k->pid, &status[0], 0, TAG_WAIT, 0);
+	submit_wait(s, -k->pid, &status[1], 0, TAG_WAIT2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 2, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT2], (int32_t) k->pid);
+	assert_exited(k, status[0]);
+	assert_int_equal(status[1], status[0]);
+	collect(k, status[0], 0);
+}
+
+/*
  * A cancelled wait for any child takes nothing: it holds no worker, so the
- * cancel claims it (0), and the child it would have reaped is left to be
+ * cancel claims it (0), and the child it was waiting for is left to be
  * collected. Where the wait is probed from a timer, a cancel that lands
- * while a probe's waitpid(WNOHANG) runs finds it running (-EALREADY), as on
- * io_uring; the probe then sees the cancel and ends it the same way.
+ * while a probe runs finds it running (-EALREADY), as on io_uring; the
+ * probe then sees the cancel and ends it the same way.
  */
 static void test_waitpid_any_cancel(void **state)
 {
@@ -502,7 +604,11 @@ static void test_waitpid_any_cancel(void **state)
 	assert_exited(k, status);
 }
 
-/* A wait for stop and continue reports sees the child stop, then resume. */
+/*
+ * A wait for stop and continue reports sees the child stop, then resume.
+ * Each report stays pending until a wait with that option collects it: the
+ * stop is reported again by a second wait before the test collects it.
+ */
 static void test_waitpid_stopped_continued(void **state)
 {
 	wp_state *s = (wp_state *) *state;
@@ -519,6 +625,14 @@ static void test_waitpid_stopped_continued(void **state)
 	assert_true(WIFSTOPPED(status));
 	assert_int_equal(WSTOPSIG(status), SIGSTOP);
 
+	int again = -1;
+	submit_wait(s, k->pid, &again, WUNTRACED, TAG_WAIT2, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT2], (int32_t) k->pid);
+	assert_int_equal(again, status);
+	collect(k, status, WUNTRACED);
+
 	status = -1;
 	submit_wait(s, k->pid, &status, WCONTINUED, TAG_WAIT2, 0);
 	assert_true(ior_submit(s->ctx) >= 0);
@@ -527,9 +641,56 @@ static void test_waitpid_stopped_continued(void **state)
 	reap_tags(s->ctx, 1, res, 3);
 	assert_int_equal(res[(uintptr_t) TAG_WAIT2], (int32_t) k->pid);
 	assert_true(WIFCONTINUED(status));
+	collect(k, status, WCONTINUED);
 }
 
-/* A wait for a process group reaps the child that leads it. */
+/*
+ * A stopped child is nothing to a wait that did not ask (no WUNTRACED): a
+ * wait for it stays pending, and a wait for any child or for its group
+ * reports an exited sibling instead, even the older one behind it on the
+ * kernel's list. macOS's waitid reports a stopped child whatever is asked,
+ * and would hand it out in place of the sibling; ior must not.
+ */
+static void test_waitpid_any_stopped(void **state)
+{
+	wp_state *s = (wp_state *) *state;
+	int32_t res[MAX_TAG];
+	int status[3] = { -1, -1, -1 };
+	memset(res, 0, sizeof(res));
+
+	kid *e = spawn_child(s, 6, 300);
+	kid *k = spawn_child(s, 0, 5000); // newer: ahead of e on the kernel's list
+	assert_return_code(setpgid(k->pid, k->pid), 0);
+	assert_return_code(setpgid(e->pid, k->pid), 0);
+	kill(k->pid, SIGSTOP);
+	sleep_ms(400); // e has exited, k is stopped with its stop uncollected
+
+	submit_wait(s, k->pid, &status[0], 0, TAG_WAIT, 0);
+	submit_wait(s, -1, &status[1], 0, TAG_WAIT2, 0);
+	submit_wait(s, -k->pid, &status[2], 0, TAG_TMO, 0);
+	assert_true(ior_submit(s->ctx) >= 0);
+	reap_tags(s->ctx, 2, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT2], (int32_t) e->pid);
+	assert_int_equal(res[(uintptr_t) TAG_TMO], (int32_t) e->pid);
+	assert_int_equal(status[2], status[1]);
+	check_reported(s, res[(uintptr_t) TAG_WAIT2], status[1]);
+
+	// The wait on the stopped child itself has nothing to report (its
+	// status is not read here: the op is in flight and may write it)...
+	ior_cqe *cqe = NULL;
+	ior_timespec to = { .tv_sec = 0, .tv_nsec = 200 * 1000000L };
+	assert_int_equal(ior_wait_cqe_timeout(s->ctx, &cqe, &to), -ETIME);
+
+	// ...until the child is gone.
+	kill(k->pid, SIGKILL);
+	reap_tags(s->ctx, 1, res, 3);
+	assert_int_equal(res[(uintptr_t) TAG_WAIT], (int32_t) k->pid);
+	assert_true(WIFSIGNALED(status[0]));
+	assert_int_equal(WTERMSIG(status[0]), SIGKILL);
+	collect(k, status[0], 0);
+}
+
+/* A wait for a process group reports the child that leads it. */
 static void test_waitpid_group(void **state)
 {
 	wp_state *s = (wp_state *) *state;
@@ -541,12 +702,12 @@ static void test_waitpid_group(void **state)
 	submit_wait(s, -k->pid, &status, 0, TAG_WAIT, 0);
 	assert_true(ior_submit(s->ctx) >= 0);
 	reap_tags(s->ctx, 1, res, 3);
-	check_reaped(s, res[(uintptr_t) TAG_WAIT], status);
+	check_reported(s, res[(uintptr_t) TAG_WAIT], status);
 }
 
 /*
  * Teardown with a wait for any child pending does not wait for the child,
- * and does not reap it.
+ * and does not collect it.
  */
 static void test_waitpid_any_at_exit(void **state)
 {
@@ -594,9 +755,12 @@ int main(int argc, char **argv)
 		cmocka_unit_test_setup_teardown(test_waitpid_wnohang, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_signaled, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_reported_again, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_two_waiters, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any_cancel, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_link_timeout_unwatched, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_stopped_continued, setup_wp, teardown_wp),
+		cmocka_unit_test_setup_teardown(test_waitpid_any_stopped, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_group, setup_wp, teardown_wp),
 		cmocka_unit_test_setup_teardown(test_waitpid_any_at_exit, setup_wp, teardown_wp),
 #endif

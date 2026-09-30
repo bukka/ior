@@ -6,6 +6,8 @@
 #include "ior.h"
 #include <pthread.h>
 #include <stdatomic.h>
+#include <signal.h>
+#include <sys/types.h>
 
 /*
  * Generic POSIX worker-thread pool shared by the threads and io_uring backends.
@@ -151,12 +153,28 @@ uint64_t ior_worker_pool_monotonic_ns(void);
 
 /*
  * A process wait that nothing can wake (any child, a process group, stop and
- * continue reports, no process watch) is probed with waitpid(WNOHANG) from
- * the timer thread instead of holding a worker: first at once, then at
+ * continue reports, no process watch) is probed with ior_waitpid_probe()
+ * from the timer thread instead of holding a worker: first at once, then at
  * intervals doubling from the minimum up to the maximum.
  */
 #define IOR_WAITPID_PROBE_MIN_NS 1000000ULL
 #define IOR_WAITPID_PROBE_MAX_NS 20000000ULL
+
+/*
+ * Ask waitid(2) what waitpid(pid, status, options) would report, without
+ * collecting it and without waiting: WNOWAIT and WNOHANG, pid and options
+ * with their waitpid(2) meaning. Returns the pid of a child whose state
+ * changed, with its waitpid(2) status rebuilt in *status (if non-NULL), 0
+ * when nothing has, or -errno (-ECHILD for no such child). The child stays
+ * waitable, so the same probe reports it again until the caller collects it.
+ * A stop or continue the options did not ask for is not reported (macOS's
+ * waitid reports stopped children unasked), and does not hide an exited
+ * sibling from a wait for any child or a group.
+ */
+int32_t ior_waitpid_probe(pid_t pid, int *status, int options);
+
+/* The waitpid(2) status of what waitid(2) reported in si. */
+int ior_wait_status_from_siginfo(const siginfo_t *si);
 
 /*
  * The CLOCK_MONOTONIC deadline a timeout names: now plus ts for a relative
