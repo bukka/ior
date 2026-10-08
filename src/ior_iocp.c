@@ -1230,6 +1230,8 @@ typedef NTSTATUS(NTAPI *ior_nt_set_information_file_fn)(
 		HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
 
 #define IOR_FILE_REPLACE_COMPLETION_INFORMATION 61
+#define IOR_STATUS_NOT_IMPLEMENTED ((NTSTATUS) 0xC0000002L)
+#define IOR_STATUS_INVALID_INFO_CLASS ((NTSTATUS) 0xC0000003L)
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(status) (((NTSTATUS) (status)) >= 0)
 #endif
@@ -1269,6 +1271,91 @@ static int iocp_take_over_handle(ior_ctx_iocp *ctx, HANDLE h)
 		return 0;
 	}
 	return status == (NTSTATUS) 0xC0000001L ? -EBUSY : -EINVAL; // STATUS_UNSUCCESSFUL
+}
+
+// Whether op is on h and needs h tied to the port, now or when it issues again.
+static bool iocp_op_binds_handle(const ior_iocp_op *op, HANDLE h)
+{
+	if (op->fd != h) {
+		return false;
+	}
+
+	switch (op->opcode) {
+		case IOR_OP_READ:
+		case IOR_OP_WRITE:
+		case IOR_OP_SEND:
+		case IOR_OP_RECV:
+		case IOR_OP_ACCEPT:
+		case IOR_OP_CONNECT:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * ior_release_handle(): untie h from ctx's port. It runs on the consumer
+ * thread, as every association does, so no op of ctx can bind h meanwhile.
+ * Windows unties a handle even with a request pending on it, and that
+ * request's packet then reaches no port; hence the scans for ops of ctx on h.
+ */
+static int ior_iocp_backend_release_handle(void *backend_ctx, ior_fd_t fd)
+{
+	ior_ctx_iocp *const ctx = backend_ctx;
+	const HANDLE h = (HANDLE) fd;
+	if (h == NULL || h == INVALID_HANDLE_VALUE) {
+		return -EBADF;
+	}
+
+	for (const ior_iocp_op *op = ctx->live_head; op; op = op->live_next) {
+		if (iocp_op_binds_handle(op, h)) {
+			return -EBUSY;
+		}
+	}
+
+	for (uint32_t i = ctx->sq_head; i != ctx->sq_tail; i++) {
+		if (iocp_op_binds_handle(ctx->sq_array[i & ctx->sq_mask], h)) {
+			return -EBUSY;
+		}
+	}
+
+	AcquireSRWLockExclusive(&g_owner_lock);
+	owner_entry **const pp = iocp_owner_find_locked(h);
+	owner_entry *const o = *pp;
+	if (!o || o->owner != ctx) {
+		ReleaseSRWLockExclusive(&g_owner_lock);
+		return 0;
+	}
+
+	InitOnceExecuteOnce(&g_nt_set_info_once, iocp_nt_set_info_resolve, NULL, NULL);
+	int ret = -ENOTSUP;
+	if (g_nt_set_info) {
+		IO_STATUS_BLOCK iosb;
+		ior_file_completion_information info = { NULL, NULL };
+		const NTSTATUS status = g_nt_set_info(
+				h, &iosb, &info, sizeof(info), IOR_FILE_REPLACE_COMPLETION_INFORMATION);
+		if (NT_SUCCESS(status)) {
+			ret = 0;
+		} else if (status != IOR_STATUS_NOT_IMPLEMENTED
+				&& status != IOR_STATUS_INVALID_INFO_CLASS) {
+			ret = -EINVAL;
+		}
+	}
+
+	if (ret == 0) {
+		*pp = o->next;
+		free(o);
+		EnterCriticalSection(&ctx->handles.lock);
+		handle_set_entry *const entry = handle_set_find_locked(&ctx->handles, h);
+		if (entry) {
+			entry->owned = false;
+		}
+
+		LeaveCriticalSection(&ctx->handles.lock);
+	}
+
+	ReleaseSRWLockExclusive(&g_owner_lock);
+	return ret;
 }
 
 // The completion status of an op whose handle could not be tied to the port.
@@ -5144,6 +5231,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.cqe_get_flags = ior_iocp_backend_cqe_get_flags,
 	.notify_fd = ior_iocp_backend_notify_fd,
 	.notify_clear = ior_iocp_backend_notify_clear,
+	.release_handle = ior_iocp_backend_release_handle,
 	.backend_name = ior_iocp_backend_name,
 	.get_features = ior_iocp_backend_get_features,
 	.sq_entries = ior_iocp_backend_sq_entries,

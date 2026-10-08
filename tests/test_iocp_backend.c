@@ -14,6 +14,7 @@
  *     recycled handle values, requests pending elsewhere and racing rings
  *   - pipes: another process's packets on a handle passed to it, ops on a
  *     duplicate of the handle, and the errno of a closed or empty pipe
+ *   - a handle taken off the port before it is handed out
  *
  * The whole file compiles to an empty (passing) cmocka group on non-IOCP
  * builds, so it is harmless to register unconditionally in CMake - but the
@@ -951,6 +952,151 @@ static void test_read_empty_nowait_pipe_eagain(void **state)
 }
 
 /* ===================================================================== */
+/* Releasing a handle                                                    */
+/* ===================================================================== */
+
+// False where the system cannot untie a handle (Wine, before Windows 8.1).
+static bool try_release(ior_ctx *ctx, HANDLE h)
+{
+	const int ret = ior_release_handle(ctx, h);
+	if (ret == -ENOTSUP) {
+		return false;
+	}
+
+	assert_int_equal(ret, 0);
+	return true;
+}
+
+// A released handle is on no port: another port takes it, and a read issued
+// on it outside ior posts there, not to the ring.
+static void test_release_handle_unbinds(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	HANDLE server, client;
+	pipe_used_by_ring(s->ctx, &server, &client);
+	if (!try_release(s->ctx, server)) {
+		CloseHandle(client);
+		CloseHandle(server);
+		skip();
+	}
+
+	const HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	assert_non_null(port);
+	assert_non_null(CreateIoCompletionPort(server, port, 7, 0));
+	foreign_read *const reads = foreign_reads_issue(server, 1);
+	DWORD got = 0;
+	assert_true(WriteFile(client, "a", 1, &got, NULL) && got == 1);
+	DWORD bytes = 0;
+	ULONG_PTR key = 0;
+	OVERLAPPED *ov = NULL;
+	assert_true(GetQueuedCompletionStatus(port, &bytes, &key, &ov, 2000));
+	assert_int_equal(key, 7);
+	assert_ptr_equal(ov, &reads[0].ov);
+	foreign_reads_check_and_free(server, reads, 1);
+
+	ior_cqe *cqe = NULL;
+	assert_int_equal(ior_peek_cqe(s->ctx, &cqe), -EAGAIN);
+	CloseHandle(client);
+	CloseHandle(server);
+	CloseHandle(port);
+}
+
+// The ring's next op on a released handle ties it to the port again.
+static void test_release_handle_rebinds(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	HANDLE server, client;
+	pipe_used_by_ring(s->ctx, &server, &client);
+	if (!try_release(s->ctx, server)) {
+		CloseHandle(client);
+		CloseHandle(server);
+		skip();
+	}
+
+	char byte = 'y';
+	assert_int_equal(pipe_op_once(s->ctx, server, &byte, 1, true), 1);
+	DWORD got = 0;
+	assert_true(ReadFile(client, &byte, 1, &got, NULL) && got == 1 && byte == 'y');
+	CloseHandle(client);
+	CloseHandle(server);
+}
+
+// A read in flight on the handle refuses the release; the read still
+// completes, and the release succeeds after it.
+static void test_release_handle_busy(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	HANDLE server, client;
+	pipe_used_by_ring(s->ctx, &server, &client);
+	char byte = 0;
+	ior_sqe *const sqe = ior_get_sqe(s->ctx);
+	assert_non_null(sqe);
+	ior_prep_read(s->ctx, sqe, server, &byte, 1, IOR_OFF_NONE);
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	assert_int_equal(ior_release_handle(s->ctx, server), -EBUSY);
+	DWORD got = 0;
+	assert_true(WriteFile(client, "b", 1, &got, NULL) && got == 1);
+	ior_cqe *cqe = NULL;
+	ior_timespec timeout = { .tv_sec = 2, .tv_nsec = 0 };
+	assert_return_code(ior_wait_cqe_timeout(s->ctx, &cqe, &timeout), 0);
+	assert_int_equal(ior_cqe_get_res(s->ctx, cqe), 1);
+	assert_int_equal(byte, 'b');
+	ior_cqe_seen(s->ctx, cqe);
+
+	const int ret = ior_release_handle(s->ctx, server);
+	assert_true(ret == 0 || ret == -ENOTSUP);
+	CloseHandle(client);
+	CloseHandle(server);
+}
+
+// A read issued outside ior and still pending is untied with the handle: it
+// completes, and its packet reaches no port.
+static void test_release_handle_foreign_pending(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	HANDLE server, client;
+	pipe_used_by_ring(s->ctx, &server, &client);
+	foreign_read *const reads = foreign_reads_issue(server, 1);
+	const int ret = ior_release_handle(s->ctx, server);
+	assert_true(ret == 0 || ret == -ENOTSUP);
+
+	DWORD got = 0;
+	assert_true(WriteFile(client, "a", 1, &got, NULL) && got == 1);
+	foreign_reads_wait_queued(reads, 1);
+	ior_cqe *cqe = NULL;
+	assert_int_equal(ior_peek_cqe(s->ctx, &cqe), -EAGAIN);
+	foreign_reads_check_and_free(server, reads, 1);
+	CloseHandle(client);
+	CloseHandle(server);
+}
+
+// A handle the ring never used, or one another ring holds, is left as it is.
+static void test_release_handle_not_ours(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	HANDLE server, client;
+	make_pipe_pair(&server, &client);
+	assert_int_equal(ior_release_handle(s->ctx, server), 0);
+	assert_int_equal(ior_release_handle(s->ctx, INVALID_HANDLE_VALUE), -EBADF);
+
+	ior_ctx *other = NULL;
+	assert_return_code(ior_queue_init(32, &other), 0);
+	char byte = 'x';
+	assert_int_equal(pipe_op_once(other, server, &byte, 1, true), 1);
+	assert_int_equal(ior_release_handle(s->ctx, server), 0);
+
+	const HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+	assert_non_null(port);
+	assert_null(CreateIoCompletionPort(server, port, 7, 0));
+	assert_int_equal(pipe_op_once(other, server, &byte, 1, true), 1);
+	ior_queue_exit(other);
+	CloseHandle(port);
+	CloseHandle(client);
+	CloseHandle(server);
+}
+
+/* ===================================================================== */
 /* Teardown with operations still in flight                              */
 /* ===================================================================== */
 
@@ -1021,6 +1167,12 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_write_to_closed_pipe_epipe, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(
 				test_read_empty_nowait_pipe_eagain, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_release_handle_unbinds, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_release_handle_rebinds, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_release_handle_busy, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(
+				test_release_handle_foreign_pending, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_release_handle_not_ours, iocp_setup, iocp_teardown),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 #else

@@ -454,6 +454,32 @@ void ior_queue_exit(ior_ctx *ctx);
  */
 int ior_queue_forget(ior_ctx *ctx);
 
+/**
+ * Untie a descriptor from the context before another process gets it.
+ *
+ * On IOCP a handle the context did I/O on stays associated with its
+ * completion port, and the association belongs to the file object, which a
+ * duplicate shares: a process given the handle (inherited, or through
+ * DuplicateHandle) posts the packets of its own overlapped I/O on it to this
+ * port. This takes the handle off the port; the next operation on it here
+ * associates it again. A request another process has pending on the handle
+ * is untied with it: its completion reaches no port. Call it on the thread
+ * that submits. On other backends nothing ties a descriptor to a context,
+ * and it returns 0.
+ *
+ * @param ctx  I/O context.
+ * @param fd   Descriptor about to be handed out.
+ *
+ * @return 0 when nothing of this context ties @p fd to its port any more,
+ *         as far as ior records (a handle it never associated is left as it
+ *         is); -EINVAL for a NULL @p ctx, or when the kernel refuses (a
+ *         closed handle); -EBADF for a NULL or INVALID_HANDLE_VALUE @p fd;
+ *         -EBUSY while an operation of the context on @p fd is queued or its
+ *         completion not yet dequeued; -ENOTSUP where the system cannot
+ *         (before Windows 8.1). The handle stays associated on any error.
+ */
+int ior_release_handle(ior_ctx *ctx, ior_fd_t fd);
+
 /* Submission */
 
 /**

@@ -166,6 +166,8 @@ typedef struct ior_backend_ops {
 	void (*destroy)(void *backend_ctx);
 	/* Optional (NULL = no fork): ior_queue_forget() in a forked child. */
 	void (*forget)(void *backend_ctx);
+	/* Optional (NULL = nothing ties a descriptor to the context): ior_release_handle(). */
+	int (*release_handle)(void *backend_ctx, ior_fd_t fd);
 
 	/* Submission queue operations. get_sqe: 0, -ENOSPC (submission queue
 	 * full), -ENOMEM (no memory for the entry, IOCP). */

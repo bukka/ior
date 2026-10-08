@@ -159,6 +159,19 @@ int ior_queue_forget(ior_ctx *ctx)
 	return 0;
 }
 
+int ior_release_handle(ior_ctx *ctx, ior_fd_t fd)
+{
+	if (!ctx) {
+		return -EINVAL;
+	}
+
+	if (!ctx->ops->release_handle) {
+		return 0;
+	}
+
+	return ctx->ops->release_handle(ctx->backend_ctx, fd);
+}
+
 /* Submission operations - just call through vtable */
 ior_sqe *ior_get_sqe(ior_ctx *ctx)
 {

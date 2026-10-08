@@ -174,7 +174,9 @@ int main() {
 > so that process's own overlapped I/O on the handle also posts a packet
 > there, and the ring drops it. The I/O itself completes for that process at
 > once, whether or not the ring dequeues. I/O whose `hEvent` has the low-order
-> bit set queues no packet.
+> bit set queues no packet. `ior_release_handle()` takes the handle off the
+> port before it is handed out (Windows 8.1 and later); the ring's next
+> operation on it associates it again.
 
 ### Operation Chaining Example
 
