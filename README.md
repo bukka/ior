@@ -169,6 +169,12 @@ int main() {
 > not ior's; while that ring lives, another one gets `-EBUSY` for the handle,
 > since the first may still have requests on it, as it does for a handle with
 > requests still pending on a port that is not ior's.
+>
+> A handle passed to another process stays associated with the ring's port,
+> so that process's own overlapped I/O on the handle also posts a packet
+> there, and the ring drops it. The I/O itself completes for that process at
+> once, whether or not the ring dequeues. I/O whose `hEvent` has the low-order
+> bit set queues no packet.
 
 ### Operation Chaining Example
 
