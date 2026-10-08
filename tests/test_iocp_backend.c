@@ -14,6 +14,7 @@
  *     recycled handle values, requests pending elsewhere and racing rings
  *   - pipes: another process's packets on a handle passed to it, ops on a
  *     duplicate of the handle, and the errno of a closed or empty pipe
+ *   - a read of part of a message or of a datagram
  *   - a handle taken off the port before it is handed out
  *
  * The whole file compiles to an empty (passing) cmocka group on non-IOCP
@@ -682,15 +683,17 @@ static void test_handle_takeover_race(void **state)
 /* Pipes                                                                 */
 /* ===================================================================== */
 
-// An overlapped duplex named pipe: *server for the ring, *client synchronous.
-static void make_pipe_pair(HANDLE *server, HANDLE *client)
+// An overlapped duplex named pipe of the given PIPE_TYPE_*, read in the same
+// mode: *server for the ring, *client synchronous.
+static void make_pipe_pair(DWORD type, HANDLE *server, HANDLE *client)
 {
 	static unsigned pairs = 0;
 	char name[64];
 	snprintf(name, sizeof(name), "\\\\.\\pipe\\ior-test-%lu-%u", GetCurrentProcessId(), pairs++);
+	const DWORD read_mode = type == PIPE_TYPE_MESSAGE ? PIPE_READMODE_MESSAGE : PIPE_READMODE_BYTE;
 	*server = CreateNamedPipeA(name,
 			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-			PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, NULL);
+			type | read_mode | PIPE_WAIT, 1, 4096, 4096, 0, NULL);
 	assert_true(*server != INVALID_HANDLE_VALUE);
 	*client = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 	assert_true(*client != INVALID_HANDLE_VALUE);
@@ -776,7 +779,7 @@ static void foreign_reads_check_and_free(HANDLE server, foreign_read *reads, uns
 // A pipe the ring wrote to once, with the byte read back.
 static void pipe_used_by_ring(ior_ctx *ctx, HANDLE *server, HANDLE *client)
 {
-	make_pipe_pair(server, client);
+	make_pipe_pair(PIPE_TYPE_BYTE, server, client);
 	char byte = 'x';
 	assert_int_equal(pipe_op_once(ctx, *server, &byte, 1, true), 1);
 	DWORD got = 0;
@@ -898,7 +901,7 @@ static void test_duplicate_handle_ops_complete(void **state)
 {
 	iocp_state *const s = (iocp_state *) *state;
 	HANDLE server, client, dup;
-	make_pipe_pair(&server, &client);
+	make_pipe_pair(PIPE_TYPE_BYTE, &server, &client);
 	assert_true(DuplicateHandle(GetCurrentProcess(), server, GetCurrentProcess(), &dup, 0, FALSE,
 			DUPLICATE_SAME_ACCESS));
 
@@ -928,7 +931,7 @@ static void test_write_to_closed_pipe_epipe(void **state)
 {
 	iocp_state *const s = (iocp_state *) *state;
 	HANDLE server, client;
-	make_pipe_pair(&server, &client);
+	make_pipe_pair(PIPE_TYPE_BYTE, &server, &client);
 	CloseHandle(client);
 
 	char byte = 'x';
@@ -941,7 +944,7 @@ static void test_read_empty_nowait_pipe_eagain(void **state)
 {
 	iocp_state *const s = (iocp_state *) *state;
 	HANDLE server, client;
-	make_pipe_pair(&server, &client);
+	make_pipe_pair(PIPE_TYPE_BYTE, &server, &client);
 	DWORD mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
 	assert_true(SetNamedPipeHandleState(server, &mode, NULL, NULL));
 
@@ -949,6 +952,123 @@ static void test_read_empty_nowait_pipe_eagain(void **state)
 	assert_int_equal(pipe_op_once(s->ctx, server, &byte, 1, false), -EAGAIN);
 	CloseHandle(client);
 	CloseHandle(server);
+}
+
+// A message-mode pipe holding the message "0123456789", read through the
+// ring 4 bytes at a time: a read gets part of the message, the next the rest.
+static void message_read_in_parts(ior_ctx *ctx, bool pending)
+{
+	HANDLE server, client;
+	make_pipe_pair(PIPE_TYPE_MESSAGE, &server, &client);
+	DWORD got = 0;
+	if (!pending) {
+		assert_true(WriteFile(client, "0123456789", 10, &got, NULL) && got == 10);
+	}
+
+	char buf[4];
+	ior_sqe *const sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	ior_prep_read(ctx, sqe, server, buf, sizeof(buf), IOR_OFF_NONE);
+	assert_true(ior_submit(ctx) >= 0);
+	if (pending) {
+		assert_true(WriteFile(client, "0123456789", 10, &got, NULL) && got == 10);
+	}
+
+	ior_cqe *cqe = NULL;
+	ior_timespec timeout = { .tv_sec = 2, .tv_nsec = 0 };
+	assert_return_code(ior_wait_cqe_timeout(ctx, &cqe, &timeout), 0);
+	assert_int_equal(ior_cqe_get_res(ctx, cqe), 4);
+	assert_memory_equal(buf, "0123", 4);
+	ior_cqe_seen(ctx, cqe);
+	assert_int_equal(ior_peek_cqe(ctx, &cqe), -EAGAIN);
+
+	char rest[16];
+	assert_int_equal(pipe_op_once(ctx, server, rest, sizeof(rest), false), 6);
+	assert_memory_equal(rest, "456789", 6);
+	CloseHandle(client);
+	CloseHandle(server);
+}
+
+// The message is in the pipe before the read, which Wine fails at once with
+// ERROR_MORE_DATA and Windows 11 reports pending: the op completes once, with
+// the bytes read.
+static void test_message_pipe_partial_read(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	message_read_in_parts(s->ctx, false);
+}
+
+// The read waits for the message and completes with part of it.
+static void test_message_pipe_partial_read_pending(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	message_read_in_parts(s->ctx, true);
+}
+
+// With the completion pump the op is staged once, and the next op on the
+// slot gets its own packet.
+static void test_message_pipe_partial_read_by_pump(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	assert_true(ior_notify_fd(s->ctx) != IOR_INVALID_FD);
+	message_read_in_parts(s->ctx, false);
+	message_read_in_parts(s->ctx, false);
+}
+
+// A recv of a datagram larger than its buffer gets the first bytes, whether
+// the datagram is queued already (on Wine WSAEMSGSIZE at once) or arrives
+// later.
+static void test_udp_recv_truncated(void **state)
+{
+	iocp_state *const s = (iocp_state *) *state;
+	WSADATA wsa;
+	assert_int_equal(WSAStartup(MAKEWORD(2, 2), &wsa), 0);
+	const SOCKET rx = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED);
+	assert_true(rx != INVALID_SOCKET);
+	const SOCKET tx = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	assert_true(tx != INVALID_SOCKET);
+	struct sockaddr_in addr = { 0 };
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	assert_int_equal(bind(rx, (struct sockaddr *) &addr, sizeof(addr)), 0);
+	int addr_len = sizeof(addr);
+	assert_int_equal(getsockname(rx, (struct sockaddr *) &addr, &addr_len), 0);
+
+	for (int pending = 0; pending < 2; pending++) {
+		if (!pending) {
+			assert_int_equal(
+					sendto(tx, "0123456789", 10, 0, (struct sockaddr *) &addr, sizeof(addr)), 10);
+			u_long queued = 0;
+			for (int tries = 0; tries < 200 && queued == 0; tries++) {
+				Sleep(10);
+				assert_int_equal(ioctlsocket(rx, FIONREAD, &queued), 0);
+			}
+
+			assert_true(queued > 0);
+		}
+
+		char buf[4];
+		ior_sqe *const sqe = ior_get_sqe(s->ctx);
+		assert_non_null(sqe);
+		ior_prep_recv(s->ctx, sqe, (ior_fd_t) rx, buf, sizeof(buf), 0);
+		assert_true(ior_submit(s->ctx) >= 0);
+		if (pending) {
+			assert_int_equal(
+					sendto(tx, "0123456789", 10, 0, (struct sockaddr *) &addr, sizeof(addr)), 10);
+		}
+
+		ior_cqe *cqe = NULL;
+		ior_timespec timeout = { .tv_sec = 2, .tv_nsec = 0 };
+		assert_return_code(ior_wait_cqe_timeout(s->ctx, &cqe, &timeout), 0);
+		assert_int_equal(ior_cqe_get_res(s->ctx, cqe), 4);
+		assert_memory_equal(buf, "0123", 4);
+		ior_cqe_seen(s->ctx, cqe);
+		assert_int_equal(ior_peek_cqe(s->ctx, &cqe), -EAGAIN);
+	}
+
+	closesocket(tx);
+	closesocket(rx);
+	WSACleanup();
 }
 
 /* ===================================================================== */
@@ -1076,7 +1196,7 @@ static void test_release_handle_not_ours(void **state)
 {
 	iocp_state *const s = (iocp_state *) *state;
 	HANDLE server, client;
-	make_pipe_pair(&server, &client);
+	make_pipe_pair(PIPE_TYPE_BYTE, &server, &client);
 	assert_int_equal(ior_release_handle(s->ctx, server), 0);
 	assert_int_equal(ior_release_handle(s->ctx, INVALID_HANDLE_VALUE), -EBADF);
 
@@ -1167,6 +1287,12 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_write_to_closed_pipe_epipe, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(
 				test_read_empty_nowait_pipe_eagain, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_message_pipe_partial_read, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(
+				test_message_pipe_partial_read_pending, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(
+				test_message_pipe_partial_read_by_pump, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_udp_recv_truncated, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_release_handle_unbinds, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_release_handle_rebinds, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_release_handle_busy, iocp_setup, iocp_teardown),

@@ -1232,6 +1232,7 @@ typedef NTSTATUS(NTAPI *ior_nt_set_information_file_fn)(
 #define IOR_FILE_REPLACE_COMPLETION_INFORMATION 61
 #define IOR_STATUS_NOT_IMPLEMENTED ((NTSTATUS) 0xC0000002L)
 #define IOR_STATUS_INVALID_INFO_CLASS ((NTSTATUS) 0xC0000003L)
+#define IOR_STATUS_BUFFER_OVERFLOW ((NTSTATUS) 0x80000005L)
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(status) (((NTSTATUS) (status)) >= 0)
 #endif
@@ -1489,6 +1490,14 @@ static BOOL cancel_overlapped_io(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	return CancelIoEx((HANDLE) op->fd, &op->overlapped);
 }
 
+// A read of part of a message or a datagram that the kernel still queues a
+// packet for: STATUS_BUFFER_OVERFLOW, a warning, left in the OVERLAPPED.
+static bool iocp_partial_read_queued(const ior_iocp_op *op, DWORD err)
+{
+	return (err == ERROR_MORE_DATA || err == WSAEMSGSIZE)
+			&& (NTSTATUS) op->overlapped.Internal == IOR_STATUS_BUFFER_OVERFLOW;
+}
+
 /*
  * issue_read / issue_write
  *
@@ -1508,6 +1517,10 @@ static BOOL cancel_overlapped_io(ior_ctx_iocp *ctx, ior_iocp_op *op)
  * Special case: ERROR_HANDLE_EOF means the read reached end-of-file. Windows
  * still posts a completion packet for this on overlapped handles, so we treat
  * it the same as a successful async start.
+ *
+ * So does a read of part of a message (ERROR_MORE_DATA, a datagram's
+ * WSAEMSGSIZE for a recv) when the status the kernel left in the OVERLAPPED
+ * is STATUS_BUFFER_OVERFLOW (iocp_partial_read_queued).
  */
 static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
@@ -1534,7 +1547,7 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	}
 
 	DWORD err = GetLastError();
-	if (err == ERROR_IO_PENDING || err == ERROR_HANDLE_EOF) {
+	if (err == ERROR_IO_PENDING || err == ERROR_HANDLE_EOF || iocp_partial_read_queued(op, err)) {
 		// Async in progress, or EOF - completion packet will be posted
 		atomic_fetch_add(&ctx->active_count, 1);
 		return 0;
@@ -1585,6 +1598,8 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
  * ReadFile/WriteFile with respect to IOCP: a completion packet is posted for
  * both synchronous success (return 0) and asynchronous start (WSA_IO_PENDING).
  * Any other Winsock error means no packet is posted, so we synthesize one.
+ * A recv's WSAEMSGSIZE with STATUS_BUFFER_OVERFLOW in the OVERLAPPED is the
+ * exception, as ERROR_MORE_DATA is for a read (iocp_partial_read_queued).
  *
  * The op's fd is an ior_fd_t (HANDLE); sockets created with WSA_FLAG_OVERLAPPED
  * are valid IOCP targets, so we cast the handle to SOCKET for the Winsock call.
@@ -1637,7 +1652,7 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	}
 
 	int err = WSAGetLastError();
-	if (err == WSA_IO_PENDING) {
+	if (err == WSA_IO_PENDING || iocp_partial_read_queued(op, (DWORD) err)) {
 		atomic_fetch_add(&ctx->active_count, 1);
 		return 0;
 	}
@@ -4554,8 +4569,13 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 			// Back in flight; nothing completed from the caller's view.
 			return -EAGAIN;
 		}
-		op->error_code = gle;
-		op->bytes_transferred = ok ? bytes_transferred : 0;
+
+		// Part of a message or a datagram: the bytes read, as recv() reports
+		// a truncated datagram.
+		const bool partial = gle == ERROR_MORE_DATA
+				&& (op->opcode == IOR_OP_READ || op->opcode == IOR_OP_RECV);
+		op->error_code = partial ? ERROR_SUCCESS : gle;
+		op->bytes_transferred = (ok || partial) ? bytes_transferred : 0;
 		atomic_store(&op->state, IOCP_OP_DONE);
 	}
 	live_remove(ctx, op);
