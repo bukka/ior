@@ -301,6 +301,66 @@ static void test_poll_link_timeout(void **state)
 	assert_int_equal(lt_res, -ETIME);
 }
 
+/*
+ * A poll of a socket ready at submit, guarded by a zero link timeout (a
+ * liveness check that must not wait): the poll completes with the readiness
+ * and the timeout, never armed, with -ECANCELED. The thread backend ends a
+ * chain head whose deadline has passed before a worker takes it (see
+ * ior_prep_link_timeout), so there the pair may report the timeout instead.
+ */
+static void test_poll_ready_zero_link_timeout(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	ior_sqe *w = ior_get_sqe(s->ctx);
+	assert_non_null(w);
+	ior_prep_write(s->ctx, w, s->sock[0], "x", 1, 0);
+	ior_sqe_set_data(s->ctx, w, WRITE_TAG(0));
+	assert_true(ior_submit_and_wait(s->ctx, 1) >= 0);
+	assert_int_equal(wait_res_for_tag(s->ctx, WRITE_TAG(0)), 1);
+
+	int rounds = 20;
+	for (int round = 0; round < rounds; round++) {
+		ior_timespec ts = { .tv_sec = 0, .tv_nsec = 0 };
+
+		ior_sqe *p = ior_get_sqe(s->ctx);
+		assert_non_null(p);
+		ior_prep_poll_add(s->ctx, p, s->sock[1], IOR_POLL_IN);
+		ior_sqe_set_flags(s->ctx, p, IOR_SQE_IO_LINK);
+		ior_sqe_set_data(s->ctx, p, POLL_TAG(0));
+
+		ior_sqe *lt = ior_get_sqe(s->ctx);
+		assert_non_null(lt);
+		ior_prep_link_timeout(s->ctx, lt, &ts, 0);
+		ior_sqe_set_data(s->ctx, lt, POLL_TAG(1));
+
+		assert_int_equal(ior_submit(s->ctx), 2);
+
+		int32_t poll_res = 0, lt_res = 0;
+		for (int i = 0; i < 2; i++) {
+			ior_cqe *cqe = NULL;
+			assert_return_code(ior_wait_cqe(s->ctx, &cqe), 0);
+			void *data = ior_cqe_get_data(s->ctx, cqe);
+			int32_t res = ior_cqe_get_res(s->ctx, cqe);
+			ior_cqe_seen(s->ctx, cqe);
+			if (data == POLL_TAG(0)) {
+				poll_res = res;
+			} else {
+				assert_ptr_equal(data, POLL_TAG(1));
+				lt_res = res;
+			}
+		}
+
+		if (ior_get_backend_type(s->ctx) == IOR_BACKEND_THREADS && poll_res == -ECANCELED) {
+			assert_int_equal(lt_res, -ETIME);
+			continue;
+		}
+		assert_true(poll_res > 0);
+		assert_true(poll_res & IOR_POLL_IN);
+		assert_int_equal(lt_res, -ECANCELED);
+	}
+}
+
 /* Closing the peer completes an IN poll (readable EOF and/or hangup). */
 static void test_poll_peer_hangup(void **state)
 {
@@ -714,6 +774,40 @@ static void test_poll_multishot_regular_file(void **state)
 	free(path);
 }
 
+/*
+ * A one-shot poll of a regular file: always ready, so it completes at once
+ * (on IOCP only sockets are pollable: -ENOTSOCK).
+ */
+static void test_poll_regular_file(void **state)
+{
+	sock_state *s = (sock_state *) *state;
+
+	char *path = create_temp_file("data", 4);
+	assert_non_null(path);
+	ior_fd_t fd = test_open_fd(path);
+	assert_true(test_fd_is_valid(fd));
+
+	ior_sqe *p = ior_get_sqe(s->ctx);
+	assert_non_null(p);
+	ior_prep_poll_add(s->ctx, p, fd, IOR_POLL_IN);
+	ior_sqe_set_data(s->ctx, p, POLL_TAG(0));
+	assert_true(ior_submit(s->ctx) >= 0);
+
+	cqe_rec r;
+	assert_return_code(reap_rec(s->ctx, &r, 2000), 0);
+	assert_ptr_equal(r.data, POLL_TAG(0));
+	assert_false(r.flags & IOR_CQE_F_MORE);
+#ifdef _WIN32
+	assert_int_equal(r.res, -ENOTSOCK);
+#else
+	assert_true(r.res & IOR_POLL_IN);
+#endif
+
+	test_close_fd(fd);
+	remove_temp_file(path);
+	free(path);
+}
+
 /* Tearing down the context with a pending multishot poll must not hang. */
 static void test_poll_multishot_pending_at_exit(void **state)
 {
@@ -774,6 +868,8 @@ int main(void)
 		cmocka_unit_test_setup_teardown(
 				test_poll_link_timeout, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test_setup_teardown(
+				test_poll_ready_zero_link_timeout, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
 				test_poll_peer_hangup, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test(test_poll_pending_at_exit),
 		cmocka_unit_test_setup_teardown(
@@ -790,6 +886,8 @@ int main(void)
 				test_poll_multishot_with_oneshot, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test_setup_teardown(
 				test_poll_multishot_regular_file, setup_socketpair, teardown_socketpair),
+		cmocka_unit_test_setup_teardown(
+				test_poll_regular_file, setup_socketpair, teardown_socketpair),
 		cmocka_unit_test(test_poll_multishot_pending_at_exit),
 	};
 
