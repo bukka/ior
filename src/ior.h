@@ -749,7 +749,10 @@ void ior_prep_timeout(ior_ctx *ctx, ior_sqe *sqe, ior_timespec *ts, unsigned cou
  * A read or write of a pollable descriptor (a socket, a pipe) waiting for
  * readiness is cancelled at the deadline; one of a regular file runs to
  * completion, as on io_uring, where a cached read even completes at submit,
- * before its link timeout is armed. If the guarded op is cancelled with
+ * before its link timeout is armed. io_uring from 6.16 arms the link timeout
+ * around the issue instead, so a zero one can fire while such a completion is
+ * still being flushed and report -ENOENT, its cancel having found nothing
+ * left. If the guarded op is cancelled with
  * ior_prep_cancel() instead, both it and this link timeout complete with
  * -ECANCELED.
  *
@@ -1064,7 +1067,8 @@ int ior_sigrequeue(const ior_siginfo_t *info);
  * handles complete with -ENOTSOCK. A socket ready at submit completes there
  * at submit, as on io_uring, before its link timeout is armed: a zero link
  * timeout (a liveness check that must not wait) finds the poll done and
- * completes with -ECANCELED.
+ * completes with -ECANCELED (on io_uring possibly -ENOENT, see
+ * ior_prep_link_timeout()).
  *
  * @param ctx        I/O context.
  * @param sqe        Entry from ior_get_sqe().

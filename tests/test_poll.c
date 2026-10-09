@@ -304,9 +304,12 @@ static void test_poll_link_timeout(void **state)
 /*
  * A poll of a socket ready at submit, guarded by a zero link timeout (a
  * liveness check that must not wait): the poll completes with the readiness
- * and the timeout, never armed, with -ECANCELED. The thread backend ends a
- * chain head whose deadline has passed before a worker takes it (see
- * ior_prep_link_timeout), so there the pair may report the timeout instead.
+ * and the timeout, never armed, with -ECANCELED. io_uring (6.16 and later)
+ * arms the timeout around the poll's issue, so a zero one can fire while the
+ * poll's completion is still being flushed and find nothing to cancel:
+ * -ENOENT. The thread backend ends a chain head whose deadline has passed
+ * before a worker takes it (see ior_prep_link_timeout), so there the pair
+ * may report the timeout instead.
  */
 static void test_poll_ready_zero_link_timeout(void **state)
 {
@@ -351,12 +354,16 @@ static void test_poll_ready_zero_link_timeout(void **state)
 			}
 		}
 
-		if (ior_get_backend_type(s->ctx) == IOR_BACKEND_THREADS && poll_res == -ECANCELED) {
+		ior_backend_type backend = ior_get_backend_type(s->ctx);
+		if (backend == IOR_BACKEND_THREADS && poll_res == -ECANCELED) {
 			assert_int_equal(lt_res, -ETIME);
 			continue;
 		}
 		assert_true(poll_res > 0);
 		assert_true(poll_res & IOR_POLL_IN);
+		if (backend == IOR_BACKEND_IOURING && lt_res == -ENOENT) {
+			continue;
+		}
 		assert_int_equal(lt_res, -ECANCELED);
 	}
 }
