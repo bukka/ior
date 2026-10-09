@@ -1061,7 +1061,10 @@ int ior_sigrequeue(const ior_siginfo_t *info);
  *
  * On the threads and IOCP backends all pending polls are multiplexed on a
  * single poller thread. On the IOCP backend only sockets are pollable; other
- * handles complete with -ENOTSOCK.
+ * handles complete with -ENOTSOCK. A socket ready at submit completes there
+ * at submit, as on io_uring, before its link timeout is armed: a zero link
+ * timeout (a liveness check that must not wait) finds the poll done and
+ * completes with -ECANCELED.
  *
  * @param ctx        I/O context.
  * @param sqe        Entry from ior_get_sqe().

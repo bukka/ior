@@ -2732,6 +2732,29 @@ fail:
 
 static int issue_poll(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
+	/*
+	 * A one-shot poll reads the socket's readiness here first, as io_uring
+	 * does when it arms a poll: readiness already there completes the op on
+	 * the submitting thread, before its link timeout is armed, so a zero
+	 * timeout (a liveness check that must not wait) finds it done. A
+	 * multishot poll goes to the poller as it is: its edges come from there.
+	 */
+	if (!op->poll_multi) {
+		WSAPOLLFD pfd = {
+			.fd = (SOCKET) op->fd,
+			.events = ior_poll_mask_to_wsa(op->poll_mask),
+		};
+		int ready = WSAPoll(&pfd, 1, 0);
+		if (ready > 0 && (pfd.revents & POLLNVAL)) {
+			return post_synthetic_completion(ctx, op, WSAENOTSOCK, 0);
+		}
+		if (ready > 0 && pfd.revents) {
+			op->work_res = (int32_t) wsa_to_ior_poll_mask(pfd.revents);
+			return post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+		}
+		// Not ready, or WSAPoll failed: the poller reports either.
+	}
+
 	if (iocp_poller_ensure(ctx) < 0) {
 		return post_synthetic_completion(ctx, op, ERROR_NOT_ENOUGH_MEMORY, 0);
 	}
